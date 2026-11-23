@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
-chcp 65001 >nul
 cd /d "%~dp0"
+chcp 65001 >nul 2>&1
 
 echo ==================================================
 echo   netdoctor — автоматическая установка для Windows
@@ -10,6 +10,20 @@ echo.
 
 set "NO_PAUSE=0"
 if /i "%~1"=="--no-pause" set "NO_PAUSE=1"
+
+:: Проверка: распакован ли архив
+if not exist "%~dp0src\netdoctor" (
+    echo [ОШИБКА] Файлы проекта не найдены рядом с install.bat!
+    echo.
+    echo Похоже, вы запустили install.bat прямо из ZIP-архива без распаковки.
+    echo Сначала распакуйте архив:
+    echo   1. Кликните правой кнопкой по скачанному ZIP-файлу.
+    echo   2. Нажмите "Извлечь все..." ^(Extract All^).
+    echo   3. Перейдите в распакованную папку и запустите install.bat.
+    echo.
+    pause
+    exit /b 1
+)
 
 call :find_python
 if not defined PY_EXE (
@@ -83,16 +97,30 @@ exit /b 0
 
 :find_python
 set "PY_EXE="
-python -c "import sys, tkinter, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+
+:: 1. Проверяем python из PATH
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if not errorlevel 1 (
-    for /f "usebackq delims=" %%I in (`python -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
-    if defined PY_EXE goto :eof
+    python -c "import tkinter, venv, ensurepip" >nul 2>&1
+    if not errorlevel 1 (
+        for /f "usebackq delims=" %%I in (`python -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
+        if defined PY_EXE goto :eof
+    ) else (
+        echo [ПРЕДУПРЕЖДЕНИЕ] В системном python.exe отсутствует модуль tkinter/venv ^(версия из Microsoft Store^).
+    )
 )
-py -3 -c "import sys, tkinter, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+
+:: 2. Проверяем лаунчер py -3
+py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
 if not errorlevel 1 (
-    for /f "usebackq delims=" %%I in (`py -3 -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
-    if defined PY_EXE goto :eof
+    py -3 -c "import tkinter, venv, ensurepip" >nul 2>&1
+    if not errorlevel 1 (
+        for /f "usebackq delims=" %%I in (`py -3 -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
+        if defined PY_EXE goto :eof
+    )
 )
+
+:: 3. Проверяем стандартные каталоги установки Python
 for %%P in (
     "%LocalAppData%\Programs\Python\Python312\python.exe"
     "%LocalAppData%\Programs\Python\Python313\python.exe"
@@ -100,11 +128,34 @@ for %%P in (
     "%ProgramFiles%\Python312\python.exe"
     "%ProgramFiles%\Python313\python.exe"
     "%ProgramFiles%\Python311\python.exe"
+    "C:\Python312\python.exe"
+    "C:\Python313\python.exe"
+    "C:\Python311\python.exe"
 ) do (
     if exist "%%~P" (
         "%%~P" -c "import sys, tkinter, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
         if not errorlevel 1 (
             set "PY_EXE=%%~P"
+            goto :eof
+        )
+    )
+)
+
+:: 4. Проверяем реестр Windows
+for /f "tokens=2*" %%A in ('reg query "HKCU\Software\Python\PythonCore\3.12\InstallPath" /ve 2^>nul') do (
+    if exist "%%~B\python.exe" (
+        "%%~B\python.exe" -c "import sys, tkinter, venv, ensurepip" >nul 2>&1
+        if not errorlevel 1 (
+            set "PY_EXE=%%~B\python.exe"
+            goto :eof
+        )
+    )
+)
+for /f "tokens=2*" %%A in ('reg query "HKLM\Software\Python\PythonCore\3.12\InstallPath" /ve 2^>nul') do (
+    if exist "%%~B\python.exe" (
+        "%%~B\python.exe" -c "import sys, tkinter, venv, ensurepip" >nul 2>&1
+        if not errorlevel 1 (
+            set "PY_EXE=%%~B\python.exe"
             goto :eof
         )
     )
@@ -145,6 +196,8 @@ goto :eof
 
 :fail
 echo.
-echo Установка завершилась с ошибкой.
-if "%NO_PAUSE%"=="0" pause
+echo ==================================================
+echo   Установка завершилась с ошибкой.
+echo ==================================================
+pause
 exit /b 1

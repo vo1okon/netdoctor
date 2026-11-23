@@ -34,6 +34,7 @@ UPSTREAM_RELEASES: dict[str, dict[str, str]] = {
     "sing-box": {
         "repo": "SagerNet/sing-box",
         "asset_keyword": "windows-amd64.zip",
+        "direct_archive": "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-windows-amd64.zip",
         "binary_name": "sing-box.exe",
         "license": "GPL-3.0-or-later (external binary only)",
     },
@@ -176,18 +177,22 @@ async def fetch_singbox_binary(
         return target_exe
 
     async def _fetch_with(active_client: httpx.AsyncClient) -> Path:
-        resp = await active_client.get("https://api.github.com/repos/SagerNet/sing-box/releases/latest")
-        resp.raise_for_status()
-        release = resp.json()
-        assets = release.get("assets") or []
         download_url: str | None = None
-        for asset in assets:
-            name = asset.get("name", "")
-            if "windows-amd64.zip" in name and "legacy" not in name:
-                download_url = asset.get("browser_download_url")
-                break
+        try:
+            resp = await active_client.get("https://api.github.com/repos/SagerNet/sing-box/releases/latest")
+            if resp.is_success:
+                release = resp.json()
+                assets = release.get("assets") or []
+                for asset in assets:
+                    name = asset.get("name", "")
+                    if "windows-amd64.zip" in name and "legacy" not in name:
+                        download_url = asset.get("browser_download_url")
+                        break
+        except Exception:  # noqa: BLE001
+            download_url = None
+
         if not download_url:
-            raise RuntimeError("Could not find windows-amd64.zip asset in SagerNet/sing-box latest release")
+            download_url = UPSTREAM_RELEASES["sing-box"]["direct_archive"]
 
         dl_resp = await active_client.get(download_url)
         dl_resp.raise_for_status()
@@ -529,6 +534,10 @@ async def fetch_all_bins(
             bin_dir, lists_dir, presets_path, force=force, timeout=timeout, client=active_client
         )
         ciadpi_exe = await fetch_byedpi(bin_dir, force=force, timeout=timeout, client=active_client)
+        try:
+            await fetch_xray_binary(bin_dir, force=force, timeout=timeout, client=active_client)
+        except Exception:  # noqa: BLE001
+            pass
 
         zapret_tracked = [
             bin_dir / "winws2.exe",

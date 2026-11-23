@@ -1,7 +1,17 @@
 @echo off
 setlocal EnableExtensions
-chcp 65001 >nul
 cd /d "%~dp0"
+chcp 65001 >nul 2>&1
+
+if not exist "%~dp0src\netdoctor" (
+    echo ==================================================
+    echo [ОШИБКА] Файлы проекта не найдены!
+    echo Похоже, вы запустили run.bat прямо из ZIP-архива без распаковки.
+    echo Сначала распакуйте архив: клик правой кнопкой -^> "Извлечь все...".
+    echo ==================================================
+    pause
+    exit /b 1
+)
 
 set "NEED_INSTALL=0"
 if not exist ".venv\Scripts\netdoctor-gui.exe" set "NEED_INSTALL=1"
