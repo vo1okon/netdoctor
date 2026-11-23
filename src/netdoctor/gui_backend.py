@@ -76,6 +76,7 @@ from netdoctor.storage import Storage
 from netdoctor.supervisor import (
     ProcessSupervisor,
     _is_admin,
+    fetch_all_bins,
     inspect_supervisor_state,
     stop_persisted_supervisor,
     validate_singbox_config,
@@ -425,6 +426,7 @@ class GuiBackend:
         self.zdy_presets_dir = Path(zdy_presets_dir) if zdy_presets_dir is not None else DEFAULT_ZDY_PRESETS_DIR
         self._supervisor: ProcessSupervisor | None = None
         self._lock = threading.RLock()
+        self._deps_lock = threading.Lock()
         self.orchestrator = MasterRoutingOrchestrator()
         self.clash_api = ClashApiClient(controller_addr=clash_api_addr)
         self._cached_dns_health: dict[str, Any] = {}
@@ -2370,6 +2372,11 @@ class GuiBackend:
                 "processes": self._collect_processes_state(),
             }
 
+        stack_mode = self.get_stack_mode()
+        deps_report: dict[str, Any] | None = None
+        if not self.has_core_binaries(stack_mode):
+            deps_report = self.ensure_deps(force=False)
+
         with self._lock:
             self.stop_services()
 
@@ -2390,11 +2397,13 @@ class GuiBackend:
             stack_mode = self.get_stack_mode()
             missing_core = not winws2_exe.is_file() or (stack_mode != "dpi_only" and not singbox_exe.is_file())
             if missing_core:
+                fetch_err = deps_report.get("fetch_error") if isinstance(deps_report, dict) else None
+                detail = f": {fetch_err}" if fetch_err else ""
                 return {
                     "ok": False,
                     "started": False,
                     "requires_admin": False,
-                    "error": f"Missing required binaries in {bin_path}. Verify dependencies first.",
+                    "error": f"Missing required binaries in {bin_path} (auto-download failed{detail}).",
                     "applied": applied,
                     "processes": self._collect_processes_state(),
                 }
@@ -2506,6 +2515,9 @@ class GuiBackend:
                 "requires_admin": False,
                 "error": f"Invalid network interface index (iface={iface})",
             }
+
+        if _is_admin() and not (self.bin_dir.resolve() / "winws2.exe").is_file():
+            self.ensure_deps(force=False)
 
         with self._lock:
             applied = applied if applied is not None else self.trigger_apply_configs(iface=iface)
@@ -2817,6 +2829,9 @@ class GuiBackend:
 
     def reload_singbox(self, iface: int | None = None) -> dict[str, Any]:
         """Validate sing-box.json and reload sing-box.exe while preserving winws2 and tg-ws-proxy."""
+        if _is_admin() and not (self.bin_dir.resolve() / "sing-box.exe").is_file():
+            self.ensure_deps(force=False)
+
         with self._lock:
             applied = self.trigger_apply_configs(iface=iface)
             if not _is_admin():
@@ -2984,9 +2999,47 @@ class GuiBackend:
             bin_dir=self.bin_dir,
         )
 
+    def has_core_binaries(self, stack_mode: str | None = None) -> bool:
+        """Return True when required core executables (`winws2.exe`, and `sing-box.exe` in hybrid mode) exist."""
+        bin_path = self.bin_dir.resolve()
+        mode = (stack_mode or self.get_stack_mode()).strip().lower()
+        if not (bin_path / "winws2.exe").is_file():
+            return False
+        if mode != "dpi_only" and not (bin_path / "sing-box.exe").is_file():
+            return False
+        return True
+
     def verify_deps(self) -> dict[str, Any]:
         """Verify binaries, companion files, lists, presets, and manifest integrity."""
         return verify_binaries(self.bin_dir, self.lists_dir)
+
+    def ensure_deps(self, *, force: bool = False) -> dict[str, Any]:
+        """Verify external binaries/lists/presets and automatically download missing or broken components."""
+        with self._deps_lock:
+            if not force:
+                pre = dict(verify_binaries(self.bin_dir, self.lists_dir))
+                if pre.get("ok"):
+                    pre["downloaded"] = False
+                    return pre
+
+            fetch_error: str | None = None
+            try:
+                _run_coro_sync(fetch_all_bins(self.bin_dir, self.lists_dir, force=force))
+            except Exception as exc:  # noqa: BLE001
+                fetch_error = str(exc)
+
+            post = dict(verify_binaries(self.bin_dir, self.lists_dir))
+            if fetch_error is None and not post.get("ok") and not force:
+                try:
+                    _run_coro_sync(fetch_all_bins(self.bin_dir, self.lists_dir, force=True))
+                except Exception as exc:  # noqa: BLE001
+                    fetch_error = str(exc)
+                post = dict(verify_binaries(self.bin_dir, self.lists_dir))
+
+            post["downloaded"] = fetch_error is None
+            if fetch_error is not None:
+                post["fetch_error"] = fetch_error
+            return post
 
     def trigger_revalidate(self) -> dict[str, Any]:
         """Run one canary/TTL revalidation cycle against stored decisions."""

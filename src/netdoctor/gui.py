@@ -147,7 +147,7 @@ SERVICE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("reload_sb", "Перезагрузить sing-box"),
     ("reval", "Проверить решения (Канарейка)"),
     ("gen", "Пересобрать конфиги"),
-    ("verify", "Проверить целостность файлов"),
+    ("verify", "Проверить и докачать компоненты"),
 )
 
 VERDICT_EXPLANATIONS: dict[str, str] = {
@@ -532,6 +532,7 @@ class NetdoctorGuiApp(tk.Tk):
             self.after(self.SNAPSHOT_INTERVAL_MS, self._snapshot_tick)
             self.after(self.LOG_INTERVAL_MS, self._log_tick)
             self.after(self.REALTIME_INTERVAL_MS, self._realtime_tick)
+            self._ensure_deps_on_startup()
             if auto_start_stack:
                 self.after(350, self.on_start)
 
@@ -4206,11 +4207,34 @@ class NetdoctorGuiApp(tk.Tk):
 
         self.run_bg("Hot-reload winws2", lambda: self.backend.reload_winws2(iface=iface), done)
 
+    def _format_deps_status(self, res: dict[str, Any]) -> None:
+        if res.get("fetch_error"):
+            self.set_status(f"Ошибка скачивания компонентов: {res['fetch_error']}", ERR_TEXT)
+        elif res.get("ok"):
+            if res.get("downloaded"):
+                self.set_status("Недостающие компоненты скачаны и проверены", OK_TEXT)
+            else:
+                self.set_status("Все компоненты проверены и готовы к работе", OK_TEXT)
+        else:
+            self.set_status("Часть компонентов повреждена или отсутствует", WARN_TEXT)
+
+    def _ensure_deps_on_startup(self) -> None:
+        manifest = self.backend.bin_dir / "manifest.json"
+        if self.backend.has_core_binaries() and manifest.is_file():
+            return
+
+        def done(res: dict[str, Any]) -> None:
+            self.log_console("Автодокачка компонентов:\n" + dumps_pretty(res))
+            self._format_deps_status(res)
+
+        self.run_bg("Автодокачка компонентов", self.backend.ensure_deps, done)
+
     def on_verify(self) -> None:
         def done(res: dict[str, Any]) -> None:
-            self.log_console("Verify Binaries:\n" + dumps_pretty(res))
+            self.log_console("Verify/Fetch Binaries:\n" + dumps_pretty(res))
+            self._format_deps_status(res)
 
-        self.run_bg("Проверка целостности файлов", self.backend.verify_deps, done)
+        self.run_bg("Проверка и докачка компонентов", self.backend.ensure_deps, done)
 
     def on_elevate(self) -> None:
         def done(res: dict[str, Any]) -> None:

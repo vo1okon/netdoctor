@@ -8,45 +8,50 @@ echo   netdoctor — автоматическая установка для Wind
 echo ==================================================
 echo.
 
-set "PY_EXE="
-python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
-if not errorlevel 1 (
-    for /f "usebackq delims=" %%I in (`python -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
-)
+set "NO_PAUSE=0"
+if /i "%~1"=="--no-pause" set "NO_PAUSE=1"
+
+call :find_python
 if not defined PY_EXE (
-    py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
-    if not errorlevel 1 (
-        for /f "usebackq delims=" %%I in (`py -3 -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
-    )
+    echo Python 3.11+ с поддержкой tkinter/venv не найден.
+    echo [0/4] Скачивание и автоматическая установка Python 3.12.10 x64...
+    call :install_python
+    call :find_python
 )
 
 if not defined PY_EXE (
-    echo [ОШИБКА] Не найден Python 3.11 или новее.
     echo.
-    echo Установите Python 3.11+ любым удобным способом:
-    echo   1. Скачайте с https://www.python.org/downloads/
-    echo      ^(обязательно поставьте галочку "Add python.exe to PATH"^)
-    echo   2. Либо выполните в PowerShell:
-    echo      winget install -e --id Python.Python.3.12
-    echo.
-    if /i not "%~1"=="--no-pause" pause
-    exit /b 1
+    echo [ОШИБКА] Не удалось автоматически установить Python 3.11+.
+    echo Установите Python 3.12 вручную с https://www.python.org/downloads/
+    echo ^(отметьте "Add python.exe to PATH" и компонент "tcl/tk and IDLE"^)
+    echo или выполните в PowerShell: winget install -e --id Python.Python.3.12
+    goto :fail
 )
 
 echo Найден Python: %PY_EXE%
 echo.
 
-if not exist ".venv\Scripts\python.exe" (
-    echo [1/4] Создание виртуального окружения ^(.venv^)...
+set "VENV_OK=0"
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -c "import sys, tkinter; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+    if not errorlevel 1 set "VENV_OK=1"
+)
+
+if "%VENV_OK%"=="0" (
+    if exist ".venv" (
+        echo [1/4] Обнаружено повреждённое окружение .venv — пересоздание...
+        rmdir /s /q ".venv"
+    ) else (
+        echo [1/4] Создание виртуального окружения ^(.venv^)...
+    )
     "%PY_EXE%" -m venv .venv
     if errorlevel 1 goto :fail
 ) else (
-    echo [1/4] Виртуальное окружение .venv уже существует — пропуск.
+    echo [1/4] Виртуальное окружение .venv уже готово — пропуск.
 )
 
 echo [2/4] Установка Python-зависимостей...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
-if errorlevel 1 goto :fail
 ".venv\Scripts\python.exe" -m pip install -e .
 if errorlevel 1 goto :fail
 
@@ -73,11 +78,73 @@ echo   Установка завершена успешно!
 echo   Запуск: двойной клик по ярлыку Netdoctor на Рабочем столе или по файлу run.bat
 echo ==================================================
 echo.
-if /i not "%~1"=="--no-pause" pause
+if "%NO_PAUSE%"=="0" pause
 exit /b 0
+
+:find_python
+set "PY_EXE="
+python -c "import sys, tkinter, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+if not errorlevel 1 (
+    for /f "usebackq delims=" %%I in (`python -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
+    if defined PY_EXE goto :eof
+)
+py -3 -c "import sys, tkinter, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+if not errorlevel 1 (
+    for /f "usebackq delims=" %%I in (`py -3 -c "import sys; print(sys.executable)"`) do set "PY_EXE=%%I"
+    if defined PY_EXE goto :eof
+)
+for %%P in (
+    "%LocalAppData%\Programs\Python\Python312\python.exe"
+    "%LocalAppData%\Programs\Python\Python313\python.exe"
+    "%LocalAppData%\Programs\Python\Python311\python.exe"
+    "%ProgramFiles%\Python312\python.exe"
+    "%ProgramFiles%\Python313\python.exe"
+    "%ProgramFiles%\Python311\python.exe"
+) do (
+    if exist "%%~P" (
+        "%%~P" -c "import sys, tkinter, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+        if not errorlevel 1 (
+            set "PY_EXE=%%~P"
+            goto :eof
+        )
+    )
+)
+goto :eof
+
+:install_python
+set "PY_URL=https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+set "PY_INST=%TEMP%\netdoctor-python-3.12.10-amd64.exe"
+if exist "%PY_INST%" del /f /q "%PY_INST%" >nul 2>&1
+
+where curl.exe >nul 2>&1
+if not errorlevel 1 (
+    curl.exe -4 -fL --retry 3 --connect-timeout 20 --progress-bar "%PY_URL%" -o "%PY_INST%"
+)
+if not exist "%PY_INST%" (
+    echo Пробуем скачать установщик Python через PowerShell...
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile($env:PY_URL, $env:PY_INST)"
+)
+
+if not exist "%PY_INST%" (
+    echo Не удалось скачать установщик Python напрямую, пробуем winget...
+    goto :try_winget
+)
+echo Запуск тихой установки Python 3.12.10 ^(без запроса UAC^)...
+start /wait "" "%PY_INST%" /quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_tcltk=1 Include_pip=1 Include_launcher=1
+set "INST_RC=%ERRORLEVEL%"
+del /f /q "%PY_INST%" >nul 2>&1
+if "%INST_RC%"=="0" goto :eof
+echo Прямой установщик завершился с кодом %INST_RC%, пробуем winget...
+
+:try_winget
+where winget.exe >nul 2>&1
+if not errorlevel 1 (
+    winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements
+)
+goto :eof
 
 :fail
 echo.
 echo Установка завершилась с ошибкой.
-if /i not "%~1"=="--no-pause" pause
+if "%NO_PAUSE%"=="0" pause
 exit /b 1

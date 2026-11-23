@@ -406,8 +406,15 @@ def cmd_apply(
     winws2_exe = bin_path / "winws2.exe"
     singbox_exe = bin_path / "sing-box.exe"
     if not winws2_exe.is_file() or not singbox_exe.is_file():
-        console.print(f"[red]Missing required binaries in {bin_path}. Run 'netdoctor fetch-bins' first.[/red]")
-        raise typer.Exit(code=1)
+        console.print(f"[yellow]Missing binaries in {bin_path} — downloading dependencies automatically...[/yellow]")
+        try:
+            asyncio.run(fetch_all_bins(bin_path, lists_path))
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Failed to auto-fetch required binaries: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        if not winws2_exe.is_file() or not singbox_exe.is_file():
+            console.print(f"[red]Missing required binaries in {bin_path} after auto-fetch.[/red]")
+            raise typer.Exit(code=1)
 
     specs: list[tuple[str, list[str], Path | None]] = []
 

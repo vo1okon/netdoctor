@@ -566,3 +566,187 @@ async def test_fetch_all_bins_two_args_resolves_presets_relative_to_bin_dir(
     assert report["ok"] is True
     assert report["presets"]["status"] == "ok"
     assert report["manifest"]["status"] == "ok"
+
+
+def test_gui_backend_ensure_deps_skips_valid_and_downloads_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import netdoctor.gui_backend as backend_mod
+    from netdoctor.gui_backend import GuiBackend
+
+    backend = GuiBackend(
+        db_path=tmp_path / "deps.db",
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+
+    fetch_calls: list[bool] = []
+
+    async def fake_fetch(bin_dir: Path, lists_dir: Path, presets_dir: Path | None = None, *, force: bool = False, **_kw: Any) -> dict[str, Any]:
+        fetch_calls.append(force)
+        return {"ok": True}
+
+    monkeypatch.setattr(backend_mod, "fetch_all_bins", fake_fetch)
+
+    # 1. Valid binaries -> skips download
+    monkeypatch.setattr(backend_mod, "verify_binaries", lambda *_a, **_kw: {"ok": True, "tools": {}})
+    res_valid = backend.ensure_deps()
+    assert res_valid["ok"] is True
+    assert res_valid["downloaded"] is False
+    assert fetch_calls == []
+
+    # 2. Missing binaries -> downloads once (force=False), then verifies ok
+    states = iter([{"ok": False}, {"ok": True}])
+    monkeypatch.setattr(backend_mod, "verify_binaries", lambda *_a, **_kw: next(states))
+    res_fetched = backend.ensure_deps()
+    assert res_fetched["ok"] is True
+    assert res_fetched["downloaded"] is True
+    assert fetch_calls == [False]
+
+    # 3. Broken binaries even after first fetch -> retries with force=True
+    fetch_calls.clear()
+    retry_states = iter([{"ok": False}, {"ok": False}, {"ok": True}])
+    monkeypatch.setattr(backend_mod, "verify_binaries", lambda *_a, **_kw: next(retry_states))
+    res_retried = backend.ensure_deps()
+    assert res_retried["ok"] is True
+    assert res_retried["downloaded"] is True
+    assert fetch_calls == [False, True]
+
+
+def test_gui_backend_start_services_auto_fetches_missing_bins_and_surfaces_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import netdoctor.gui_backend as backend_mod
+    from netdoctor.gui_backend import GuiBackend
+
+    bin_dir = tmp_path / "bin"
+    lists_dir = tmp_path / "lists"
+    backend = GuiBackend(
+        db_path=tmp_path / "start.db",
+        configs_dir=tmp_path / "configs",
+        lists_dir=lists_dir,
+        logs_dir=tmp_path / "logs",
+        bin_dir=bin_dir,
+    )
+
+    monkeypatch.setattr(backend_mod, "_is_admin", lambda: True)
+    monkeypatch.setattr(backend_mod, "detect_bypass_active", lambda: False)
+    monkeypatch.setattr(backend_mod, "validate_singbox_config", lambda *_a, **_kw: (True, "ok"))
+
+    # 1. Auto-fetch fails -> start_services returns clear auto-download error
+    async def failing_fetch(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        raise RuntimeError("network unreachable")
+
+    monkeypatch.setattr(backend_mod, "fetch_all_bins", failing_fetch)
+    monkeypatch.setattr(backend_mod, "verify_binaries", lambda *_a, **_kw: {"ok": False})
+    err_res = backend.start_services(force=True)
+    assert err_res["ok"] is False
+    assert "auto-download failed: network unreachable" in str(err_res["error"])
+
+    # 2. Auto-fetch downloads missing binaries -> start_services proceeds to start_stack
+    fetched_paths: list[Path] = []
+
+    async def populating_fetch(b_dir: Path, l_dir: Path, *_a: Any, **_kw: Any) -> dict[str, Any]:
+        b_dir.mkdir(parents=True, exist_ok=True)
+        (b_dir / "winws2.exe").write_bytes(_fake_pe(b"WINWS2"))
+        (b_dir / "sing-box.exe").write_bytes(_fake_pe(b"SINGBOX"))
+        fetched_paths.append(b_dir)
+        return {"ok": True}
+
+    started_specs: list[Any] = []
+
+    class FakeSupervisor:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        def start_stack(self, specs: Any, **_kw: Any) -> None:
+            started_specs.extend(specs)
+
+        def status(self) -> dict[str, Any]:
+            return {"winws2": {"running": True, "pid": 123}, "sing-box": {"running": True, "pid": 456}}
+
+        def stop_all(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(backend_mod, "fetch_all_bins", populating_fetch)
+    monkeypatch.setattr(
+        backend_mod,
+        "verify_binaries",
+        lambda *_a, **_kw: {"ok": (bin_dir / "winws2.exe").is_file() and (bin_dir / "sing-box.exe").is_file()},
+    )
+    monkeypatch.setattr(backend_mod, "ProcessSupervisor", FakeSupervisor)
+
+    ok_res = backend.start_services(force=True)
+    assert ok_res["ok"] is True, ok_res
+    assert ok_res["started"] is True
+    assert fetched_paths == [bin_dir]
+    assert [s[0] for s in started_specs] == ["winws2", "sing-box"]
+
+
+def test_cli_apply_auto_fetches_missing_binaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import netdoctor.cli as cli_mod
+
+    db_path = tmp_path / "cli_apply.db"
+    cfg_dir = tmp_path / "configs"
+    lists_dir = tmp_path / "lists"
+    bin_dir = tmp_path / "bin"
+    logs_dir = tmp_path / "logs"
+
+    monkeypatch.setattr(cli_mod, "_is_admin", lambda: True)
+    monkeypatch.setattr(cli_mod, "detect_bypass_active", lambda: False)
+    monkeypatch.setattr(cli_mod, "stop_persisted_supervisor", lambda **_kw: [])
+    monkeypatch.setattr(cli_mod, "detect_physical_egress_iface", lambda: 1)
+
+    fetch_calls: list[tuple[Path, Path]] = []
+
+    async def fake_cli_fetch(b_dir: Path, l_dir: Path, *_a: Any, **_kw: Any) -> dict[str, Any]:
+        b_dir.mkdir(parents=True, exist_ok=True)
+        (b_dir / "winws2.exe").write_bytes(_fake_pe(b"WINWS2"))
+        (b_dir / "sing-box.exe").write_bytes(_fake_pe(b"SINGBOX"))
+        fetch_calls.append((b_dir, l_dir))
+        return {"ok": True}
+
+    class FakeSupervisor:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        def start_stack(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        def status(self) -> dict[str, Any]:
+            return {"winws2": {"running": True}, "sing-box": {"running": True}}
+
+        def stop_all(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(cli_mod, "fetch_all_bins", fake_cli_fetch)
+    monkeypatch.setattr(cli_mod, "ProcessSupervisor", FakeSupervisor)
+
+    res = CliRunner().invoke(
+        app,
+        [
+            "apply",
+            "--db",
+            str(db_path),
+            "--configs-dir",
+            str(cfg_dir),
+            "--lists-dir",
+            str(lists_dir),
+            "--bin-dir",
+            str(bin_dir),
+            "--logs-dir",
+            str(logs_dir),
+            "--iface",
+            "1",
+            "--duration",
+            "0.01",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert fetch_calls == [(bin_dir.resolve(), lists_dir.resolve())]
+    assert (bin_dir / "winws2.exe").is_file()
+    assert (bin_dir / "sing-box.exe").is_file()
