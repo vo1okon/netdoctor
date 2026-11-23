@@ -675,6 +675,23 @@ def test_gui_minsize_layout_no_clipping_and_dns_alert(tmp_path: Path) -> None:
         app.update()
         assert app.tab_service.winfo_reqheight() <= app.tab_service.winfo_height() + 5
 
+        # Domains inspector rule management panel scales responsively and supports vertical scrolling
+        app._select_tab(app.tab_domains)
+        app.update_idletasks()
+        app.update()
+        assert app.rule_canvas.winfo_width() >= 295
+        assert app._rule_form_frame.winfo_width() == app.rule_canvas.winfo_width()
+        bbox = app.rule_canvas.bbox("all")
+        assert bbox is not None and bbox[3] >= app._rule_form_frame.winfo_reqheight() - 2
+        assert app.pin_btn.winfo_height() >= 22
+        assert app.unpin_btn.winfo_height() >= 22
+        # Verify vertical scrolling works when rule form exceeds canvas height or on mousewheel
+        app.rule_canvas.yview_moveto(1.0)
+        app.update_idletasks()
+        assert app.rule_canvas.yview()[1] >= 0.99
+        app.rule_canvas.yview_moveto(0.0)
+        app.update_idletasks()
+
         # Clearing alert removes dashboard alert banner
         (logs_dir / "sing-box.log").write_text("INFO started cleanly\n", encoding="utf-8")
         backend.select_dns_server("comss_dns")

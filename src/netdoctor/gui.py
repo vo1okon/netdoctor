@@ -1930,7 +1930,7 @@ class NetdoctorGuiApp(tk.Tk):
 
         tree_wrap = tk.Frame(paned, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         cols = tuple(c[0] for c in DOMAIN_COLUMNS)
-        self.domain_tree = self.make_tree(tree_wrap, cols, height=10)
+        self.domain_tree = self.make_tree(tree_wrap, cols, height=8)
         for cid, title, width, anchor in DOMAIN_COLUMNS:
             heading_txt = f"{title} ▲" if cid == "domain" else title
             self.domain_tree.heading(cid, text=heading_txt, command=lambda c=cid: self.sort_domains(c))
@@ -1945,9 +1945,9 @@ class NetdoctorGuiApp(tk.Tk):
         self.domain_tree.bind("<<TreeviewSelect>>", self.on_domain_select)
         self.domain_tree.bind("<Button-3>", self._on_domain_context_menu)
         self._scrolled(tree_wrap, self.domain_tree, horizontal=True)
-        paned.add(tree_wrap, weight=3)
+        paned.add(tree_wrap, weight=5)
 
-        paned.add(self._build_inspector(paned), weight=2)
+        paned.add(self._build_inspector(paned), weight=4)
 
         self._domain_menu = tk.Menu(self, tearoff=0, bg=CARD_ALT, fg=FG, activebackground=SELECT_BG, activeforeground="#FFFFFF")
         self._domain_menu.add_command(label="▶ Проверить доступность сейчас", command=self.on_test_selected_domain)
@@ -2121,20 +2121,19 @@ class NetdoctorGuiApp(tk.Tk):
 
     def _build_inspector(self, parent: tk.Misc) -> tk.Frame:
         panel = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-
-        right = tk.Frame(panel, bg=CARD_ALT, width=310, highlightthickness=1, highlightbackground=BORDER)
-        right.pack(side="right", fill="y", padx=(6, 10), pady=8)
-        right.pack_propagate(False)
+        panel.rowconfigure(0, weight=1, minsize=185)
+        panel.columnconfigure(0, weight=7, minsize=340)
+        panel.columnconfigure(1, weight=4, minsize=320)
 
         left = tk.Frame(panel, bg=CARD)
-        left.pack(side="left", fill="both", expand=True, padx=(12, 6), pady=8)
+        left.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=8)
         self.inspector_title = tk.Label(
             left, text="Выберите сайт в таблице выше, чтобы увидеть результаты проб", bg=CARD, fg=ACCENT, font=FONT_UI_B, anchor="w"
         )
         self.inspector_title.pack(fill="x")
         box = tk.Frame(left, bg=SIDEBAR_BG, highlightthickness=1, highlightbackground=BORDER)
         box.pack(fill="both", expand=True, pady=(6, 0))
-        self.inspector = self.make_text(box, height=8, wrap="word")
+        self.inspector = self.make_text(box, height=7, wrap="word")
         self.inspector.tag_configure("h", foreground=ACCENT, font=("Consolas", 10, "bold"))
         self.inspector.tag_configure("ok", foreground=OK_TEXT)
         self.inspector.tag_configure("bad", foreground=ERR_TEXT)
@@ -2151,40 +2150,91 @@ class NetdoctorGuiApp(tk.Tk):
         self.inspector.configure(state="disabled")
         self._scrolled(box, self.inspector)
 
+        right_outer = tk.Frame(panel, bg=CARD_ALT, highlightthickness=1, highlightbackground=BORDER)
+        right_outer.grid(row=0, column=1, sticky="nsew", padx=(6, 10), pady=8)
+
+        self.rule_canvas = tk.Canvas(right_outer, bg=CARD_ALT, highlightthickness=0, bd=0, height=195)
+        rule_vsb = ttk.Scrollbar(right_outer, orient="vertical")
+        self._rule_vsb = rule_vsb
+
+        def _sync_rule_scrollbar(first: str, last: str) -> None:
+            rule_vsb.set(first, last)
+            try:
+                need_scroll = float(first) > 0.001 or float(last) < 0.999
+                if need_scroll:
+                    if not rule_vsb.winfo_ismapped():
+                        rule_vsb.pack(side="right", fill="y")
+                elif rule_vsb.winfo_ismapped():
+                    rule_vsb.pack_forget()
+            except (ValueError, tk.TclError):
+                pass
+
+        rule_vsb.configure(command=self.rule_canvas.yview)
+        self.rule_canvas.configure(yscrollcommand=_sync_rule_scrollbar)
+        self.rule_canvas.pack(side="left", fill="both", expand=True)
+
+        right = tk.Frame(self.rule_canvas, bg=CARD_ALT)
+        self._rule_form_frame = right
+        self._rule_window_id = self.rule_canvas.create_window((0, 0), window=right, anchor="nw")
+
+        def _on_rule_frame_cfg(_e: Any = None) -> None:
+            try:
+                bbox = self.rule_canvas.bbox("all")
+                if bbox:
+                    self.rule_canvas.configure(scrollregion=bbox)
+            except tk.TclError:
+                pass
+
+        def _on_rule_canvas_cfg(e: Any) -> None:
+            try:
+                w = max(240, int(getattr(e, "width", 0)))
+                self.rule_canvas.itemconfigure(self._rule_window_id, width=w)
+                bbox = self.rule_canvas.bbox("all")
+                if bbox:
+                    self.rule_canvas.configure(scrollregion=bbox)
+            except tk.TclError:
+                pass
+
+        right.bind("<Configure>", _on_rule_frame_cfg)
+        self.rule_canvas.bind("<Configure>", _on_rule_canvas_cfg)
+
         tk.Label(right, text="Управление правилом", bg=CARD_ALT, fg=FG, font=FONT_UI_B, anchor="w").pack(
-            fill="x", padx=12, pady=(10, 2)
+            fill="x", padx=10, pady=(5, 0)
         )
-        tk.Label(
+        sub_rule_lbl = tk.Label(
             right,
             text="Запустите автоподбор или задайте слой вручную:",
             bg=CARD_ALT,
             fg=MUTED,
             font=FONT_SMALL,
             anchor="w",
-        ).pack(fill="x", padx=12, pady=(0, 8))
+            justify="left",
+        )
+        sub_rule_lbl.pack(fill="x", padx=10, pady=(0, 3))
+        self._bind_responsive_wrap(sub_rule_lbl, min_wrap=200, pad=20)
 
         auto_row = tk.Frame(right, bg=CARD_ALT)
-        auto_row.pack(fill="x", padx=12, pady=(0, 6))
-        self.make_button(auto_row, "▶ Тест", self.on_test_selected_domain, "success", font=FONT_SMALL_B, padx=5, pady=4).pack(
+        auto_row.pack(fill="x", padx=10, pady=(0, 4))
+        self.make_button(auto_row, "▶ Тест", self.on_test_selected_domain, "success", font=FONT_SMALL_B, padx=5, pady=2).pack(
             side="left", fill="x", expand=True, padx=(0, 3)
         )
-        self.make_button(auto_row, "Авто DPI", self.on_recheck_selected, "primary", font=FONT_SMALL_B, padx=5, pady=4).pack(
+        self.make_button(auto_row, "Авто DPI", self.on_recheck_selected, "primary", font=FONT_SMALL_B, padx=5, pady=2).pack(
             side="left", fill="x", expand=True, padx=(0, 3)
         )
-        self.make_button(auto_row, "Авто DNS", self.on_roll_dns_selected, "neutral", font=FONT_SMALL_B, padx=5, pady=4).pack(
+        self.make_button(auto_row, "Авто DNS", self.on_roll_dns_selected, "neutral", font=FONT_SMALL_B, padx=5, pady=2).pack(
             side="left", fill="x", expand=True
         )
 
-        tk.Frame(right, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=12, pady=(0, 6))
+        tk.Frame(right, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=10, pady=(0, 3))
 
         tk.Label(right, text="Ручной выбор слоя и стратегии:", bg=CARD_ALT, fg=FG_SOFT, font=FONT_SMALL_B, anchor="w").pack(
-            fill="x", padx=12
+            fill="x", padx=10
         )
         self.override_layer_var = tk.StringVar(value="dpi")
         self.override_layer_cb = ttk.Combobox(
             right, textvariable=self.override_layer_var, values=OVERRIDE_LAYERS, state="readonly"
         )
-        self.override_layer_cb.pack(fill="x", padx=12, pady=(4, 2))
+        self.override_layer_cb.pack(fill="x", padx=10, pady=(2, 1))
         self.override_layer_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_override_layer_changed())
 
         self._override_layer_hint_lbl = tk.Label(
@@ -2194,26 +2244,56 @@ class NetdoctorGuiApp(tk.Tk):
             fg=MUTED,
             font=FONT_SMALL,
             anchor="w",
-            wraplength=274,
+            wraplength=280,
             justify="left",
         )
-        self._override_layer_hint_lbl.pack(fill="x", padx=12, pady=(0, 5))
-        self._bind_responsive_wrap(self._override_layer_hint_lbl, min_wrap=220, pad=24)
+        self._override_layer_hint_lbl.pack(fill="x", padx=10, pady=(0, 3))
+        self._bind_responsive_wrap(self._override_layer_hint_lbl, min_wrap=200, pad=20)
 
         self.override_strategy_var = tk.StringVar()
         self.override_strategy_cb = ttk.Combobox(right, textvariable=self.override_strategy_var, state="readonly")
-        self.override_strategy_cb.pack(fill="x", padx=12, pady=(0, 6))
+        self.override_strategy_cb.pack(fill="x", padx=10, pady=(0, 4))
 
         pin_row = tk.Frame(right, bg=CARD_ALT)
-        pin_row.pack(fill="x", padx=12, pady=(0, 6))
-        self.make_button(pin_row, "📌 Закрепить (Pin)", self.on_pin, "primary", font=FONT_SMALL_B, padx=8, pady=5).pack(
-            side="left", fill="x", expand=True, padx=(0, 4)
+        pin_row.pack(fill="x", padx=10, pady=(0, 6))
+        self.pin_btn = self.make_button(
+            pin_row, "📌 Закрепить (Pin)", self.on_pin, "primary", font=FONT_SMALL_B, padx=8, pady=3
         )
+        self.pin_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
         self.unpin_btn = self.make_button(
-            pin_row, "Открепить", self.on_toggle_pin_selected, "neutral", font=FONT_SMALL, padx=8, pady=5
+            pin_row, "Открепить", self.on_toggle_pin_selected, "neutral", font=FONT_SMALL, padx=8, pady=3
         )
         self.unpin_btn.pack(side="left")
+
+        self._bind_rule_mousewheel(right_outer)
         return panel
+
+    def _on_rule_mousewheel(self, event: Any) -> str | None:
+        if self._closed or not hasattr(self, "rule_canvas"):
+            return None
+        try:
+            if not self.rule_canvas.winfo_viewable():
+                return None
+            first, last = self.rule_canvas.yview()
+            if float(first) <= 0.001 and float(last) >= 0.999:
+                return None
+        except tk.TclError:
+            return None
+        delta = getattr(event, "delta", 0)
+        if delta:
+            step = -1 if delta > 0 else 1
+            if abs(delta) >= 120:
+                step = int(-delta / 120)
+            self.rule_canvas.yview_scroll(step, "units")
+            return "break"
+        return None
+
+    def _bind_rule_mousewheel(self, widget: tk.Misc) -> None:
+        """Recursively attach <MouseWheel> handler to rule management panel widgets (excluding Combobox dropdown wheel)."""
+        if not isinstance(widget, ttk.Combobox):
+            widget.bind("<MouseWheel>", self._on_rule_mousewheel, add="+")
+        for child in widget.winfo_children():
+            self._bind_rule_mousewheel(child)
 
     # ---------------------------------------------------------------- Tab 3: Пресеты Zapret2
 
