@@ -17,8 +17,10 @@ import pytest
 from typer.testing import CliRunner
 
 from netdoctor.cli import app
+from netdoctor.config_gen import extract_blob_args
 from netdoctor.supervisor import (
     UPSTREAM_RELEASES,
+    _sync_blockcheck_fake_bins,
     fetch_all_bins,
     fetch_byedpi,
     fetch_tg_ws_proxy,
@@ -750,3 +752,46 @@ def test_cli_apply_auto_fetches_missing_binaries(
     assert fetch_calls == [(bin_dir.resolve(), lists_dir.resolve())]
     assert (bin_dir / "winws2.exe").is_file()
     assert (bin_dir / "sing-box.exe").is_file()
+
+
+def test_sync_blockcheck_fake_bins_copies_without_clobber(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bc_fake = bin_dir / "blockcheck" / "zapret" / "files" / "fake"
+    bc_fake.mkdir(parents=True)
+    kyber_src = bc_fake / "tls_clienthello_vk_com_kyber.bin"
+    kyber_src.write_bytes(b"KYBER_HELLO")
+    existing_src = bc_fake / "tls_clienthello_www_google_com.bin"
+    existing_src.write_bytes(b"BLOCKCHECK_GOOGLE")
+
+    files_dir = bin_dir / "files"
+    files_dir.mkdir(parents=True)
+    existing_dst = files_dir / "tls_clienthello_www_google_com.bin"
+    existing_dst.write_bytes(b"EXISTING_GOOGLE")
+
+    copied = _sync_blockcheck_fake_bins(bin_dir)
+
+    assert files_dir / "tls_clienthello_vk_com_kyber.bin" in copied
+    assert (files_dir / "tls_clienthello_vk_com_kyber.bin").read_bytes() == b"KYBER_HELLO"
+    assert existing_dst.read_bytes() == b"EXISTING_GOOGLE"
+
+
+def test_extract_blob_args_falls_back_for_missing_files(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    files_dir = bin_dir / "files"
+    files_dir.mkdir(parents=True)
+    (files_dir / "tls_clienthello_www_google_com.bin").write_bytes(b"TLS_GOOGLE")
+    (files_dir / "stun.bin").write_bytes(b"STUN_PKT")
+
+    blob_args = extract_blob_args(
+        [
+            "--lua-desync=fake:blob=tls_vk_kyber:repeats=6",
+            "--lua-desync=fake:blob=discord_active:repeats=6",
+            "--lua-desync=fake:blob=quic_rutube:repeats=4",
+        ],
+        bin_dir=bin_dir,
+    )
+
+    assert "--blob=tls_vk_kyber:@files/tls_clienthello_www_google_com.bin" in blob_args
+    assert "--blob=discord_active:@files/stun.bin" in blob_args
+    assert f"--blob=quic_rutube:0x{'00' * 64}" in blob_args
+

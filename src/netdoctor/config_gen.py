@@ -293,7 +293,30 @@ def detect_physical_egress_iface() -> int | None:
 _BLOB_REF_RE = re.compile(r"(?:blob|seqovl_pattern)=([A-Za-z0-9_]+)")
 
 
-def extract_blob_args(args: list[str]) -> list[str]:
+def _resolve_blob_value(name: str, files_dir: Path, validate_files: bool) -> str:
+    val = KNOWN_BLOBS[name]
+    if not (validate_files and val.startswith("@files/")):
+        return val
+    target = files_dir / val[len("@files/") :]
+    if target.is_file() and target.stat().st_size > 0:
+        return val
+
+    if name.startswith(("tls", "http")):
+        fallback = "@files/tls_clienthello_www_google_com.bin"
+    elif name.startswith("quic") or name == "fake_dbankcloud":
+        fallback = "@files/quic_initial_www_google_com.bin"
+    elif name in ("discord_active", "game_active") or "stun" in name:
+        fallback = "@files/stun.bin"
+    else:
+        fallback = "@files/zero_256.bin"
+
+    fb_target = files_dir / fallback[len("@files/") :]
+    if fb_target.is_file() and fb_target.stat().st_size > 0:
+        return fallback
+    return "0x" + ("00" * 64)
+
+
+def extract_blob_args(args: list[str], bin_dir: str | Path | None = None) -> list[str]:
     """Return sorted --blob=... definitions for any KNOWN_BLOBS referenced in winws2 args."""
     needed: set[str] = set()
     for tok in args:
@@ -302,7 +325,9 @@ def extract_blob_args(args: list[str]) -> list[str]:
                 name = match.group(1)
                 if name in KNOWN_BLOBS:
                     needed.add(name)
-    return [f"--blob={name}:{KNOWN_BLOBS[name]}" for name in sorted(needed)]
+    files_dir = (Path(bin_dir) if bin_dir is not None else Path("bin")) / "files"
+    validate_files = files_dir.is_dir()
+    return [f"--blob={name}:{_resolve_blob_value(name, files_dir, validate_files)}" for name in sorted(needed)]
 
 
 def _uses_known_file_blob(strat: Strategy) -> bool:

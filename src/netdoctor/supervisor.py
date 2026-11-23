@@ -261,6 +261,24 @@ async def fetch_xray_binary(
         return await _fetch_with(own_client)
 
 
+def _sync_blockcheck_fake_bins(bin_dir: Path) -> list[Path]:
+    """Copy missing or empty .bin fake payloads from bin/blockcheck/** into bin/files/."""
+    blockcheck_dir = bin_dir / "blockcheck"
+    if not blockcheck_dir.is_dir():
+        return []
+    files_dir = bin_dir / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for src in sorted(blockcheck_dir.rglob("*.bin")):
+        if not src.is_file() or src.stat().st_size == 0:
+            continue
+        dst = files_dir / src.name
+        if not dst.exists() or dst.stat().st_size == 0:
+            shutil.copy2(src, dst)
+            copied.append(dst)
+    return copied
+
+
 async def fetch_zapret_win_bundle(
     bin_dir: Path = DEFAULT_BIN_DIR,
     *,
@@ -287,6 +305,7 @@ async def fetch_zapret_win_bundle(
         "cygwin_cygpath": bin_dir / "cygwin" / "bin" / "cygpath.exe",
     }
     if not force and all(p.exists() and p.stat().st_size > 0 for p in sentinels.values()):
+        _sync_blockcheck_fake_bins(bin_dir)
         return sentinels
 
     url = UPSTREAM_RELEASES["zapret-win-bundle"]["branch_archive"]
@@ -310,6 +329,7 @@ async def fetch_zapret_win_bundle(
                 out = _safe_extract_file(bin_dir, rel, zf.read(info.filename))
                 extracted[str(rel)] = out
 
+    _sync_blockcheck_fake_bins(bin_dir)
     for key, path in sentinels.items():
         if path.exists():
             extracted.setdefault(key, path)
@@ -1545,6 +1565,11 @@ class ProcessSupervisor:
         if exe_path.is_absolute() or "/" in exe or "\\" in exe or exe.lower().endswith(".exe"):
             if not exe_path.is_file() and shutil.which(exe) is None:
                 raise FileNotFoundError(f"Executable not found for '{name}': {exe}")
+
+        if name == "winws2":
+            _sync_blockcheck_fake_bins(
+                Path(cwd) if cwd is not None else (exe_path.parent if exe_path.parent != Path(".") else self.bin_dir)
+            )
 
         was_running = (name in self.processes and self.processes[name].poll() is None) or (
             name in self._adopted
