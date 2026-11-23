@@ -1,0 +1,37 @@
+# Python / venv / caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Local runtime databases & logs
+netdoctor.db
+netdoctor.db-*
+*.db
+*.db-journal
+*.db-wal
+logs/
+*.log
+
+# Generated runtime configs & personal VPN credentials
+configs/sing-box.json
+configs/winws2_live_at.txt
+configs/winws2_preset.txt
+
+# Generated dynamic hostlists (keep static lists and zapret2 lists)
+lists/exclude_unlocker_domains.txt
+lists/exclude_vpn_ips.txt
+lists/tls_*.txt
+lists/quic_*.txt
+lists/*.backup
+
+# Heavy external binaries & runtime tools
+bin/
+
+# OS / IDE / shortcuts
+*.lnk
+.DS_Store
+Thumbs.db

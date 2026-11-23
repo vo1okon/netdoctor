@@ -1,0 +1,345 @@
+strategies:
+- id: tls_multisplit_pos2
+  family: multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=multisplit:pos=2
+  description: Light TLS ClientHello split at byte 2
+- id: tls_multisplit_sni
+  family: multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=multisplit:pos=midsld
+  description: Light TLS ClientHello split at middle of SLD
+- id: tls_fakedsplit_pos2
+  family: fakedsplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fakedsplit:pos=2:tcp_ts=-600000:tcp_md5
+  description: Light TLS fake + split at byte 2
+- id: tls_fake_repeats6
+  family: fake
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=fake_default_tls:repeats=6:tcp_ack=-66000:tcp_ts_up:ip_autottl=-1,3-20:ip6_autottl=-1,3-20
+  description: Heavy TLS fake ClientHello with 6 repeats
+- id: tls_multidisorder_seqovl
+  family: multidisorder
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=multidisorder:pos=1,midsld:seqovl=5
+  description: Heavy TLS disorder with sequence overlap
+- id: quic_fake_repeats6
+  family: quic_fake
+  protocol: quic
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=fake_default_quic:repeats=6
+  description: QUIC Initial fake packet injection (6 repeats)
+- id: quic_fallback_tcp
+  family: quic_fallback
+  protocol: quic
+  tier: 3
+  args_template: []
+  description: Drop UDP/443 in sing-box so browser falls back to TCP/TLS
+- id: tls_hostfakesplit_ozon
+  family: hostfakesplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=hostfakesplit:host=ozon.ru:tcp_ts=-600000:tcp_md5:repeats=4
+  description: ALT9 TLS hostfakesplit impersonating ozon.ru with TCP MD5
+- id: tls_hostfakesplit_google
+  family: hostfakesplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=hostfakesplit:host=www.google.com:tcp_ts=-600000:repeats=4:ip_id=zero
+  description: ALT9 TLS hostfakesplit impersonating www.google.com
+- id: tls_fakedsplit_autottl
+  family: fakedsplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fakedsplit:pos=1:repeats=10:tcp_ack=-66000:tcp_ts_up:ip_autottl=-1,3-20:ip6_autottl=-1,3-20
+  description: ALT9 Cloudflare fakedsplit with autottl and bad tcp_ack
+- id: tls_alt9_youtube_video
+  family: fake_multisplit
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=tls_google:tcp_ts=-600000:tcp_ts_up:ip_id=zero:repeats=8
+  - --lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=tls_google:ip_id=zero
+  description: ALT9 YouTube video fake + seqovl multisplit with tls_google blob
+- id: tls_alt9_discord
+  family: fake_multisplit
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:tcp_ts=-600000:tcp_ts_up:repeats=8
+  - --lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=tls_google
+  description: ALT9 Discord fake TLS SNI mod + seqovl multisplit
+- id: quic_fake_google_autottl
+  family: quic_fake
+  protocol: quic
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=quic_google:ip_autottl=-2,3-20:ip6_autottl=-2,3-20:repeats=10:payload=all
+  description: ALT9 QUIC fake using quic_google blob and autottl
+- id: tls_alt1_199_fake_fakedsplit
+  family: fake_fakedsplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=tls_google:tcp_ts=-600000:ip_id=zero:repeats=6
+  - --lua-desync=fakedsplit:pattern=0x00:tcp_ts=-600000:ip_id=zero:repeats=6
+  description: 'ALT1 1.9.9: fake tls_google + fakedsplit (проверенный пресет для YouTube/Discord)'
+- id: tls_alt1_1103_fake_fakedsplit
+  family: fake_fakedsplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=tls_google:tcp_ts=-600000:tcp_ts_up:ip_id=zero:repeats=6
+  - --lua-desync=fakedsplit:pos=2:pattern=0x00:tcp_ts=-600000:tcp_ts_up:ip_id=zero:repeats=6
+  description: 'ALT1 1.10.3: fake tls_google + fakedsplit pos=2 с tcp_ts_up'
+- id: tls_general_1103_seqovl681
+  family: multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=tls_google:ip_id=zero
+  description: 'general 1.10.3: multisplit seqovl=681 с паттерном tls_google (YouTube)'
+- id: tls_general_1103_seqovl568_4pda
+  family: multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=multisplit:pos=1:seqovl=568:seqovl_pattern=tls_4pda
+  description: 'general 1.10.3: multisplit seqovl=568 с паттерном tls_4pda (Discord/общий)'
+- id: tls_fake_tls_auto_alt2_1103
+  family: fake_multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=10000000:tcp_ack=-66000:tcp_ts_up:ip_id=zero:repeats=8
+  - --lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=tls_google:ip_id=zero
+  description: 'FAKE TLS AUTO ALT2 1.10.3: fake SNI + tcp_seq + multisplit seqovl
+    681'
+- id: tls_fake_tls_auto_11
+  family: fake_multidisorder
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=0x00000000:repeats=11:tcp_ack=-66000:tcp_ts_up
+  - --lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:repeats=11:tcp_ack=-66000:tcp_ts_up
+  - --lua-desync=multidisorder_legacy:pos=1,midsld:repeats=11
+  description: 'ALL TCP & UDP fake_tls_auto_11: двойной fake x11 + multidisorder_legacy'
+- id: tls_simple_fake_alt2_max
+  family: fake
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=tls_max:tcp_ts=1:repeats=6
+  description: 'SIMPLE FAKE ALT2: лёгкий fake tls_max (tcp_ts=1, repeats=6)'
+- id: tls_simple_fake_badseq
+  family: fake
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=fake_default_tls:repeats=6:tcp_ack=-66000:tcp_ts_up
+  description: 'SIMPLE FAKE: fake ClientHello с badseq (tcp_ack=-66000) и tcp_ts_up'
+- id: tls_rostelecom_multidisorder
+  family: multidisorder
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=multidisorder:pos=1,host+2,sld+2,sld+5,sniext+1,sniext+2,endhost-2:seqovl=1
+  description: 'Ростелеком: сложная нарезка multidisorder вокруг SNI (7 позиций)'
+- id: tls_multisplit_complex
+  family: multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=multisplit:pos=1,host+2,sld+2,sld+5,sniext+1,sniext+2,endhost-2:seqovl=1
+  description: 'Multisplit Complex: нарезка ClientHello по 7 позициям SNI'
+- id: tls_hostfakesplit_2gis
+  family: hostfakesplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=hostfakesplit:host=2gis.ru:repeats=4:tcp_ts=-600000
+  description: 'ALT9 Discord: hostfakesplit с подменой SNI на 2gis.ru'
+- id: tls_hostfakesplit_ozon_ts1000
+  family: hostfakesplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=hostfakesplit:host=ozon.ru:tcp_ts=-1000:tcp_md5:repeats=4
+  description: hostfakesplit ozon.ru с tcp_ts=-1000 и tcp_md5 (мессенджеры и веб)
+- id: tls_syndata_multidisorder_legacy
+  family: syndata
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=send:repeats=2
+  - --lua-desync=syndata:blob=tls_google
+  - --lua-desync=multidisorder_legacy:pos=2
+  description: Syndata + MultiDisorder legacy с паттерном tls_google
+- id: tls_syndata_multisplit_seqovl
+  family: syndata
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=send:repeats=2
+  - --lua-desync=syndata:blob=tls_google
+  - --lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=tls_google
+  description: Syndata + MultiSplit seqovl=681 (tls_google)
+- id: tls_censorliber_google_seqovl
+  family: fake
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=tls_google:ip_autottl=-1,3-20:ip6_autottl=-1,3-20:repeats=6:tcp_ack=-66000:seqovl=680:seqovl_pattern=tls_google
+  description: 'Censorliber: fake tls_google + AutoTTL + TCP ACK + seqovl=680'
+- id: tls_censorliber_max_seqovl
+  family: fake
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=tls_max:ip_autottl=-1,3-20:ip6_autottl=-1,3-20:repeats=6:tcp_ack=-66000:seqovl=680:seqovl_pattern=tls_max
+  description: 'Censorliber: fake tls_max + AutoTTL + TCP ACK + seqovl=680'
+- id: tls_fake_datanoack
+  family: fake
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=fake_default_tls:tcp_flags_unset=ack:tls_mod=rnd,rndsni,padencap
+  description: 'Fake DataNoAck: сброс ACK-флага + рандомизация SNI и padencap'
+- id: tls_fakeddisorder_autottl
+  family: fakeddisorder
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fakeddisorder:pos=2,midsld-2:tcp_ack=-66000:ip_autottl=0,3-20:ip6_autottl=0,3-20
+  description: 'FakedDisorder AutoTTL: расщепление с обратным порядком и badseq'
+- id: tls_telegram_alt1_combo
+  family: fake_fakedsplit
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=fake_stun_as_tls:tcp_ts=-600000:repeats=6
+  - --lua-desync=fake:blob=tls_google:tcp_ts=-600000:repeats=6
+  - --lua-desync=fakedsplit:pattern=0x00:tcp_ts=-600000:repeats=6
+  - --lua-desync=fake:blob=tls_max:tcp_ts=-600000:repeats=6
+  description: ALT1 Telegram / WhatsApp / Social комбо (STUN + Google + fakedsplit
+    + Max)
+- id: quic_fake_google_repeats6
+  family: quic_fake
+  protocol: quic
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=quic_google:repeats=6:payload=all
+  description: ALT1 QUIC fake quic_google (6 повторов)
+- id: quic_fake_google_repeats11
+  family: quic_fake
+  protocol: quic
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=quic_google:repeats=11:payload=all
+  description: FAKE TLS AUTO ALT2 QUIC fake quic_google (11 повторов)
+- id: quic_fake_autottl_repeats12
+  family: quic_fake
+  protocol: quic
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=quic_google:repeats=12:ip_autottl=2,3-20:ip6_autottl=2,3-20:payload=all
+  description: QUIC fake quic_google AutoTTL (12 повторов)
+- id: quic_fake_zero64
+  family: quic_fake
+  protocol: quic
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=zero64:repeats=12:payload=all
+  description: QUIC fake zero64 (12 повторов для сложных UDP-блокировок)
+- id: quic_fake_ttl0_badsum
+  family: quic_fake
+  protocol: quic
+  tier: 3
+  args_template:
+  - --lua-desync=fake:blob=quic_google:repeats=15:ip_ttl=0:ip6_ttl=0:badsum:payload=all
+  description: QUIC fake TTL=0 + badsum (15 повторов)
+- id: tls_alt12_1104_sferum_seqovl
+  family: fake_multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=stun_pat:tcp_ts=-600000:repeats=8
+  - --lua-desync=fake:blob=tls_sferum:tcp_ts=-600000:repeats=8
+  - --lua-desync=multisplit:pos=1:seqovl=664:seqovl_pattern=tls_sferum
+  description: 'ALT12 1.10.4: двойной fake (STUN + Sferum) + multisplit seqovl=664'
+- id: tls_alt13_1104_sochi_hostfakesplit
+  family: fake_hostfakesplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=tls_sochi:tcp_ts=-600000:repeats=5
+  - --lua-desync=fake:blob=stun2:tcp_ts=-600000:repeats=5
+  - --lua-desync=hostfakesplit:host=mail.ru:altorder=1:tcp_ts=-600000:repeats=5
+  description: 'ALT13 1.10.4: двойной fake (Sochi + STUN2) + hostfakesplit mail.ru
+    altorder=1'
+- id: tls_exp_1104_hostfakesplit_google
+  family: hostfakesplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=hostfakesplit:host=www.google.com:tcp_ts=-600000:ip_id=zero
+  description: 'EXP 1.10.4: hostfakesplit www.google.com с tcp_ts и ip_id=zero'
+- id: tls_fakedsplit_vk_kyber
+  family: fake_fakedsplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=tls_vk_kyber:tcp_ts=-600000:ip_id=zero:repeats=6
+  - --lua-desync=fakedsplit:pos=2:pattern=0x00:tcp_ts=-600000:ip_id=zero:repeats=6
+  description: 'Kyber: fake tls_vk_kyber + fakedsplit pos=2 (для постквантового TLS)'
+- id: tls_clone_multisplit_sni
+  family: multisplit
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=tls_client_hello_clone
+  - --lua-desync=multisplit:pos=1,midsld
+  description: 'Zapret2 v1.0.7: tls_client_hello_clone + multisplit по midsld'
+- id: tls_oob_multisplit_pos2
+  family: oob
+  protocol: tls
+  tier: 3
+  args_template:
+  - --lua-desync=oob:pos=2
+  description: 'Zapret2 v1.0.7: TCP OOB urgent byte на pos=2'
+- id: tls_tcpseg_sni
+  family: tcpseg
+  protocol: tls
+  tier: 2
+  args_template:
+  - --lua-desync=tcpseg:pos=0,midsld
+  description: 'Zapret2 v1.0.7: TCP сегментация ClientHello без overlap (tcpseg)'
+- id: quic_fake_rutube_repeats8
+  family: quic_fake
+  protocol: quic
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=quic_rutube:repeats=8:payload=all
+  description: QUIC fake под Rutube Initial (8 повторов)
+- id: quic_fake_5ka_repeats8
+  family: quic_fake
+  protocol: quic
+  tier: 2
+  args_template:
+  - --lua-desync=fake:blob=quic_5ka:repeats=8:payload=all
+  description: QUIC fake под 5ka Initial (8 повторов)

@@ -1,0 +1,13 @@
+targets:
+  - domain: discord.com
+    test_url: https://discord.com/assets/favicon.ico
+  - domain: youtube.com
+    test_url: https://www.youtube.com/favicon.ico
+  - domain: rutracker.org
+    test_url: https://rutracker.org/favicon.ico
+  - domain: instagram.com
+    test_url: https://www.instagram.com/favicon.ico
+  - domain: x.com
+    test_url: https://x.com/favicon.ico
+  - domain: telegram.org
+    test_url: https://telegram.org/favicon.ico
