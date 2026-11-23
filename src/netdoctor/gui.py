@@ -4020,10 +4020,15 @@ class NetdoctorGuiApp(tk.Tk):
             events = res.get("events") or []
             self.populate_connections_table(conns, events)
             healed = res.get("healed") or []
+            deferred = res.get("reload_deferred") or []
             if healed:
                 names = ", ".join(f"{h['domain']}→{h.get('strategy_id') or h['layer']}" for h in healed)
                 self.log_console(f"Live-Радар автоподбор: {names}")
                 self.set_status(f"Live-Радар подобрал: {names}", OK_TEXT)
+                if deferred:
+                    self.log_console(
+                        f"Перезапуск {', '.join(deferred)} отложен — есть активные рабочие соединения"
+                    )
                 self.refresh_async()
 
         def failed(_exc: Exception) -> None:

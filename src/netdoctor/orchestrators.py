@@ -444,6 +444,46 @@ def _parse_singbox_failed_ips(sb_tail: str) -> set[str]:
     return failed
 
 
+def _parse_clash_conn_age_sec(start_raw: Any, now_dt: datetime | None = None) -> float | None:
+    """Parse Clash API RFC3339/ISO-8601 connection start timestamp and return age in seconds."""
+    if not start_raw or not isinstance(start_raw, str):
+        return None
+    raw = start_raw.strip()
+    if not raw:
+        return None
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    raw = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1)[:6]).ljust(6, "0"), raw)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    cur = now_dt or datetime.now(timezone.utc).astimezone()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=cur.tzinfo)
+    return max(0.0, (cur - parsed).total_seconds())
+
+
+def _node_has_healthy_connections(clash_conns: list[dict[str, Any]], node_tag: str) -> bool:
+    """Return True if any live Clash connection through `node_tag` has bidirectional traffic."""
+    clean_tag = (node_tag or "").strip()
+    if not clean_tag or not clash_conns:
+        return False
+    for c in clash_conns:
+        if not isinstance(c, dict):
+            continue
+        if clean_tag not in (c.get("chains") or []):
+            continue
+        try:
+            up = int(c.get("upload") or 0)
+            dn = int(c.get("download") or 0)
+        except (TypeError, ValueError):
+            continue
+        if up > 0 and dn > 0:
+            return True
+    return False
+
+
 def _is_external_ip(ip_str: str) -> bool:
     """Return True if ip_str is a routable/external address (keeps RFC 5737 test IPs for unit tests)."""
     clean = ip_str.split("%", 1)[0].strip()
@@ -1620,6 +1660,17 @@ class VpnLayerOrchestrator:
         health_map = storage.get_vpn_node_health_map()
         sel_now, active_leaf, _ = ClashApiClient.resolve_active_proxy(proxies, selector_tag)
 
+        clash_conns: list[dict[str, Any]] = []
+        get_conns_fn = getattr(clash_client, "get_connections", None)
+        if callable(get_conns_fn):
+            try:
+                conn_payload = await get_conns_fn()
+                raw_c = (conn_payload.get("connections") or []) if isinstance(conn_payload, dict) else []
+                clash_conns = [c for c in raw_c if isinstance(c, dict)]
+            except Exception:  # noqa: BLE001
+                clash_conns = []
+        active_has_live_traffic = bool(active_leaf and _node_has_healthy_connections(clash_conns, active_leaf))
+
         priority_node = str(policy.get("priority_node") or "").strip()
         has_custom_prio = bool(priority_node) or any(
             int(n.get("priority") if n.get("priority") is not None else 100) < 100 for n in real_nodes
@@ -1728,6 +1779,39 @@ class VpnLayerOrchestrator:
                 str(h.get("quarantined_until") or "")
             )
 
+        async def _check_active_node_alive(node: dict[str, Any], active_tag: str) -> bool:
+            probe = await _probe_via_clash(node)
+            if probe.get("alive"):
+                return True
+            if not force and active_has_live_traffic:
+                await asyncio.sleep(0.25)
+                ok2, rtt2, err2 = await self._measure_clash_node_delay(clash_client, active_tag, timeout)
+                if ok2:
+                    node_for_db = dict(node)
+                    node_for_db["tag"] = active_tag
+                    rec = self.record_node_result(
+                        storage,
+                        node_for_db,
+                        ok=True,
+                        rtt_ms=rtt2,
+                        protocol_ok=True,
+                        error="",
+                    )
+                    probed_results[active_tag] = {
+                        "tag": active_tag,
+                        "alive": True,
+                        "ping_ms": rtt2,
+                        "probe_result": err2,
+                        "protocol_ok": True,
+                        "cb_state": rec["cb_state"],
+                        "consecutive_fails": rec["consecutive_fails"],
+                        "ewma_rtt_ms": rec["ewma_rtt_ms"],
+                        "tunnel_verified": True,
+                        "node": node,
+                    }
+                    return True
+            return False
+
         if effective_mode == "priority":
             def _prio_sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int, int]:
                 idx, n = item
@@ -1751,8 +1835,7 @@ class VpnLayerOrchestrator:
 
             active_alive = False
             if active_leaf and active_leaf in node_by_tag and active_leaf in proxies:
-                active_probe = await _probe_via_clash(node_by_tag[active_leaf])
-                active_alive = bool(active_probe.get("alive"))
+                active_alive = await _check_active_node_alive(node_by_tag[active_leaf], active_leaf)
 
             if active_alive and ordered_tags and active_leaf == ordered_tags[0]:
                 if sel_now != active_leaf:
@@ -1768,6 +1851,16 @@ class VpnLayerOrchestrator:
                 }
 
             if active_alive and active_leaf in ordered_tags:
+                if not force and active_has_live_traffic:
+                    self._active_node_tag = active_leaf
+                    return {
+                        "ok": True,
+                        "action": "keep_active_session",
+                        "selector": sel_now,
+                        "selected": active_leaf,
+                        "previous": active_leaf,
+                        "probed": list(probed_results.values()),
+                    }
                 active_rank = ordered_tags.index(active_leaf)
                 higher_candidates = [
                     n
@@ -1863,8 +1956,7 @@ class VpnLayerOrchestrator:
 
         active_alive = False
         if active_leaf and active_leaf in node_by_tag and active_leaf in proxies:
-            active_probe = await _probe_via_clash(node_by_tag[active_leaf])
-            active_alive = bool(active_probe.get("alive"))
+            active_alive = await _check_active_node_alive(node_by_tag[active_leaf], active_leaf)
             if sel_now == "vpn-auto" and active_alive:
                 self._active_node_tag = active_leaf
                 return {
@@ -1877,6 +1969,16 @@ class VpnLayerOrchestrator:
                 }
 
         if sel_now != "vpn-auto":
+            if active_alive and not force and active_has_live_traffic:
+                self._active_node_tag = active_leaf
+                return {
+                    "ok": True,
+                    "action": "keep_active_session",
+                    "selector": sel_now,
+                    "selected": active_leaf,
+                    "previous": active_leaf,
+                    "probed": list(probed_results.values()),
+                }
             cooldown_ok = (
                 not active_alive
                 or force
@@ -2296,7 +2398,8 @@ class RealtimeConnectionMonitor:
         sb_tail = _tail_text(logs_dir / "sing-box.log", max_bytes=131072)
         failed_ips = _parse_singbox_failed_ips(sb_tail)
 
-        stalled_clash_ips: set[str] = set()
+        healthy_clash_endpoints: set[tuple[str, int]] = set()
+        healthy_clash_domains: set[str] = set()
         stalled_clash_endpoints: set[tuple[str, int]] = set()
         clash_flows: list[dict[str, Any]] = []
         for c in clash_conns:
@@ -2338,9 +2441,22 @@ class RealtimeConnectionMonitor:
                 download_b = int(c.get("download") or 0)
             except (TypeError, ValueError):
                 download_b = 0
-            is_stalled = upload_b > 0 and download_b == 0
+            age_sec = _parse_clash_conn_age_sec(c.get("start"))
+            is_healthy = upload_b > 0 and download_b > 0
+            is_stalled = (
+                upload_b > 0
+                and download_b == 0
+                and proto in ("tls", "http", "tcp", "quic")
+                and (age_sec is None or age_sec >= 3.0)
+            )
+            if is_healthy:
+                healthy_clash_endpoints.add((rip, rport))
+                if host:
+                    healthy_clash_domains.add(host)
+                    matched_h, _ = _match_decision_domain(host, decisions_map)
+                    if matched_h:
+                        healthy_clash_domains.add(matched_h)
             if is_stalled:
-                stalled_clash_ips.add(rip)
                 stalled_clash_endpoints.add((rip, rport))
 
             clash_flows.append(
@@ -2350,6 +2466,7 @@ class RealtimeConnectionMonitor:
                     "rport": rport,
                     "proto": proto,
                     "host": host,
+                    "is_healthy": is_healthy,
                     "is_stalled": is_stalled,
                 }
             )
@@ -2363,6 +2480,7 @@ class RealtimeConnectionMonitor:
             proto: str,
             sock_status: str,
             observed_host: str | None,
+            active_healthy: bool = False,
         ) -> dict[str, Any]:
             matched_domain, dec = _match_decision_domain(observed_host, decisions_map)
             display_domain = matched_domain or observed_host or "—"
@@ -2379,27 +2497,31 @@ class RealtimeConnectionMonitor:
                     if display_domain != "—"
                 )
             )
-            has_valid_domain = bool(
-                matched_domain
-                and "." in matched_domain
-                and display_domain != "—"
-                and not _is_ip_literal(matched_domain)
-                and not matched_domain.endswith((".local", ".arpa", ".lan", ".internal"))
+            endpoint_stalled = (rip, rport) in stalled_clash_endpoints or sock_status == "STALLED"
+            is_healthy_conn = bool(
+                (
+                    active_healthy
+                    or (rip, rport) in healthy_clash_endpoints
+                    or (matched_domain and matched_domain in healthy_clash_domains)
+                )
+                and not endpoint_stalled
+                and sock_status != "SYN_SENT"
             )
+            is_telemetry = _is_telemetry_noise_domain(display_domain)
 
             if is_unlocker_conn:
                 layer = "unlocker"
                 strategy_id = "hosts/unlocker"
                 health = "protected"
-            elif sock_status == "SYN_SENT" or rip in failed_ips or rip in stalled_clash_ips:
+            elif is_healthy_conn:
+                health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
+            elif is_telemetry:
+                health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
+            elif sock_status in ("SYN_SENT", "STALLED") or endpoint_stalled or rip in failed_ips:
                 health = "needs_fix"
             elif dec is not None and dec.status != "active":
                 health = "needs_fix"
             elif matched_domain and matched_domain in rotated_domains and (dec is None or dec.layer == "dpi"):
-                health = "needs_fix"
-            elif matched_domain and matched_domain in known_targets and dec is None:
-                health = "needs_fix"
-            elif has_valid_domain and dec is None and proto in ("tls", "quic") and not _is_telemetry_noise_domain(display_domain):
                 health = "needs_fix"
             elif dec is not None and dec.layer in ("dpi", "vpn", "dns"):
                 health = "protected"
@@ -2418,6 +2540,7 @@ class RealtimeConnectionMonitor:
                 "layer": layer,
                 "strategy_id": strategy_id,
                 "health": health,
+                "active_healthy": is_healthy_conn,
             }
 
         conns = self._read_inet_connections()
@@ -2495,6 +2618,7 @@ class RealtimeConnectionMonitor:
                     proto=flow["proto"],
                     sock_status=sock_status,
                     observed_host=observed_host,
+                    active_healthy=bool(flow.get("is_healthy")),
                 )
             )
 
@@ -2534,9 +2658,26 @@ class RealtimeConnectionMonitor:
         with self._lock:
             cooldowns = dict(self.cooldown_until)
 
+        healthy_domains = {
+            str(c.get("domain") or "").lower()
+            for c in connections
+            if c.get("domain")
+            and c.get("domain") != "—"
+            and c.get("health") != "needs_fix"
+            and (c.get("active_healthy") or c.get("socket_status") == "ESTABLISHED")
+        }
+
         for conn in connections:
             dom = str(conn.get("domain") or "")
-            if conn.get("layer") == "unlocker" or conn.get("health") != "needs_fix" or not dom or dom == "—" or _is_rdns_ptr_hostname(dom):
+            if (
+                conn.get("layer") == "unlocker"
+                or conn.get("health") != "needs_fix"
+                or not dom
+                or dom == "—"
+                or _is_rdns_ptr_hostname(dom)
+                or _is_telemetry_noise_domain(dom)
+                or dom.lower() in healthy_domains
+            ):
                 continue
             if dom in seen or cooldowns.get(dom, 0.0) > now:
                 continue
@@ -2557,6 +2698,7 @@ class RealtimeConnectionMonitor:
             if (
                 not dom
                 or dom in seen
+                or dom in healthy_domains
                 or cooldowns.get(dom, 0.0) > now
                 or _is_rdns_ptr_hostname(dom)
                 or _is_telemetry_noise_domain(dom)
@@ -2772,12 +2914,15 @@ class RealtimeConnectionMonitor:
         if any_saved:
             self.invalidate_scan_cache()
 
+        reload_deferred: list[str] = []
         if any_saved and (dpi_or_vpn_changed or winws2_changed or singbox_changed):
             procs = backend._collect_processes_state()
             is_adm = _is_admin()
             if ((procs.get("winws2") or {}).get("running")) and is_adm:
                 if hasattr(backend, "reload_winws2_if_changed"):
-                    backend.reload_winws2_if_changed(min_interval_sec=20.0)
+                    w_res = backend.reload_winws2_if_changed(min_interval_sec=20.0, defer_if_active=True)
+                    if isinstance(w_res, dict) and w_res.get("deferred"):
+                        reload_deferred.append("winws2")
                 else:
                     backend.reload_winws2()
             else:
@@ -2785,7 +2930,9 @@ class RealtimeConnectionMonitor:
 
             if singbox_changed and ((procs.get("sing-box") or {}).get("running")) and is_adm:
                 if hasattr(backend, "reload_singbox_if_changed"):
-                    backend.reload_singbox_if_changed(min_interval_sec=15.0)
+                    sb_res = backend.reload_singbox_if_changed(min_interval_sec=15.0, defer_if_active=True)
+                    if isinstance(sb_res, dict) and sb_res.get("deferred"):
+                        reload_deferred.append("sing-box")
                 else:
                     backend.reload_singbox()
 
@@ -2801,7 +2948,7 @@ class RealtimeConnectionMonitor:
 
         with self._lock:
             events = list(self.recent_events)
-        return {"connections": connections, "healed": healed, "events": events}
+        return {"connections": connections, "healed": healed, "events": events, "reload_deferred": reload_deferred}
 
 
 class MasterRoutingOrchestrator:

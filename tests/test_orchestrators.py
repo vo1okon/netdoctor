@@ -1250,10 +1250,11 @@ def test_clash_synthesis_stalled_singbox_log_failures_and_unknown_domain_auto_he
     assert by_dom["discord.com"]["process"] == "sing-box"
     assert by_dom["discord.com"]["protocol"] == "quic"
     assert by_dom["discord.com"]["health"] == "protected"
-    # (c) Unknown domain outside targets.yaml with dec is None -> needs_fix so it gets auto-probed
-    assert by_dom["healthy-unknown.example"]["health"] == "needs_fix"
+    # (c) Healthy ESTABLISHED unknown domain outside targets.yaml with bidirectional Clash traffic stays direct (not disrupted!)
+    assert by_dom["healthy-unknown.example"]["health"] == "direct"
+    assert by_dom["healthy-unknown.example"]["active_healthy"] is True
 
-    # Now test (c) auto-heal probes unknown domains once and caches direct decisions so they are NOT re-probed
+    # Now verify auto-heal leaves healthy ESTABLISHED unknown domain alone and only probes/heals failing domain
     heal_db = tmp_path / "unknown_heal.db"
     heal_logs = tmp_path / "heal_logs"
     heal_logs.mkdir(parents=True, exist_ok=True)
@@ -1279,7 +1280,7 @@ def test_clash_synthesis_stalled_singbox_log_failures_and_unknown_domain_auto_he
             type=socket.SOCK_STREAM,
             laddr=SimpleNamespace(ip="192.168.1.10", port=52002),
             raddr=SimpleNamespace(ip="203.0.113.81", port=443),
-            status="ESTABLISHED",
+            status="SYN_SENT",
             pid=3002,
         ),
     ]
@@ -1323,21 +1324,23 @@ def test_clash_synthesis_stalled_singbox_log_failures_and_unknown_domain_auto_he
     monkeypatch.setattr(heal_backend.orchestrator.monitor, "_resolve_pid_name", lambda pid: "browser.exe")
 
     res1 = asyncio.run(heal_backend.orchestrator.monitor.auto_heal_connections(heal_backend, max_domains_per_tick=5))
-    assert set(probed_domains) == {"ok-outside.example", "blocked-outside.example"}
+    assert set(probed_domains) == {"blocked-outside.example"}
     healed_by_dom = {h["domain"]: h for h in res1["healed"]}
-    assert healed_by_dom["ok-outside.example"]["layer"] == "direct"
     assert healed_by_dom["blocked-outside.example"]["layer"] == "dpi"
 
     res1_conns = {c["domain"]: c for c in res1["connections"]}
     assert res1_conns["ok-outside.example"]["health"] == "direct"
-    assert res1_conns["blocked-outside.example"]["health"] == "protected"
+    assert res1_conns["blocked-outside.example"]["layer"] == "dpi"
 
-    # Clear cooldowns and verify a second tick does NOT re-probe cached direct/dpi decisions
+    # Once the healed socket connects cleanly (ESTABLISHED), it shows as protected and tick 2 does NOT re-probe
+    heal_conns[1].status = "ESTABLISHED"
     heal_backend.orchestrator.monitor.cooldown_until.clear()
     probed_domains.clear()
     res2 = asyncio.run(heal_backend.orchestrator.monitor.auto_heal_connections(heal_backend, max_domains_per_tick=5))
     assert res2["healed"] == []
     assert probed_domains == []
+    res2_conns = {c["domain"]: c for c in res2["connections"]}
+    assert res2_conns["blocked-outside.example"]["health"] == "protected"
 
 
 def test_comss_dns_ip_ai_preset_and_singbox_doh_sni_resolution() -> None:

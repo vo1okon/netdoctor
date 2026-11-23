@@ -732,7 +732,7 @@ def test_audit_fixes_telemetry_noise_filter_and_strict_16kb_probe(
     assert _is_telemetry_noise_domain("healthy-unknown.example") is False
     assert _is_telemetry_noise_domain("youtube.com") is False
 
-    # Scan keeps telemetry noise domains as direct instead of polluting needs_fix
+    # Scan keeps healthy ESTABLISHED connections direct and keeps failing telemetry noise out of needs_fix
     st = Storage(tmp_path / "noise.db")
     try:
         mon = RealtimeConnectionMonitor()
@@ -740,19 +740,29 @@ def test_audit_fixes_telemetry_noise_filter_and_strict_16kb_probe(
         mon.ip_to_domain["203.0.113.11"] = "healthy-unknown.example"
 
         class _Sock:
-            def __init__(self, ip: str, port: int = 443) -> None:
+            def __init__(self, ip: str, port: int = 443, status: str = "ESTABLISHED") -> None:
                 self.raddr = (ip, port)
-                self.status = "ESTABLISHED"
+                self.status = status
                 self.pid = 4242
                 self.type = 1
 
         monkeypatch.setattr(psutil, "net_connections", lambda kind="inet": [_Sock("203.0.113.10"), _Sock("203.0.113.11")])
         monkeypatch.setattr(mon, "_resolve_pid_name", lambda pid: "chrome.exe")
 
-        rows = mon.scan_active_connections(st, tmp_path / "logs", net_key="AS12389:home:test")
-        by_dom = {r["domain"]: r for r in rows}
-        assert by_dom["aka.ms"]["health"] == "direct"
-        assert by_dom["healthy-unknown.example"]["health"] == "needs_fix"
+        rows_ok = mon.scan_active_connections(st, tmp_path / "logs", net_key="AS12389:home:test")
+        by_dom_ok = {r["domain"]: r for r in rows_ok}
+        assert by_dom_ok["aka.ms"]["health"] == "direct"
+        assert by_dom_ok["healthy-unknown.example"]["health"] == "direct"
+
+        monkeypatch.setattr(
+            psutil,
+            "net_connections",
+            lambda kind="inet": [_Sock("203.0.113.10", status="SYN_SENT"), _Sock("203.0.113.11", status="SYN_SENT")],
+        )
+        rows_fail = mon.scan_active_connections(st, tmp_path / "logs", net_key="AS12389:home:test")
+        by_dom_fail = {r["domain"]: r for r in rows_fail}
+        assert by_dom_fail["aka.ms"]["health"] == "direct"
+        assert by_dom_fail["healthy-unknown.example"]["health"] == "needs_fix"
     finally:
         st.close()
 

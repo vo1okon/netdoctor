@@ -549,11 +549,7 @@ def generate_winws2_config(
         "--ctrack-disable=0",
         "--ipcache-lifetime=8400",
         "--ipcache-hostname=1",
-        (
-            "--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443,1024-65535"
-            if game_filter
-            else "--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443"
-        ),
+        "--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443",
     ]
     if enable_tcp_in:
         args.append("--wf-tcp-in=80,443")
@@ -579,7 +575,12 @@ def generate_winws2_config(
         if srv_clean and "." in srv_clean and "/" not in srv_clean and not _is_ip_address(srv_clean):
             vpn_hostnames.add(srv_clean)
 
-    catchall_excluded_domains = sorted(set(excluded_set) | vpn_hostnames)
+    direct_domains = {
+        d.domain.strip().lower()
+        for d in decisions
+        if d.layer == "direct" and d.status == "active" and d.domain and d.domain.strip()
+    }
+    catchall_excluded_domains = sorted(set(excluded_set) | vpn_hostnames | direct_domains)
     exclude_hostlist_path: Path | None = None
     if catchall_excluded_domains:
         exclude_hostlist_path = lists_path / "exclude_unlocker_domains.txt"

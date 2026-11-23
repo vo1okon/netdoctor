@@ -42,6 +42,10 @@ from netdoctor.orchestrators import (
     DNS_CATEGORIES,
     SERVICE_PRESETS,
     MasterRoutingOrchestrator,
+    RealtimeConnectionMonitor,
+    _INTERNAL_PROXY_PROCESSES,
+    _is_external_ip,
+    _parse_clash_conn_age_sec,
     build_unlocker_protection_context,
 )
 from netdoctor.presets import (
@@ -406,6 +410,10 @@ def launch_gui_detached(
         return {"ok": False, "launched": False, "error": str(exc), "command": cmd}
 
 
+_WEB_KEEPALIVE_PORTS: frozenset[int] = frozenset({53, 80, 443, 8080, 8443})
+_ACTIVE_FLOW_IDLE_SEC: float = 15.0
+
+
 class GuiBackend:
     """Thread-safe backend bridging netdoctor diagnostics, storage, configs, VPNs, and supervised processes."""
 
@@ -443,6 +451,9 @@ class GuiBackend:
         self._last_winws2_reload_ts: float = 0.0
         self._last_singbox_hash: str = ""
         self._last_singbox_reload_ts: float = 0.0
+        self._pending_winws2_reload: bool = False
+        self._pending_singbox_reload: bool = False
+        self._clash_conn_traffic: dict[str, tuple[int, float]] = {}
         self._desired_running: bool = False
         self._stopping: bool = False
         self._watchdog_restarts: int = 0
@@ -2530,6 +2541,9 @@ class GuiBackend:
             self._desired_running = True
             self._last_winws2_hash = self._winws2_args_hash(applied["winws2_args"])
             self._last_winws2_reload_ts = time.monotonic()
+            self._pending_winws2_reload = False
+            self._pending_singbox_reload = False
+            self._clash_conn_traffic.clear()
             try:
                 sb_cfg_path = Path(applied["singbox_config"])
                 self._last_singbox_hash = (
@@ -2570,6 +2584,9 @@ class GuiBackend:
             with self._lock:
                 self._desired_running = False
                 self._watchdog_next_retry_ts = 0.0
+                self._pending_winws2_reload = False
+                self._pending_singbox_reload = False
+                self._clash_conn_traffic.clear()
                 self._service_retry_ts.clear()
                 self._service_fail_counts.clear()
                 try:
@@ -2684,6 +2701,7 @@ class GuiBackend:
 
             self._last_winws2_hash = self._winws2_args_hash(applied["winws2_args"])
             self._last_winws2_reload_ts = time.monotonic()
+            self._pending_winws2_reload = False
             return {
                 "ok": True,
                 "reloaded": True,
@@ -2693,10 +2711,132 @@ class GuiBackend:
                 "processes": self._collect_processes_state(),
             }
 
+    def _active_working_connections(self, *, service: str) -> list[dict[str, Any]]:
+        """Return currently active working connections (stateful non-web sessions or actively flowing transfers)."""
+        procs = self._collect_processes_state()
+        sb_running = bool((procs.get("sing-box") or {}).get("running"))
+        winws_running = bool((procs.get("winws2") or {}).get("running"))
+        protected: list[dict[str, Any]] = []
+
+        if sb_running:
+            try:
+                conn_data = self.clash_api.get_connections_sync()
+            except Exception:  # noqa: BLE001
+                conn_data = {}
+            if not isinstance(conn_data, dict):
+                return []
+            raw_conns = conn_data.get("connections")
+            if not isinstance(raw_conns, list):
+                return []
+
+            now = time.monotonic()
+            seen_ids: set[str] = set()
+            with self._lock:
+                for c in raw_conns:
+                    if not isinstance(c, dict):
+                        continue
+                    meta = c.get("metadata") or {}
+                    rip = str(meta.get("destinationIP") or "").strip()
+                    try:
+                        rport = int(meta.get("destinationPort") or 0)
+                    except (TypeError, ValueError):
+                        rport = 0
+                    if not rip or not _is_external_ip(rip) or rport <= 0:
+                        continue
+
+                    raw_proc = str(meta.get("processPath") or "").strip()
+                    proc_name = Path(raw_proc.replace("\\", "/")).name.lower() if raw_proc else ""
+                    if proc_name and (
+                        proc_name in _INTERNAL_PROXY_PROCESSES
+                        or proc_name == "tg-ws-proxy.exe"
+                        or "tgwsproxy" in proc_name
+                    ):
+                        continue
+
+                    try:
+                        up = int(c.get("upload") or 0)
+                        dn = int(c.get("download") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if up <= 0 or dn <= 0:
+                        continue
+
+                    total = up + dn
+                    conn_id = str(c.get("id") or f"{proc_name}:{rip}:{rport}")
+                    seen_ids.add(conn_id)
+                    prev = self._clash_conn_traffic.get(conn_id)
+                    if prev is not None:
+                        prev_total, last_change_ts = prev
+                        if total > prev_total:
+                            self._clash_conn_traffic[conn_id] = (total, now)
+                            actively_flowing = True
+                        else:
+                            actively_flowing = (now - last_change_ts) < _ACTIVE_FLOW_IDLE_SEC
+                    else:
+                        age_sec = _parse_clash_conn_age_sec(c.get("start"))
+                        if age_sec is not None and age_sec >= _ACTIVE_FLOW_IDLE_SEC:
+                            self._clash_conn_traffic[conn_id] = (total, now - _ACTIVE_FLOW_IDLE_SEC)
+                            actively_flowing = False
+                        else:
+                            self._clash_conn_traffic[conn_id] = (total, now)
+                            actively_flowing = True
+
+                    is_stateful_non_web = rport not in _WEB_KEEPALIVE_PORTS
+                    if is_stateful_non_web or actively_flowing:
+                        protected.append(
+                            {
+                                "process": proc_name or "sing-box",
+                                "remote": f"{rip}:{rport}",
+                                "port": rport,
+                                "stateful": is_stateful_non_web,
+                                "flowing": actively_flowing,
+                            }
+                        )
+
+                for stale_id in [k for k in self._clash_conn_traffic if k not in seen_ids]:
+                    self._clash_conn_traffic.pop(stale_id, None)
+            return protected
+
+        if service == "winws2" and winws_running:
+            for c in RealtimeConnectionMonitor._read_inet_connections():
+                if str(getattr(c, "status", "") or "") != "ESTABLISHED":
+                    continue
+                if getattr(c, "type", socket.SOCK_STREAM) != socket.SOCK_STREAM:
+                    continue
+                raddr = getattr(c, "raddr", None)
+                if not raddr:
+                    continue
+                rip = str(getattr(raddr, "ip", None) or (raddr[0] if len(raddr) >= 1 else ""))
+                rport = int(getattr(raddr, "port", None) or (raddr[1] if len(raddr) >= 2 else 0))
+                if not rip or not _is_external_ip(rip) or rport <= 0 or rport in _WEB_KEEPALIVE_PORTS:
+                    continue
+                pid = getattr(c, "pid", None)
+                proc_name = self.orchestrator.monitor._resolve_pid_name(pid).lower()
+                if (
+                    proc_name in _INTERNAL_PROXY_PROCESSES
+                    or proc_name == "tg-ws-proxy.exe"
+                    or "tgwsproxy" in proc_name
+                ):
+                    continue
+                protected.append(
+                    {
+                        "process": proc_name,
+                        "remote": f"{rip}:{rport}",
+                        "port": rport,
+                        "stateful": True,
+                        "flowing": True,
+                    }
+                )
+            return protected
+
+        return []
+
     def reload_winws2_if_changed(
         self,
         iface: int | None = None,
         min_interval_sec: float = 20.0,
+        *,
+        defer_if_active: bool = False,
     ) -> dict[str, Any]:
         """Hot-reload winws2 ONLY if its generated args changed AND cooldown interval elapsed."""
         with self._lock:
@@ -2705,6 +2845,7 @@ class GuiBackend:
             procs = self._collect_processes_state()
             winws_running = bool((procs.get("winws2") or {}).get("running"))
             if winws_running and self._last_winws2_hash and new_hash == self._last_winws2_hash:
+                self._pending_winws2_reload = False
                 return {
                     "ok": True,
                     "reloaded": False,
@@ -2722,6 +2863,19 @@ class GuiBackend:
                     "applied": applied,
                     "processes": procs,
                 }
+            if winws_running and defer_if_active:
+                active_conns = self._active_working_connections(service="winws2")
+                if active_conns:
+                    self._pending_winws2_reload = True
+                    return {
+                        "ok": True,
+                        "reloaded": False,
+                        "deferred": True,
+                        "skipped": "active_connections",
+                        "active_connections": len(active_conns),
+                        "applied": applied,
+                        "processes": procs,
+                    }
         if getattr(self.reload_winws2, "__func__", None) is GuiBackend.reload_winws2:
             return self.reload_winws2(iface=iface, applied=applied)
         return self.reload_winws2(iface=iface)
@@ -2842,6 +2996,15 @@ class GuiBackend:
                             restarted.append("sing-box")
                     w_net_res = self.reload_winws2()
                     if w_net_res.get("ok"):
+                        restarted.append("winws2")
+            if not network_changed:
+                if self._pending_singbox_reload and sb_running and stack_mode != "dpi_only":
+                    sb_pend = self.reload_singbox_if_changed(min_interval_sec=15.0, defer_if_active=True)
+                    if sb_pend.get("reloaded") and "sing-box" not in restarted:
+                        restarted.append("sing-box")
+                if self._pending_winws2_reload:
+                    w_pend = self.reload_winws2_if_changed(min_interval_sec=20.0, defer_if_active=True)
+                    if w_pend.get("reloaded") and "winws2" not in restarted:
                         restarted.append("winws2")
             return {
                 "checked": True,
@@ -3022,6 +3185,7 @@ class GuiBackend:
             except OSError:
                 self._last_singbox_hash = ""
             self._last_singbox_reload_ts = time.monotonic()
+            self._pending_singbox_reload = False
             self._sync_singbox_vpn_selector()
 
             return {
@@ -3037,6 +3201,8 @@ class GuiBackend:
         self,
         iface: int | None = None,
         min_interval_sec: float = 15.0,
+        *,
+        defer_if_active: bool = False,
     ) -> dict[str, Any]:
         """Hot-reload sing-box ONLY if generated sing-box.json changed AND cooldown interval elapsed."""
         with self._lock:
@@ -3049,6 +3215,7 @@ class GuiBackend:
             procs = self._collect_processes_state()
             sb_running = bool((procs.get("sing-box") or {}).get("running"))
             if sb_running and self._last_singbox_hash and new_hash == self._last_singbox_hash:
+                self._pending_singbox_reload = False
                 return {
                     "ok": True,
                     "reloaded": False,
@@ -3066,6 +3233,19 @@ class GuiBackend:
                     "applied": applied,
                     "processes": procs,
                 }
+            if sb_running and defer_if_active:
+                active_conns = self._active_working_connections(service="sing-box")
+                if active_conns:
+                    self._pending_singbox_reload = True
+                    return {
+                        "ok": True,
+                        "reloaded": False,
+                        "deferred": True,
+                        "skipped": "active_connections",
+                        "active_connections": len(active_conns),
+                        "applied": applied,
+                        "processes": procs,
+                    }
         return self.reload_singbox(iface=iface)
 
     def _reload_running_services(self, *, winws2: bool = False, singbox: bool = False) -> None:
