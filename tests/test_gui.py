@@ -385,6 +385,7 @@ def test_controller_backward_compatibility_and_headless_check(
         configs_dir=configs_dir,
         lists_dir=lists_dir,
         logs_dir=logs_dir,
+        bin_dir=tmp_path / "bin",
     )
     assert isinstance(ctrl.backend, GuiBackend)
     ctrl_snap = ctrl.get_status_snapshot()

@@ -485,31 +485,43 @@ class Storage:
 
     def get_all_subscription_nodes(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT id, nodes_json FROM subscriptions ORDER BY id ASC").fetchall()
+        priorities_map = self.get_vpn_selection_policy()["priorities"]
         all_nodes: list[dict[str, Any]] = []
         seen: set[str] = set()
         for r in rows:
             sub_id = str(r["id"] or "default")
             for raw_node in json.loads(r["nodes_json"]):
                 node = dict(raw_node)
-                orig_tag = str(node.get("tag") or "")
+                orig_tag = str(node.get("tag") or "").strip() or "vpn-node"
+                shown_name = str(node.get("display_name") or orig_tag).strip() or orig_tag
+                node["display_name"] = shown_name
                 node_sub_id = str(node.get("subscription_id") or sub_id)
                 if orig_tag in seen:
-                    node["display_name"] = node.get("display_name") or orig_tag
                     base_tag = f"{node_sub_id}__{orig_tag}"
-                    new_tag = base_tag
+                    final_tag = base_tag
                     suffix = 2
-                    while new_tag in seen:
-                        new_tag = f"{base_tag}_{suffix}"
+                    while final_tag in seen:
+                        final_tag = f"{base_tag}_{suffix}"
                         suffix += 1
-                    node["tag"] = new_tag
-                    raw_outbound = node.get("raw_outbound")
-                    if isinstance(raw_outbound, dict):
-                        updated_ob = dict(raw_outbound)
-                        updated_ob["tag"] = new_tag
-                        node["raw_outbound"] = updated_ob
-                    seen.add(new_tag)
                 else:
-                    seen.add(orig_tag)
+                    final_tag = orig_tag
+                seen.add(final_tag)
+                node["tag"] = final_tag
+                raw_outbound = node.get("raw_outbound")
+                if isinstance(raw_outbound, dict):
+                    updated_ob = dict(raw_outbound)
+                    updated_ob["tag"] = final_tag
+                    node["raw_outbound"] = updated_ob
+                if final_tag in priorities_map:
+                    node["priority"] = int(priorities_map[final_tag])
+                elif node.get("priority") is None:
+                    node["priority"] = 100
+                else:
+                    node["priority"] = int(node["priority"])
+                if "enabled" not in node or node.get("enabled") is None:
+                    node["enabled"] = True
+                else:
+                    node["enabled"] = bool(node["enabled"])
                 all_nodes.append(node)
         return all_nodes
 
@@ -620,6 +632,59 @@ class Storage:
                 """,
                 (key, str(value)),
             )
+
+    def get_vpn_selection_policy(self) -> dict[str, Any]:
+        """Read persisted VPN node selection mode (`auto` | `priority`), preferred node tag, and priority map."""
+        raw_mode = self.get_setting("vpn_selection_mode", "auto").strip().lower()
+        mode = "priority" if raw_mode == "priority" else "auto"
+        priority_node = self.get_setting("vpn_priority_node", "").strip()
+        raw_prio = self.get_setting("vpn_node_priorities", "{}")
+        priorities: dict[str, int] = {}
+        try:
+            parsed = json.loads(raw_prio)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    clean_tag = str(k or "").strip()
+                    if not clean_tag:
+                        continue
+                    try:
+                        val = max(1, min(999, int(v)))
+                    except (TypeError, ValueError):
+                        continue
+                    priorities[clean_tag] = val
+        except (json.JSONDecodeError, TypeError):
+            priorities = {}
+        return {
+            "mode": mode,
+            "priority_node": priority_node,
+            "priorities": priorities,
+        }
+
+    def set_vpn_selection_policy(
+        self,
+        *,
+        mode: str | None = None,
+        priority_node: str | None = None,
+        priorities: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Persist VPN selection mode, preferred priority node tag, and/or per-node priority mapping."""
+        if mode is not None:
+            clean_mode = "priority" if str(mode).strip().lower() == "priority" else "auto"
+            self.set_setting("vpn_selection_mode", clean_mode)
+        if priority_node is not None:
+            self.set_setting("vpn_priority_node", str(priority_node).strip())
+        if priorities is not None:
+            sanitized: dict[str, int] = {}
+            for k, v in priorities.items():
+                clean_tag = str(k or "").strip()
+                if not clean_tag:
+                    continue
+                try:
+                    sanitized[clean_tag] = max(1, min(999, int(v)))
+                except (TypeError, ValueError):
+                    continue
+            self.set_setting("vpn_node_priorities", json.dumps(sanitized, ensure_ascii=False))
+        return self.get_vpn_selection_policy()
 
     def save_custom_dns(self, entry: dict[str, Any]) -> dict[str, Any]:
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")

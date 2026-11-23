@@ -15,12 +15,12 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import dns.resolver
 
 from netdoctor.models import Decision, Protocol, Strategy, VpnNode
-from netdoctor.vpn import infer_node_region
+from netdoctor.vpn import infer_node_region, is_placeholder_node
 
 KNOWN_BLOBS: dict[str, str] = {
     "quic_google": "@files/quic_initial_www_google_com.bin",
@@ -350,13 +350,34 @@ def _resolve_single_hostname(srv: str) -> list[str]:
 
     from netdoctor.probes import order_system_nameservers, record_system_nameserver_winner
 
+    def _collect_v4_from_resolver(res: dns.resolver.Resolver) -> tuple[list[str], bool]:
+        """Return (sorted_ipv4_list, nxdomain_hit)."""
+        try:
+            ans = res.resolve(srv, "A")
+            ips = {
+                r.address
+                for r in ans
+                if ipaddress.ip_address(r.address).version == 4
+            }
+            return sorted(ips), False
+        except dns.resolver.NXDOMAIN:
+            return [], True
+        except (
+            dns.resolver.NoAnswer,
+            dns.resolver.LifetimeTimeout,
+            dns.resolver.NoNameservers,
+            OSError,
+            ValueError,
+        ):
+            return [], False
+
     try:
         resolver = dns.resolver.Resolver()
         ordered_ns = order_system_nameservers([str(ns) for ns in (resolver.nameservers or [])])
         if ordered_ns:
             resolver.nameservers = ordered_ns
-        resolver.timeout = 0.5
-        resolver.lifetime = 1.2
+        resolver.timeout = 0.6
+        resolver.lifetime = 1.5
         ans = resolver.resolve(srv, "A")
         if ordered_ns:
             record_system_nameserver_winner(ordered_ns, str(getattr(ans, "nameserver", "") or ""))
@@ -365,15 +386,39 @@ def _resolve_single_hostname(srv: str) -> list[str]:
             for r in ans
             if ipaddress.ip_address(r.address).version == 4
         }
-        return sorted(ips)
+        if ips:
+            return sorted(ips)
+    except dns.resolver.NXDOMAIN:
+        return []
     except (
-        dns.resolver.NXDOMAIN,
         dns.resolver.NoAnswer,
         dns.resolver.LifetimeTimeout,
         dns.resolver.NoNameservers,
         OSError,
         ValueError,
     ):
+        pass
+
+    # System DNS timed out or had no answer — fallback to public resolvers before giving up
+    pub_resolver = dns.resolver.Resolver(configure=False)
+    pub_resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
+    pub_resolver.timeout = 0.6
+    pub_resolver.lifetime = 1.5
+    pub_ips, nx = _collect_v4_from_resolver(pub_resolver)
+    if nx:
+        return []
+    if pub_ips:
+        return pub_ips
+
+    try:
+        infos = socket.getaddrinfo(srv, None, socket.AF_INET)
+        fallback_ips = {
+            str(sockaddr[0]).split("%", 1)[0]
+            for _f, _t, _p, _c, sockaddr in infos
+            if _is_ip_address(str(sockaddr[0]).split("%", 1)[0])
+        }
+        return sorted(fallback_ips)
+    except (socket.gaierror, OSError):
         return []
 
 
@@ -428,7 +473,7 @@ def resolve_vpn_ips(raw_servers: list[str] | None) -> list[str]:
             if len(_VPN_DNS_CACHE) > 256:
                 _VPN_DNS_CACHE.clear()
             for host, ips in zip(to_resolve, results):
-                ttl = 300.0 if ips else 120.0
+                ttl = 300.0 if ips else 10.0
                 _VPN_DNS_CACHE[host.lower()] = (list(ips), done_now + ttl)
                 resolved.update(ips)
 
@@ -528,10 +573,17 @@ def generate_winws2_config(
     else:
         exclude_ipset_path.write_text("# No VPN server IPs configured\n", encoding="utf-8")
 
+    vpn_hostnames: set[str] = set()
+    for raw_srv in vpn_server_ips or []:
+        srv_clean = (raw_srv or "").strip().lower()
+        if srv_clean and "." in srv_clean and "/" not in srv_clean and not _is_ip_address(srv_clean):
+            vpn_hostnames.add(srv_clean)
+
+    catchall_excluded_domains = sorted(set(excluded_set) | vpn_hostnames)
     exclude_hostlist_path: Path | None = None
-    if excluded_set:
+    if catchall_excluded_domains:
         exclude_hostlist_path = lists_path / "exclude_unlocker_domains.txt"
-        exclude_hostlist_path.write_text("\n".join(excluded_set) + "\n", encoding="utf-8")
+        exclude_hostlist_path.write_text("\n".join(catchall_excluded_domains) + "\n", encoding="utf-8")
 
     hostlists_map: dict[str, list[str]] = {}
     profile_count = 0
@@ -828,6 +880,7 @@ DEFAULT_BYPASS_PROCESSES: tuple[str, ...] = (
     "TgWsProxy_windows.exe",
     "tg-ws-proxy.exe",
     "python.exe",
+    "pythonw.exe",
     "Antigravity.exe",
     "language_server_windows_x64.exe",
     "Cursor.exe",
@@ -869,6 +922,8 @@ def generate_singbox_config(
     extra_dns_servers_sni: bool = True,
     doh_tls_sni: str | None = None,
     tun_stack: str = "gvisor",
+    vpn_selection_mode: str = "auto",
+    preferred_vpn_node: str | None = None,
 ) -> dict[str, Any]:
     """Generate sing-box 1.12+/1.14+ JSON configuration combining global + per-domain DoH/bypass DNS rules, Telegram proxy route, multi-VPN regional/auto/AI urltest/selector outbounds, and Clash API."""
     vpn_nodes = vpn_nodes or []
@@ -891,6 +946,29 @@ def generate_singbox_config(
                 per_dns_domains.setdefault(dns_id, []).append(d.domain)
                 per_dns_override_hosts.add(d.domain)
 
+    # Bucket layer="vpn" decisions by target outbound and expand CDN/alias domains
+    vpn_select_set: set[str] = set()
+    vpn_ai_set: set[str] = set()
+    byedpi_set: set[str] = set()
+    for d in decisions:
+        if d.layer == "vpn" and not _is_bypassed(d.domain):
+            expanded = [d.domain]
+            expanded.extend(CDN_DOMAIN_EXPANSIONS.get(d.domain.strip().lower(), ()))
+            if d.strategy_id == "vpn-ai":
+                target_bucket = vpn_ai_set
+            elif d.strategy_id == "byedpi-out" and enable_byedpi:
+                target_bucket = byedpi_set
+            else:
+                target_bucket = vpn_select_set
+            for dom_cand in expanded:
+                if dom_cand and not _is_bypassed(dom_cand):
+                    target_bucket.add(dom_cand)
+
+    vpn_select_domains = sorted(vpn_select_set)
+    vpn_ai_domains = sorted(vpn_ai_set)
+    byedpi_domains = sorted(byedpi_set)
+    all_vpn_route_domains = vpn_select_set | vpn_ai_set | byedpi_set
+
     # Collect remaining domains needing default DoH, VPN, or QUIC drop
     doh_domains = sorted(
         {
@@ -900,9 +978,11 @@ def generate_singbox_config(
             and d.domain not in per_dns_override_hosts
             and not _is_bypassed(d.domain)
         }
-    )
-    vpn_domains = sorted(
-        {d.domain for d in decisions if d.layer == "vpn" and not _is_bypassed(d.domain)}
+        | {
+            dom
+            for dom in all_vpn_route_domains
+            if dom not in per_dns_override_hosts and not _is_bypassed(dom)
+        }
     )
     quic_reject_domains = sorted(
         {
@@ -1124,10 +1204,19 @@ def generate_singbox_config(
             }
         )
 
-    endpoints: list[dict[str, Any]] = []
-    node_entries: list[tuple[str, str, str]] = []
+    class _NodeEntry(NamedTuple):
+        tag: str
+        sub_id: str
+        region: str
+        priority: int
+        enabled: bool
+        is_placeholder: bool
+        orig_idx: int
 
-    for node in vpn_nodes:
+    endpoints: list[dict[str, Any]] = []
+    node_entries: list[_NodeEntry] = []
+
+    for orig_idx, node in enumerate(vpn_nodes):
         raw_tag = str(node.tag or node.raw_outbound.get("tag") or node.protocol or "vpn-node")
         unique_tag = _unique_tag(raw_tag, used_tags)
         sub_id = _sanitize_tag_part(node.subscription_id or "default")
@@ -1156,19 +1245,28 @@ def generate_singbox_config(
                 ob["domain_resolver"] = "dns-doh"
             outbounds.append(ob)
 
-        node_entries.append((unique_tag, sub_id, region))
+        raw_prio = getattr(node, "priority", 100)
+        try:
+            prio = int(raw_prio if raw_prio is not None else 100)
+        except (TypeError, ValueError):
+            prio = 100
+        enabled = bool(getattr(node, "enabled", True))
+        placeholder = is_placeholder_node(node)
+        node_entries.append(_NodeEntry(unique_tag, sub_id, region, prio, enabled, placeholder, orig_idx))
 
-    all_node_tags = [tag for tag, _sub, _reg in node_entries]
+    all_node_tags = [e.tag for e in node_entries]
     quarantined = set(quarantined_tags or ())
-    active_entries = [entry for entry in node_entries if entry[0] not in quarantined]
-    if not active_entries and node_entries:
-        active_entries = list(node_entries)
-    active_tags = [tag for tag, _sub, _reg in active_entries]
+    eligible_entries = [e for e in node_entries if e.enabled and not e.is_placeholder]
+    active_entries = [e for e in eligible_entries if e.tag not in quarantined]
+    if not active_entries:
+        active_entries = list(eligible_entries) if eligible_entries else list(node_entries)
+    active_entries.sort(key=lambda e: (e.priority, e.orig_idx))
+    active_tags = [e.tag for e in active_entries]
 
     if all_node_tags:
         grouped_ut: dict[tuple[str, str], list[str]] = {}
-        for tag, sub_id, region in active_entries:
-            grouped_ut.setdefault((sub_id, region), []).append(tag)
+        for e in active_entries:
+            grouped_ut.setdefault((e.sub_id, e.region), []).append(e.tag)
 
         ut_group_tags: list[str] = []
         non_ru_ut_tags: list[str] = []
@@ -1180,8 +1278,8 @@ def generate_singbox_config(
                     "tag": ut_tag,
                     "outbounds": g_tags,
                     "url": "https://www.gstatic.com/generate_204",
-                    "interval": "3m",
-                    "tolerance": 150,
+                    "interval": "1m",
+                    "tolerance": 100,
                     "idle_timeout": "30m",
                     "interrupt_exist_connections": False,
                 }
@@ -1190,22 +1288,22 @@ def generate_singbox_config(
             if region != "ru":
                 non_ru_ut_tags.append(ut_tag)
 
-        # Automatic fastest/alive node switching via urltest
+        # Automatic fastest/alive node switching via urltest (prefer non-RU nodes so geo-blocked sites exit abroad)
+        non_ru_node_tags = [e.tag for e in active_entries if e.region != "ru"]
         outbounds.append(
             {
                 "type": "urltest",
                 "tag": "vpn-auto",
-                "outbounds": active_tags,
+                "outbounds": non_ru_node_tags or active_tags,
                 "url": "https://www.gstatic.com/generate_204",
-                "interval": "3m",
-                "tolerance": 150,
+                "interval": "1m",
+                "tolerance": 100,
                 "idle_timeout": "30m",
                 "interrupt_exist_connections": False,
             }
         )
 
         # AI-dedicated pool preferring non-RU regional urltest groups / nodes
-        non_ru_node_tags = [tag for tag, _sub, reg in active_entries if reg != "ru"]
         ai_targets = list(dict.fromkeys([*non_ru_ut_tags, *non_ru_node_tags]))
         if not ai_targets:
             ai_targets = list(active_tags)
@@ -1215,20 +1313,32 @@ def generate_singbox_config(
                 "tag": "vpn-ai",
                 "outbounds": ai_targets,
                 "url": "https://www.gstatic.com/generate_204",
-                "interval": "3m",
-                "tolerance": 150,
+                "interval": "1m",
+                "tolerance": 100,
                 "idle_timeout": "30m",
                 "interrupt_exist_connections": False,
             }
         )
 
-        # Selector allowing manual or orchestrator-driven pinning with vpn-auto as default
+        # Selector allowing manual or orchestrator-driven pinning with vpn-auto or priority node as default
+        default_outbound = "vpn-auto"
+        if (vpn_selection_mode or "auto").strip().lower() == "priority":
+            non_quarantined_active = [e for e in active_entries if e.tag not in quarantined]
+            non_quarantined_tags = {e.tag for e in non_quarantined_active}
+            pref = (preferred_vpn_node or "").strip()
+            if pref and pref in non_quarantined_tags:
+                default_outbound = pref
+            else:
+                prio_match = next((e.tag for e in non_quarantined_active if e.priority < 100), None)
+                if prio_match is not None:
+                    default_outbound = prio_match
+
         outbounds.append(
             {
                 "type": "selector",
                 "tag": "vpn-select",
                 "outbounds": ["vpn-auto", *ut_group_tags, *all_node_tags, "direct"],
-                "default": "vpn-auto",
+                "default": default_outbound,
             }
         )
     else:
@@ -1253,32 +1363,19 @@ def generate_singbox_config(
     bypass_procs = list(dict.fromkeys([*DEFAULT_BYPASS_PROCESSES, *(extra_bypass_processes or [])]))
 
     # 4. Route rules (sing-box 1.12+ route actions: sniff, hijack-dns, reject)
+    proc_bypass_rule: dict[str, Any] = {
+        "process_name": bypass_procs,
+        "outbound": "direct",
+    }
+    if enable_tun:
+        # Scope process bypass to TUN only so mixed-in explicit proxy probes from python/pythonw still test VPN routes
+        proc_bypass_rule["inbound"] = ["tun-in"]
+
     route_rules: list[dict[str, Any]] = [
         {"action": "sniff"},
         {"protocol": "dns", "action": "hijack-dns"},
         # Prevent routing loops and preserve external unlocker / IDE apps (Antigravity, xray, happ, etc.)
-        {
-            "process_name": bypass_procs,
-            "outbound": "direct",
-        },
-        # Telegram domains routed via tg-ws-out
-        {
-            "domain_suffix": ["t.me", "telegram.org", "telegram.me", "telesco.pe"],
-            "outbound": "tg-ws-out",
-        },
-        # Telegram IP CIDRs routed via tg-ws-out
-        {
-            "ip_cidr": [
-                "91.108.4.0/22",
-                "91.108.8.0/22",
-                "91.108.12.0/22",
-                "91.108.16.0/22",
-                "91.108.56.0/22",
-                "149.154.160.0/20",
-                "185.76.151.0/24",
-            ],
-            "outbound": "tg-ws-out",
-        },
+        proc_bypass_rule,
     ]
 
     if bypass_list:
@@ -1289,14 +1386,51 @@ def generate_singbox_config(
             }
         )
 
-    # VPN routing placed BEFORE QUIC reject so VPN domains keep UDP/443 inside tunnel
-    if vpn_domains:
+    # Explicit VPN / ByeDPI routing placed BEFORE tg-ws-out (so VPN-assigned Telegram web domains are not shadowed)
+    # and BEFORE QUIC reject (so VPN domains keep UDP/443 inside tunnel)
+    if vpn_select_domains:
         route_rules.append(
             {
-                "domain_suffix": vpn_domains,
+                "domain_suffix": vpn_select_domains,
                 "outbound": "vpn-select",
             }
         )
+    if vpn_ai_domains:
+        route_rules.append(
+            {
+                "domain_suffix": vpn_ai_domains,
+                "outbound": "vpn-ai",
+            }
+        )
+    if byedpi_domains:
+        route_rules.append(
+            {
+                "domain_suffix": byedpi_domains,
+                "outbound": "byedpi-out",
+            }
+        )
+
+    # Telegram domains & MTProto DC CIDRs routed via tg-ws-out
+    route_rules.extend(
+        [
+            {
+                "domain_suffix": ["t.me", "telegram.org", "telegram.me", "telesco.pe"],
+                "outbound": "tg-ws-out",
+            },
+            {
+                "ip_cidr": [
+                    "91.108.4.0/22",
+                    "91.108.8.0/22",
+                    "91.108.12.0/22",
+                    "91.108.16.0/22",
+                    "91.108.56.0/22",
+                    "149.154.160.0/20",
+                    "185.76.151.0/24",
+                ],
+                "outbound": "tg-ws-out",
+            },
+        ]
+    )
 
     if quic_reject_domains:
         route_rules.append(

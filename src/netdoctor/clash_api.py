@@ -42,6 +42,51 @@ class ClashApiClient:
         return data if isinstance(data, dict) else {}
 
     @staticmethod
+    def unwrap_proxies(data: dict[str, Any]) -> dict[str, Any]:
+        """Unwrap sing-box Clash API `{"proxies": {...}}` envelope if present."""
+        if not isinstance(data, dict):
+            return {}
+        inner = data.get("proxies")
+        return inner if isinstance(inner, dict) else data
+
+    @staticmethod
+    def resolve_active_proxy(
+        proxies: dict[str, Any],
+        selector_tag: str = "vpn-select",
+    ) -> tuple[str | None, str | None, float | None]:
+        """Return `(direct_selected, resolved_leaf, last_delay_ms)` for a selector outbound."""
+        pmap = ClashApiClient.unwrap_proxies(proxies)
+        sel = pmap.get(selector_tag)
+        if not isinstance(sel, dict) or not sel.get("now"):
+            return None, None, None
+
+        direct_selected = str(sel["now"])
+        cur = direct_selected
+        visited: set[str] = {selector_tag}
+        for _ in range(6):
+            if cur in visited:
+                break
+            visited.add(cur)
+            info = pmap.get(cur)
+            if not isinstance(info, dict) or not info.get("now"):
+                break
+            cur = str(info["now"])
+
+        last_delay_ms: float | None = None
+        leaf_info = pmap.get(cur)
+        if isinstance(leaf_info, dict) and isinstance(leaf_info.get("history"), list):
+            for entry in reversed(leaf_info["history"]):
+                if isinstance(entry, dict) and entry.get("delay") is not None:
+                    try:
+                        val = float(entry["delay"])
+                        if val > 0:
+                            last_delay_ms = val
+                            break
+                    except (TypeError, ValueError):
+                        continue
+        return direct_selected, cur, last_delay_ms
+
+    @staticmethod
     def _parse_delay_response(resp: httpx.Response) -> dict[str, Any]:
         try:
             payload = resp.json()
@@ -79,7 +124,7 @@ class ClashApiClient:
                 timeout=self.timeout,
             ) as client:
                 resp = await client.get("/proxies")
-                return self._parse_json_dict(resp)
+                return self.unwrap_proxies(self._parse_json_dict(resp))
         except Exception:
             return {}
 
@@ -171,7 +216,7 @@ class ClashApiClient:
                 timeout=self.timeout,
             ) as client:
                 resp = client.get("/proxies")
-                return self._parse_json_dict(resp)
+                return self.unwrap_proxies(self._parse_json_dict(resp))
         except Exception:
             return {}
 

@@ -25,7 +25,11 @@ from netdoctor.dynamics import run_canary_cycle
 from netdoctor.gui import _has_console_window, launch_gui
 from netdoctor.gui_backend import elevate_gui, launch_gui_detached
 from netdoctor.models import Protocol, VerdictClass, VpnNode
-from netdoctor.orchestrators import DnsLayerOrchestrator, build_unlocker_protection_context
+from netdoctor.orchestrators import (
+    DnsLayerOrchestrator,
+    VpnLayerOrchestrator,
+    build_unlocker_protection_context,
+)
 from netdoctor.probes import detect_bypass_active, detect_network_fingerprint, run_domain_probes
 from netdoctor.tray import terminate_pid_gracefully
 from netdoctor.selector import (
@@ -306,6 +310,15 @@ def cmd_apply(
         dns_orch = DnsLayerOrchestrator()
         active_dns = dns_orch.get_active_dns(storage)
         dns_catalog_map = {s["id"]: s for s in dns_orch.get_all_dns_servers(storage)}
+        vpn_policy = storage.get_vpn_selection_policy()
+        health_map = storage.get_vpn_node_health_map()
+        vpn_orch = VpnLayerOrchestrator()
+        quarantined_tags = {
+            tag
+            for tag, rec in health_map.items()
+            if str(rec.get("cb_state") or "") == "open"
+            and not vpn_orch._is_quarantine_expired(str(rec.get("quarantined_until") or ""))
+        }
         guard = build_unlocker_protection_context(storage=storage)
     finally:
         storage.close()
@@ -374,8 +387,11 @@ def cmd_apply(
         dns_catalog=dns_catalog_map,
         bypass_domains=exclude_domains,
         extra_bypass_processes=extra_procs,
+        quarantined_tags=quarantined_tags,
         use_wireguard_endpoints=True,
         doh_tls_sni=doh_tls_sni,
+        vpn_selection_mode=vpn_policy["mode"],
+        preferred_vpn_node=vpn_policy["priority_node"] or None,
     )
 
     console.print(f"[green]Generated winws2 preset:[/green] {winws_preset_file} ({len(hostlists)} hostlists)")

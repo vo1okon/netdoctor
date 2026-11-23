@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from netdoctor.gui_backend import GuiBackend, elevate_gui
 from netdoctor.supervisor import _is_admin
+from netdoctor.vpn import is_auto_select_node, is_placeholder_node
 from netdoctor.tray import (
     NetdoctorTrayIcon,
     acquire_single_instance_mutex,
@@ -102,6 +103,8 @@ OVERRIDE_LAYER_HINTS: dict[str, str] = {
 }
 
 LOG_FILES = ("winws2.log", "sing-box.log", "tg-ws-proxy.log")
+VPN_MODE_AUTO_LABEL = "Автовыбор (внутри VPN)"
+VPN_MODE_PRIORITY_LABEL = "Приоритетный сервер"
 PROCESS_LEDS: tuple[tuple[str, str], ...] = (
     ("winws2", "winws2.exe"),
     ("sing-box", "sing-box.exe"),
@@ -460,6 +463,8 @@ class NetdoctorGuiApp(tk.Tk):
         self.config_previews: dict[str, str] = {}
         self._vpn_signature = ""
         self._vpn_nodes_by_iid: dict[str, dict[str, Any]] = {}
+        self._vpn_policy: dict[str, Any] = {"mode": "auto", "priority_node": "", "priorities": {}}
+        self._vpn_mode_syncing: bool = False
         self.zapret_presets: list[dict[str, Any]] = []
         self.presets_by_iid: dict[str, dict[str, Any]] = {}
         self.selected_preset: dict[str, Any] | None = None
@@ -605,6 +610,11 @@ class NetdoctorGuiApp(tk.Tk):
         if self._exiting or self._closed:
             return
         self._exiting = True
+        self._busy += 1
+        try:
+            self.set_status("Остановка служб и выход…", WARN_TEXT)
+        except tk.TclError:
+            pass
 
         def _stop_then_close() -> None:
             try:
@@ -2940,7 +2950,7 @@ class NetdoctorGuiApp(tk.Tk):
         tk.Frame(vpn_card, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=12)
 
         row2 = tk.Frame(vpn_card, bg=CARD)
-        row2.pack(fill="x", padx=12, pady=(5, 8))
+        row2.pack(fill="x", padx=12, pady=(5, 5))
         self.make_button(row2, "Ротировать узел", self.on_rotate_vpn_node, "warn", font=FONT_SMALL_B, padx=9, pady=4).pack(
             side="right", padx=(6, 0)
         )
@@ -2959,17 +2969,48 @@ class NetdoctorGuiApp(tk.Tk):
         self._vpn_summary_lbl.pack(side="left", fill="x", expand=True)
         self._bind_responsive_wrap(self._vpn_summary_lbl, min_wrap=200, pad=16)
 
+        tk.Frame(vpn_card, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=12)
+
+        row3 = tk.Frame(vpn_card, bg=CARD)
+        row3.pack(fill="x", padx=12, pady=(5, 8))
+        tk.Label(row3, text="Режим выбора:", bg=CARD, fg=MUTED, font=FONT_SMALL_B).pack(side="left", padx=(0, 6))
+        self.vpn_mode_var = tk.StringVar(value=VPN_MODE_AUTO_LABEL)
+        self.vpn_mode_cb = ttk.Combobox(
+            row3,
+            textvariable=self.vpn_mode_var,
+            values=[VPN_MODE_AUTO_LABEL, VPN_MODE_PRIORITY_LABEL],
+            state="readonly",
+            width=25,
+        )
+        self.vpn_mode_cb.pack(side="left", padx=(0, 8))
+        self.vpn_mode_cb.bind("<<ComboboxSelected>>", self.on_vpn_mode_change)
+        self.make_button(
+            row3, "Автовыбор", self.on_set_vpn_auto_mode, "neutral", font=FONT_SMALL_B, padx=8, pady=3
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            row3, "▼", lambda: self.on_move_vpn_priority(1), "neutral", font=FONT_SMALL_B, padx=8, pady=3
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            row3, "▲", lambda: self.on_move_vpn_priority(-1), "neutral", font=FONT_SMALL_B, padx=8, pady=3
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            row3, "★ Приоритетный", self.on_set_priority_vpn_node, "primary", font=FONT_SMALL_B, padx=9, pady=3
+        ).pack(side="right", padx=(8, 0))
+
         paned = ttk.PanedWindow(tab, orient="vertical")
         paned.pack(fill="both", expand=True)
 
         vpn_wrap = tk.Frame(paned, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        self.vpn_tree = self.make_tree(vpn_wrap, ("tag", "region", "protocol", "transport", "server", "health"), height=6)
+        self.vpn_tree = self.make_tree(
+            vpn_wrap, ("priority", "tag", "region", "protocol", "transport", "server", "health"), height=6
+        )
         for cid, title, width in (
+            ("priority", "Приоритет", 82),
             ("tag", "Сервер (tag)", 180),
-            ("region", "Регион", 70),
-            ("protocol", "Протокол", 85),
-            ("transport", "Транспорт", 85),
-            ("server", "Адрес : Порт / Пинг", 220),
+            ("region", "Регион", 66),
+            ("protocol", "Протокол", 82),
+            ("transport", "Транспорт", 82),
+            ("server", "Адрес : Порт / Пинг", 210),
             ("health", "Circuit Breaker / Статус", 175),
         ):
             self.vpn_tree.heading(cid, text=title)
@@ -2977,6 +3018,7 @@ class NetdoctorGuiApp(tk.Tk):
         self.vpn_tree.tag_configure("ok", foreground=OK_TEXT)
         self.vpn_tree.tag_configure("warn", foreground=WARN_TEXT)
         self.vpn_tree.tag_configure("bad", foreground=ERR_TEXT)
+        self.vpn_tree.tag_configure("muted", foreground=MUTED)
         self._scrolled(vpn_wrap, self.vpn_tree, horizontal=True)
         paned.add(vpn_wrap, weight=2)
 
@@ -3192,9 +3234,9 @@ class NetdoctorGuiApp(tk.Tk):
             return
         self._refreshing = True
 
-        def done(payload: tuple[dict[str, Any], dict[str, Any] | None]) -> None:
+        def done(payload: tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]) -> None:
             self._refreshing = False
-            snap, wd = payload
+            snap, wd, vpn_rec = payload
             self.apply_snapshot(snap)
             if isinstance(wd, dict) and wd.get("restarted"):
                 cnt = wd.get("restarts_count", 1)
@@ -3210,6 +3252,14 @@ class NetdoctorGuiApp(tk.Tk):
                     f"[WATCHDOG] winws2.exe падал слишком часто ({wd.get('restarts_count', 0)} раз) — "
                     f"проверьте лог winws2.log: {wd.get('last_crash_reason', '')}"
                 )
+            if isinstance(vpn_rec, dict):
+                act = str(vpn_rec.get("action") or "")
+                if act in ("failover", "failover_priority", "failback_priority", "return_to_auto"):
+                    self.log_console(
+                        f"[VPN] Автопереключение ({act}): {vpn_rec.get('previous') or '—'} -> {vpn_rec.get('selected')}"
+                    )
+                elif act == "all_unavailable":
+                    self.log_console("[VPN] Все настроенные VPN-серверы сейчас недоступны")
 
         def failed(exc: Exception) -> None:
             self._refreshing = False
@@ -3218,22 +3268,28 @@ class NetdoctorGuiApp(tk.Tk):
         def runner() -> None:
             try:
                 wd_res: dict[str, Any] | None = None
+                vpn_rec: dict[str, Any] | None = None
                 if run_watchdog and hasattr(self.backend, "ensure_services_healthy"):
                     try:
                         wd_res = self.backend.ensure_services_healthy()
                     except Exception:  # noqa: BLE001
                         wd_res = None
+                if run_watchdog and hasattr(self.backend, "reconcile_vpn_health"):
+                    try:
+                        vpn_rec = self.backend.reconcile_vpn_health(min_interval_sec=30.0)
+                    except Exception:  # noqa: BLE001
+                        vpn_rec = None
                 snap = self.backend.get_status_snapshot()
             except Exception as exc:  # noqa: BLE001
                 self._post(failed, exc)
             else:
-                self._post(done, (snap, wd_res))
+                self._post(done, (snap, wd_res, vpn_rec))
 
         threading.Thread(target=runner, name="gui-snapshot", daemon=True).start()
 
     def _watchdog_only_async(self) -> None:
         """Lightweight tray-mode watchdog tick skipping full snapshot/UI redraws."""
-        if self._refreshing or self._closed or not hasattr(self.backend, "ensure_services_healthy"):
+        if self._refreshing or self._closed or self._exiting or not hasattr(self.backend, "ensure_services_healthy"):
             return
         self._refreshing = True
 
@@ -3255,7 +3311,7 @@ class NetdoctorGuiApp(tk.Tk):
         threading.Thread(target=runner, name="gui-watchdog", daemon=True).start()
 
     def _snapshot_tick(self) -> None:
-        if self._closed:
+        if self._closed or self._exiting:
             return
         if self._busy == 0:
             if self._is_window_hidden():
@@ -3411,6 +3467,10 @@ class NetdoctorGuiApp(tk.Tk):
         if "orchestrators" in snap and isinstance(snap["orchestrators"], dict):
             self.update_layer_cards(snap["orchestrators"])
 
+        if isinstance(snap.get("vpn_policy"), dict):
+            self._vpn_policy = dict(snap["vpn_policy"])
+            self._sync_vpn_mode_combo()
+
         self.populate_domain_table(snap.get("domain_rows") or [])
         self.populate_vpn_table(snap.get("vpn_nodes") or [])
 
@@ -3518,7 +3578,12 @@ class NetdoctorGuiApp(tk.Tk):
             fg=OK_TEXT if vpn_running else (WARN_TEXT if vpn.get("total_count", 0) else MUTED),
         )
         tg_ok = "✔" if (vpn.get("tg_proxy_running") or vpn.get("tg_proxy_alive")) else "выкл"
-        self.card_vpn_sub.configure(text=f"Через VPN: {vpn.get('vpn_domains_count', 0)} сайтов • TG-WS: {tg_ok}")
+        best_n = str(vpn.get("best_node") or "").strip()
+        sel_mode = str(vpn.get("selection_mode") or self._vpn_policy.get("mode") or "auto")
+        mode_short = "Приор." if sel_mode == "priority" else "Авто"
+        best_short = (best_n[:18] + "…") if len(best_n) > 20 else best_n
+        node_part = f" • {mode_short}: {best_short}" if best_short else ""
+        self.card_vpn_sub.configure(text=f"Через VPN: {vpn.get('vpn_domains_count', 0)} сайтов • TG-WS: {tg_ok}{node_part}")
 
         rt = orch.get("realtime") or {}
         needs_fix = int(rt.get("needs_fix_count", 0))
@@ -3978,7 +4043,7 @@ class NetdoctorGuiApp(tk.Tk):
         threading.Thread(target=runner, name="gui-realtime", daemon=True).start()
 
     def _realtime_tick(self) -> None:
-        if self._closed:
+        if self._closed or self._exiting:
             return
         hidden = self._is_window_hidden()
         stack_running = bool(self.last_snapshot.get("running"))
@@ -4070,58 +4135,153 @@ class NetdoctorGuiApp(tk.Tk):
 
     # ---------------------------------------------------------------- VPN / logs tab
 
+    def _sync_vpn_mode_combo(self) -> None:
+        if not hasattr(self, "vpn_mode_var"):
+            return
+        self._vpn_mode_syncing = True
+        try:
+            mode = str(self._vpn_policy.get("mode") or "auto")
+            self.vpn_mode_var.set(VPN_MODE_PRIORITY_LABEL if mode == "priority" else VPN_MODE_AUTO_LABEL)
+        finally:
+            self._vpn_mode_syncing = False
+
+    def _active_vpn_node_from_snap(self) -> str:
+        vpn_orch = (self.last_snapshot.get("orchestrators") or {}).get("vpn") or {}
+        return str(vpn_orch.get("best_node") or "").strip()
+
+    def _selected_vpn_node(self) -> dict[str, Any] | None:
+        sel = self.vpn_tree.selection() if hasattr(self, "vpn_tree") else ()
+        if not sel:
+            return None
+        node_row = self._vpn_nodes_by_iid.get(sel[0])
+        if isinstance(node_row, dict):
+            return node_row
+        vals = self.vpn_tree.item(sel[0], "values")
+        if vals and len(vals) >= 2:
+            raw_name = str(vals[1]).lstrip("▶ ").split(" [⚡", 1)[0].strip()
+            for n in self.last_snapshot.get("vpn_nodes") or []:
+                if raw_name in (str(n.get("tag") or "").strip(), str(n.get("display_name") or "").strip()):
+                    return n
+        return None
+
     def populate_vpn_table(self, nodes: list[dict[str, Any]]) -> None:
-        signature = repr(nodes)
+        active_vpn_node = self._active_vpn_node_from_snap()
+        signature = repr((nodes, self._vpn_policy, active_vpn_node))
         if signature == self._vpn_signature:
             return
         self._vpn_signature = signature
+        prev_node = self._selected_vpn_node()
+        prev_sel_tag = str(prev_node.get("tag") or "").strip() if isinstance(prev_node, dict) else ""
+
         self.vpn_tree.delete(*self.vpn_tree.get_children())
         self._vpn_nodes_by_iid = {}
+
+        mode = str(self._vpn_policy.get("mode") or "auto")
+        pref_tag = str(self._vpn_policy.get("priority_node") or "").strip()
         alive_cnt = 0
+        real_cnt = 0
+        ph_cnt = 0
+        restore_iid: str | None = None
+
         for i, node in enumerate(nodes):
             iid = f"n{i}"
             self._vpn_nodes_by_iid[iid] = node
+            tag_str = str(node.get("tag") or "").strip()
+            if prev_sel_tag and tag_str == prev_sel_tag:
+                restore_iid = iid
+
+            is_ph = bool(node["is_placeholder"]) if "is_placeholder" in node else is_placeholder_node(node)
+            is_builtin_auto = bool(node["is_builtin_auto"]) if "is_builtin_auto" in node else is_auto_select_node(node)
+            enabled = bool(node.get("enabled", True))
+            try:
+                prio = int(node.get("priority") if node.get("priority") is not None else 100)
+            except (TypeError, ValueError):
+                prio = 100
+
+            if is_ph:
+                ph_cnt += 1
+                prio_txt = "—"
+            else:
+                real_cnt += 1
+                if (pref_tag and tag_str == pref_tag) or prio == 1:
+                    prio_txt = "★ #1"
+                elif prio < 100:
+                    prio_txt = f"#{prio}"
+                elif mode == "priority":
+                    prio_txt = "Резерв"
+                else:
+                    prio_txt = "Авто"
+
+            is_active = bool(node.get("is_active") or (active_vpn_node and tag_str == active_vpn_node))
+            shown = str(node.get("display_name") or tag_str).strip()
+            if is_active:
+                shown = f"▶ {shown}"
+            if is_builtin_auto and not is_ph:
+                shown = f"{shown} [⚡ Авто-VPN]"
+
             endpoint = f"{node.get('server', '')}:{node.get('server_port', '')}"
             if "ping_ms" in node and node.get("ping_ms") is not None:
                 suffix = "✔ (туннель)" if node.get("tunnel_verified") else "✔"
                 endpoint += f"  •  {node['ping_ms']} ms {suffix}"
-            elif node.get("alive") is False:
+            elif node.get("alive") is False and not is_ph:
                 endpoint += f"  •  {node.get('probe_result') or 'таймаут'} ✖"
 
             cb_state = str(node.get("cb_state") or "closed")
             proto_ok = node.get("protocol_ok", True)
-            if cb_state == "open":
+            if is_ph:
+                health_txt = "ℹ Служебный (не сервер)"
+                row_tag = "muted"
+            elif not enabled:
+                health_txt = "⏸ Отключён"
+                row_tag = "muted"
+            elif cb_state == "open":
                 health_txt = "🔴 Карантин (block)" if not proto_ok else "🔴 Карантин"
-                tag = "bad"
+                row_tag = "bad"
             elif cb_state == "half_open":
                 health_txt = "🟡 Проверка восстановления"
-                tag = "warn"
+                row_tag = "warn"
+            elif node.get("alive") is False:
+                health_txt = "🟠 Сбой (недоступен)"
+                row_tag = "warn"
             elif node.get("alive"):
-                health_txt = "🟢 Активен"
-                tag = "ok"
+                health_txt = "🟢 Активен" if is_active else "🟢 Доступен"
+                row_tag = "ok"
                 alive_cnt += 1
             else:
-                health_txt = "● Готов"
-                tag = "ok"
+                health_txt = "🟢 Активен" if is_active else "● Готов"
+                row_tag = "ok"
 
             self.vpn_tree.insert(
                 "",
                 "end",
-                iid=f"n{i}",
+                iid=iid,
                 values=(
-                    node.get("display_name") or node.get("tag", ""),
+                    prio_txt,
+                    shown,
                     str(node.get("region") or "other").upper(),
                     node.get("protocol", ""),
                     node.get("transport", "tcp"),
                     endpoint,
                     health_txt,
                 ),
-                tags=(tag,),
+                tags=(row_tag,),
             )
 
-        self._vpn_summary_lbl.configure(
-            text=f"Узлов в пуле: {len(nodes)}" + (f" (доступных: {alive_cnt})" if alive_cnt else "")
+        if restore_iid:
+            self.vpn_tree.selection_set(restore_iid)
+
+        mode_lbl = (
+            f"Приоритет ({pref_tag})"
+            if (mode == "priority" and pref_tag)
+            else ("Приоритетный" if mode == "priority" else "Автовыбор (внутри VPN)")
         )
+        active_lbl = f" • Активен: {active_vpn_node}" if active_vpn_node else ""
+        alive_lbl = f", доступных: {alive_cnt}" if alive_cnt else ""
+        ph_lbl = f", служебных: {ph_cnt}" if ph_cnt else ""
+        self._vpn_summary_lbl.configure(
+            text=f"Режим: {mode_lbl}{active_lbl} • Серверов: {real_cnt}{alive_lbl}{ph_lbl}"
+        )
+        self._sync_vpn_mode_combo()
         self._update_nav_badge(self.tab_vpn, str(len(nodes)))
 
     def refresh_logs_async(self) -> None:
@@ -4176,7 +4336,7 @@ class NetdoctorGuiApp(tk.Tk):
                 self.log_view.see("end")
 
     def _log_tick(self) -> None:
-        if self._closed:
+        if self._closed or self._exiting:
             return
         try:
             on_logs_tab = self.notebook.select() == str(self.tab_vpn)
@@ -4602,19 +4762,17 @@ class NetdoctorGuiApp(tk.Tk):
 
     def on_rotate_vpn_node(self) -> None:
         target_tag: str | None = None
-        sel = self.vpn_tree.selection() if hasattr(self, "vpn_tree") else ()
-        if sel:
-            node_row = self._vpn_nodes_by_iid.get(sel[0])
-            if isinstance(node_row, dict) and node_row.get("tag"):
-                target_tag = str(node_row["tag"])
-            else:
-                vals = self.vpn_tree.item(sel[0], "values")
-                if vals:
-                    sel_name = str(vals[0])
-                    for n in self.last_snapshot.get("vpn_nodes") or []:
-                        if sel_name in (n.get("tag"), n.get("display_name")):
-                            target_tag = str(n.get("tag"))
-                            break
+        sel_node = self._selected_vpn_node()
+        if isinstance(sel_node, dict):
+            is_ph = bool(sel_node["is_placeholder"]) if "is_placeholder" in sel_node else is_placeholder_node(sel_node)
+            if is_ph:
+                self.set_status(
+                    "Служебная запись не является VPN-сервером — выберите сервер или снимите выделение для авто-ротации",
+                    WARN_TEXT,
+                )
+                return
+            if sel_node.get("tag"):
+                target_tag = str(sel_node["tag"]).strip()
 
         def done(res: dict[str, Any]) -> None:
             if res.get("ok"):
@@ -4628,6 +4786,76 @@ class NetdoctorGuiApp(tk.Tk):
             self._after_change()
 
         self.run_bg("Ротация VPN-узла", lambda: self.backend.rotate_vpn_node(target_tag=target_tag), done)
+
+    def on_vpn_mode_change(self, _event: Any = None) -> None:
+        if self._vpn_mode_syncing:
+            return
+        target_mode = "priority" if self.vpn_mode_var.get() == VPN_MODE_PRIORITY_LABEL else "auto"
+
+        def done(res: dict[str, Any]) -> None:
+            pol = res.get("policy") or {}
+            self._vpn_policy = dict(pol) if isinstance(pol, dict) else self._vpn_policy
+            rec = res.get("reconcile") or {}
+            sel = rec.get("selected") or (self._vpn_policy.get("priority_node") if target_mode == "priority" else "vpn-auto")
+            lbl = "Приоритетный" if target_mode == "priority" else "Автовыбор (внутри VPN)"
+            self.log_console(f"Режим VPN: {lbl} (узел={sel or 'vpn-auto'})")
+            self.set_status(f"Режим VPN: {lbl}", OK_TEXT)
+            self._after_change()
+
+        self.run_bg("Переключение режима VPN", lambda: self.backend.set_vpn_selection_mode(target_mode), done)
+
+    def on_set_priority_vpn_node(self) -> None:
+        node = self._selected_vpn_node()
+        if not node or not node.get("tag"):
+            self.set_status("Сначала выберите сервер в таблице VPN", WARN_TEXT)
+            return
+        is_ph = bool(node["is_placeholder"]) if "is_placeholder" in node else is_placeholder_node(node)
+        if is_ph:
+            self.set_status("Служебную запись нельзя сделать приоритетным сервером", WARN_TEXT)
+            return
+        tag = str(node["tag"]).strip()
+
+        def done(res: dict[str, Any]) -> None:
+            pol = res.get("policy") or {}
+            self._vpn_policy = dict(pol) if isinstance(pol, dict) else self._vpn_policy
+            rec = res.get("reconcile") or {}
+            live_sel = rec.get("selected") or tag
+            self.log_console(f"Приоритетный VPN #1: {tag} (активный={live_sel})")
+            self.set_status(f"Приоритетный VPN #1: {tag}", OK_TEXT)
+            self._after_change()
+
+        self.run_bg(f"Приоритет VPN ({tag})", lambda: self.backend.set_vpn_priority_node(tag), done)
+
+    def on_move_vpn_priority(self, delta: int) -> None:
+        node = self._selected_vpn_node()
+        if not node or not node.get("tag"):
+            self.set_status("Сначала выберите сервер в таблице VPN", WARN_TEXT)
+            return
+        is_ph = bool(node["is_placeholder"]) if "is_placeholder" in node else is_placeholder_node(node)
+        if is_ph:
+            self.set_status("Служебная запись не участвует в приоритетах", WARN_TEXT)
+            return
+        tag = str(node["tag"]).strip()
+
+        def done(res: dict[str, Any]) -> None:
+            pol = res.get("policy") or {}
+            self._vpn_policy = dict(pol) if isinstance(pol, dict) else self._vpn_policy
+            top = res.get("priority_node") or tag
+            self.log_console(f"Обновлён приоритет VPN ({tag}) • #1: {top}")
+            self.set_status(f"Приоритет VPN обновлён (#1: {top})", OK_TEXT)
+            self._after_change()
+
+        self.run_bg("Изменение приоритета VPN", lambda: self.backend.move_vpn_node_priority(tag, delta), done)
+
+    def on_set_vpn_auto_mode(self) -> None:
+        def done(res: dict[str, Any]) -> None:
+            pol = res.get("policy") or {}
+            self._vpn_policy = dict(pol) if isinstance(pol, dict) else self._vpn_policy
+            self.log_console("Режим VPN переключён на автовыбор (внутри VPN)")
+            self.set_status("Режим VPN: автовыбор (внутри VPN)", OK_TEXT)
+            self._after_change()
+
+        self.run_bg("Автовыбор VPN-сервера", lambda: self.backend.set_vpn_selection_mode("auto"), done)
 
     def on_blockcheck2_selected(self) -> None:
         if not self.selected_row:

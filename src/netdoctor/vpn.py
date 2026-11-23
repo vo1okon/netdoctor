@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import re
 import urllib.parse
@@ -22,11 +23,82 @@ _SUBSCRIPTION_USER_AGENTS: tuple[str, ...] = (
 )
 
 _REGION_FLAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("eu", ("🇩🇪", "🇳🇱", "🇫🇮", "🇫🇷", "🇬🇧", "🇸🇪", "🇵🇱", "🇨🇿", "🇨🇭", "🇦🇹", "🇱🇻", "🇪🇪", "🇪🇺")),
-    ("us", ("🇺🇸",)),
+    ("eu", ("🇩🇪", "🇳🇱", "🇫🇮", "🇫🇷", "🇬🇧", "🇸🇪", "🇵🇱", "🇨🇿", "🇨🇭", "🇦🇹", "🇱🇻", "🇪🇪", "🇪🇺", "🇧🇬")),
+    ("us", ("🇺🇸", "🇨🇦")),
     ("ru", ("🇷🇺",)),
     ("asia", ("🇸🇬", "🇯🇵", "🇹🇷", "🇭🇰", "🇰🇷", "🇦🇪")),
 )
+
+_AUTO_SELECT_NODE_RE = re.compile(
+    r"(?:автовыбор|авто[\s_-]*выбор|автоподбор|auto[\s_-]*select|autoselect|\bauto\b|\bsmart\b|\bfastest\b|\boptimal\b|балансир|load[\s_-]*balance)",
+    re.IGNORECASE,
+)
+_INFO_BANNER_TAG_RE = re.compile(
+    r"(?:^|\s)(?:истекает|осталось|трафик|подписка|поддержка|канал|обновите|expire[sd]?|remaining|traffic|support|renew)\s*[:：]",
+    re.IGNORECASE,
+)
+_PLACEHOLDER_MARKERS: tuple[str, ...] = ("↙", "↘", "⬇", "↓", "⬆", "===", "───", "———")
+_PLACEHOLDER_SERVER_SUFFIXES: tuple[str, ...] = (".invalid", ".local", ".localhost", ".internal", ".obed")
+
+
+def is_auto_select_node(node_or_tag: VpnNode | dict[str, Any] | str) -> bool:
+    """Return True if a node tag/display_name indicates a provider built-in auto-select entry."""
+    if isinstance(node_or_tag, str):
+        text = node_or_tag
+    elif isinstance(node_or_tag, VpnNode):
+        text = f"{node_or_tag.tag or ''} {node_or_tag.display_name or ''}"
+    elif isinstance(node_or_tag, dict):
+        text = f"{node_or_tag.get('tag') or ''} {node_or_tag.get('display_name') or ''}"
+    else:
+        text = ""
+    return bool(text.strip() and _AUTO_SELECT_NODE_RE.search(text))
+
+
+def is_placeholder_node(node: VpnNode | dict[str, Any]) -> bool:
+    """Return True for non-routable subscription banners/dividers/Happ dummy placeholders."""
+    if isinstance(node, VpnNode):
+        protocol = str(node.protocol or "").strip().lower()
+        server = str(node.server or "").strip()
+        tag = str(node.tag or "").strip()
+        display_name = str(node.display_name or "").strip()
+        raw_outbound = node.raw_outbound if isinstance(node.raw_outbound, dict) else {}
+    elif isinstance(node, dict):
+        protocol = str(node.get("protocol") or "").strip().lower()
+        raw_outbound = node.get("raw_outbound") if isinstance(node.get("raw_outbound"), dict) else {}
+        server = str(node.get("server") or raw_outbound.get("server") or "").strip()
+        tag = str(node.get("tag") or "").strip()
+        display_name = str(node.get("display_name") or "").strip()
+    else:
+        return True
+
+    if protocol == "tailscale" and server.lower() == "tailscale":
+        return False
+
+    if not server:
+        return True
+
+    low_srv = server.lower().strip("[]").rstrip(".")
+    if low_srv == "localhost" or low_srv.endswith(_PLACEHOLDER_SERVER_SUFFIXES):
+        return True
+    try:
+        addr = ipaddress.ip_address(low_srv)
+        if addr.is_loopback or addr.is_unspecified:
+            return True
+    except ValueError:
+        pass
+
+    tls_obj = raw_outbound.get("tls")
+    if isinstance(tls_obj, dict):
+        sni = str(tls_obj.get("server_name") or "").strip().lower().rstrip(".")
+        if sni == "exampl.com":
+            return True
+
+    label = f"{tag} {display_name}".strip()
+    if any(marker in label for marker in _PLACEHOLDER_MARKERS):
+        return True
+    if label and _INFO_BANNER_TAG_RE.search(label):
+        return True
+    return False
 
 _REGION_WORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
@@ -138,16 +210,20 @@ def _make_vpn_node(
     display_name: str = "",
 ) -> VpnNode:
     """Construct VpnNode cleanly whether or not extended fields exist in VpnNode yet."""
-    shown_name = display_name or tag
+    clean_tag = (tag or "").strip() or "vpn-node"
+    shown_name = (display_name or clean_tag).strip() or clean_tag
+    ob = dict(raw_outbound)
+    if "tag" in ob:
+        ob["tag"] = clean_tag
     kwargs: dict[str, Any] = {
-        "tag": tag,
+        "tag": clean_tag,
         "protocol": protocol,
         "server": server,
         "server_port": server_port,
-        "raw_outbound": raw_outbound,
+        "raw_outbound": ob,
         "subscription_id": subscription_id,
         "display_name": shown_name,
-        "transport": infer_node_transport(raw_outbound, protocol),
+        "transport": infer_node_transport(ob, protocol),
         "region": infer_node_region(shown_name, server),
     }
     model_fields = getattr(VpnNode, "model_fields", None)
@@ -1032,7 +1108,8 @@ def parse_single_uri(uri: str, index: int = 0) -> VpnNode | None:
         return None
 
     qs = urllib.parse.parse_qs(parsed.query)
-    tag = urllib.parse.unquote(parsed.fragment) if parsed.fragment else f"{scheme}-{index}"
+    raw_frag = urllib.parse.unquote(parsed.fragment).strip() if parsed.fragment else ""
+    tag = raw_frag or f"{scheme}-{index}"
     server = parsed.hostname or ""
     port = parsed.port or 443
     user = urllib.parse.unquote(parsed.username or "")
@@ -1679,12 +1756,43 @@ async def refresh_all_subscriptions(storage: Any, timeout: float = 10.0) -> dict
     for sub in storage.get_subscriptions():
         sub_id = sub["id"]
         url_or_uri = sub["url_or_uri"]
+        existing_by_tag: dict[str, tuple[int, bool]] = {}
+        existing_by_ep: dict[tuple[str, int, str], tuple[int, bool]] = {}
+        for old in sub.get("nodes") or []:
+            if not isinstance(old, dict):
+                continue
+            try:
+                prio = int(old.get("priority") if old.get("priority") is not None else 100)
+            except (TypeError, ValueError):
+                prio = 100
+            en = bool(old.get("enabled", True))
+            old_tag = str(old.get("tag") or "").strip()
+            if old_tag:
+                existing_by_tag[old_tag] = (prio, en)
+            old_srv = str(old.get("server") or "").strip().lower()
+            try:
+                old_port = int(old.get("server_port") or 0)
+            except (TypeError, ValueError):
+                old_port = 0
+            old_proto = str(old.get("protocol") or "").strip().lower()
+            if old_srv and old_port:
+                existing_by_ep[(old_srv, old_port, old_proto)] = (prio, en)
         try:
             nodes = await fetch_subscription(url_or_uri, subscription_id=sub_id, timeout=timeout)
         except Exception:
             results[sub_id] = 0
             continue
         if nodes:
+            for n in nodes:
+                clean_tag = str(n.tag or "").strip()
+                ep_key = (
+                    str(n.server or "").strip().lower(),
+                    int(n.server_port or 0),
+                    str(n.protocol or "").strip().lower(),
+                )
+                matched = existing_by_tag.get(clean_tag) or existing_by_ep.get(ep_key)
+                if matched is not None:
+                    n.priority, n.enabled = matched
             storage.save_subscription(
                 sub_id=sub_id,
                 url_or_uri=url_or_uri,

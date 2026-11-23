@@ -705,6 +705,14 @@ def compile_zapret_preset(
                 "--lua-desync=pass",
             ]
         )
+        compiled_profiles.append(
+            [
+                "--filter-udp=443,1024-65535",
+                f"--ipset={exclude_ipset_path.as_posix()}",
+                "--payload=all",
+                "--lua-desync=pass",
+            ]
+        )
 
     for prof in profiles:
         if any(t == "--skip" for t in prof):

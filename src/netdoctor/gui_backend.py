@@ -87,7 +87,12 @@ from netdoctor.tray import (
     get_autostart_status as tray_get_autostart_status,
     set_autostart_enabled as tray_set_autostart_enabled,
 )
-from netdoctor.vpn import fetch_subscription, refresh_all_subscriptions
+from netdoctor.vpn import (
+    fetch_subscription,
+    is_auto_select_node,
+    is_placeholder_node,
+    refresh_all_subscriptions,
+)
 
 T = TypeVar("T")
 
@@ -436,7 +441,10 @@ class GuiBackend:
         # Watchdog & safe hot-reload tracking (prevents winws2 WinDivert reload storms & silent crashes)
         self._last_winws2_hash: str = ""
         self._last_winws2_reload_ts: float = 0.0
+        self._last_singbox_hash: str = ""
+        self._last_singbox_reload_ts: float = 0.0
         self._desired_running: bool = False
+        self._stopping: bool = False
         self._watchdog_restarts: int = 0
         self._watchdog_timestamps: deque[float] = deque(maxlen=20)
         self._watchdog_next_retry_ts: float = 0.0
@@ -448,6 +456,8 @@ class GuiBackend:
         self._service_fail_counts: dict[str, int] = {}
         self._strategies_seeded_sig: tuple[Any, ...] | None = None
         self._last_singbox_check: tuple[str, int] | None = None
+        self._last_vpn_reconcile_ts: float = 0.0
+        self._vpn_reconciling: bool = False
 
     @staticmethod
     def _winws2_args_hash(winws_args: list[str]) -> str:
@@ -637,6 +647,7 @@ class GuiBackend:
             domain_rows = self._query_domain_rows(storage, net_key)
             vpn_nodes = storage.get_all_subscription_nodes()
             vpn_health_map = storage.get_vpn_node_health_map()
+            vpn_policy = storage.get_vpn_selection_policy()
             active_dns = self.orchestrator.dns.get_active_dns(storage)
             all_dns = self.orchestrator.dns.get_all_dns_servers(storage)
             game_filter = storage.get_setting("game_filter", "0") == "1"
@@ -678,7 +689,12 @@ class GuiBackend:
             )
         else:
             orchestrators = self.get_orchestrators_summary(probe_live=False, processes=processes)
-        enriched_vpn_nodes = self._merge_vpn_ping_cache(vpn_nodes, health_map=vpn_health_map)
+        enriched_vpn_nodes = self._merge_vpn_ping_cache(
+            vpn_nodes,
+            health_map=vpn_health_map,
+            policy=vpn_policy,
+            active_node_tag=(orchestrators.get("vpn") or {}).get("best_node"),
+        )
         dns_alert: str | None = None
         sb_tail = _read_tail_lines(self.logs_dir / "sing-box.log", max_lines=60)
         m_doh = re.search(
@@ -722,6 +738,7 @@ class GuiBackend:
             "domain_rows": domain_rows,
             "vpn_nodes_count": len(enriched_vpn_nodes),
             "vpn_nodes": enriched_vpn_nodes,
+            "vpn_policy": vpn_policy,
             "processes": processes,
             "running": any(bool(p.get("running")) for p in processes.values()),
             "orchestrators": orchestrators,
@@ -766,16 +783,28 @@ class GuiBackend:
         self,
         nodes: list[dict[str, Any]],
         health_map: dict[str, dict[str, Any]] | None = None,
+        policy: dict[str, Any] | None = None,
+        active_node_tag: str | None = None,
     ) -> list[dict[str, Any]]:
         with self._lock:
             cache = dict(self._cached_vpn_nodes)
         hmap = health_map or {}
-        if not cache and not hmap:
-            return nodes
+        pref_node = str((policy or {}).get("priority_node") or "").strip()
+        active_clean = str(active_node_tag or "").strip()
         merged: list[dict[str, Any]] = []
         for n in nodes:
-            tag = str(n.get("tag") or "")
+            tag = str(n.get("tag") or "").strip()
             item = dict(n)
+            item["is_placeholder"] = is_placeholder_node(item)
+            item["is_builtin_auto"] = is_auto_select_node(item)
+            try:
+                prio = int(item.get("priority") if item.get("priority") is not None else 100)
+            except (TypeError, ValueError):
+                prio = 100
+            item["priority"] = prio
+            item["enabled"] = bool(item.get("enabled", True))
+            item["is_priority"] = bool((pref_node and tag == pref_node) or prio < 100)
+            item["is_active"] = bool(active_clean and tag == active_clean)
             h = hmap.get(tag)
             if h:
                 item["cb_state"] = h.get("cb_state", "closed")
@@ -788,6 +817,8 @@ class GuiBackend:
                 item["ping_ms"] = cached.get("ping_ms")
                 item["alive"] = cached.get("alive")
                 item["probe_result"] = cached.get("probe_result")
+                if "tunnel_verified" in cached:
+                    item["tunnel_verified"] = cached["tunnel_verified"]
                 if "cb_state" in cached:
                     item["cb_state"] = cached["cb_state"]
                 if "protocol_ok" in cached:
@@ -844,8 +875,19 @@ class GuiBackend:
                     report["dns"].update(self._cached_dns_health)
                 if self._cached_vpn_health:
                     for k, v in self._cached_vpn_health.items():
-                        if v is not None:
-                            report["vpn"][k] = v
+                        if v is None:
+                            continue
+                        if k == "best_node" and report["vpn"].get("running") and report["vpn"].get("best_node"):
+                            continue
+                        if k == "best_ping_ms" and report["vpn"].get("running"):
+                            if report["vpn"].get("best_ping_ms") is not None:
+                                continue
+                            if (
+                                report["vpn"].get("best_node")
+                                and report["vpn"].get("best_node") != self._cached_vpn_health.get("best_node")
+                            ):
+                                continue
+                        report["vpn"][k] = v
         return report
 
     def scan_live_connections(self) -> dict[str, Any]:
@@ -898,7 +940,7 @@ class GuiBackend:
         )
 
     def probe_all_vpn_nodes(self) -> list[dict[str, Any]]:
-        """Measure TCP + in-tunnel latency (when Clash API active) across VPN nodes and persist health."""
+        """Measure TCP + in-tunnel latency (when Clash API active) across VPN nodes, persist health, and steer away from dead/stale nodes."""
         proc_state = self._collect_processes_state()
         clash_client = self.clash_api if bool((proc_state.get("sing-box") or {}).get("running")) else None
         storage = Storage(self.db_path)
@@ -907,11 +949,51 @@ class GuiBackend:
             health = _run_coro_sync(
                 self.orchestrator.vpn.check_health(nodes, clash_client=clash_client, storage=storage)
             )
+            probed = list(health.get("nodes") or [])
+            if clash_client is not None and probed:
+                proxies = clash_client.get_proxies_sync()
+                sel_now, active_leaf, _ = ClashApiClient.resolve_active_proxy(proxies, "vpn-select")
+                policy = storage.get_vpn_selection_policy()
+                probed_by_tag = {
+                    str(n.get("tag") or "").strip(): n
+                    for n in probed
+                    if str(n.get("tag") or "").strip()
+                }
+                active_entry = probed_by_tag.get(active_leaf or "")
+                active_alive = bool(
+                    active_entry
+                    and active_entry.get("alive")
+                    and not active_entry.get("is_placeholder")
+                    and active_entry.get("enabled", True)
+                )
+                alive_real = [
+                    n
+                    for n in probed
+                    if n.get("alive") and not n.get("is_placeholder") and n.get("enabled", True)
+                ]
+                if alive_real:
+                    top_cand = alive_real[0]
+                    top_tag = str(top_cand.get("tag") or "").strip()
+                    should_switch = (not active_alive) or (sel_now == "direct")
+                    if policy["mode"] == "priority" and top_tag and active_leaf != top_tag:
+                        should_switch = True
+                    if should_switch and top_tag and top_tag in proxies:
+                        clash_client.select_outbound_sync("vpn-select", top_tag)
+                        if (
+                            not active_alive
+                            and active_leaf
+                            and active_leaf != top_tag
+                            and active_leaf not in ("vpn-auto", "direct")
+                        ):
+                            clash_client.close_connections_by_node_sync(active_leaf)
+                        self.orchestrator.vpn._active_node_tag = top_tag
+                        self.orchestrator.vpn._last_switch_ts = time.monotonic()
+                        health["best_node"] = top_tag
+                        health["best_ping_ms"] = top_cand.get("ping_ms")
         finally:
             storage.close()
-        probed = list(health.get("nodes") or [])
         with self._lock:
-            self._cached_vpn_nodes = {str(n.get("tag") or ""): n for n in probed}
+            self._cached_vpn_nodes = {str(n.get("tag") or "").strip(): n for n in probed if str(n.get("tag") or "").strip()}
             self._cached_vpn_health = {
                 "alive_count": health.get("alive_count"),
                 "best_node": health.get("best_node"),
@@ -1416,7 +1498,7 @@ class GuiBackend:
             storage.close()
 
         applied = self.trigger_apply_configs()
-        self._reload_running_services(winws2=True, singbox=(clean_id != "auto"))
+        self._reload_running_services(winws2=True, singbox=True)
         return {
             "ok": True,
             "active_preset_id": clean_id,
@@ -1545,7 +1627,7 @@ class GuiBackend:
             storage.close()
         if was_active:
             self.trigger_apply_configs()
-            self._reload_running_services(winws2=True)
+            self._reload_running_services(winws2=True, singbox=True)
         return {"ok": deleted, "deleted": deleted, "reset_to_auto": was_active}
 
     def _save_preset_test_rate(
@@ -1931,6 +2013,7 @@ class GuiBackend:
                 if tun_stack not in ("gvisor", "mixed", "system"):
                     tun_stack = "gvisor"
                 active_preset_id, active_preset_name, active_preset = self._resolve_active_zapret_preset(storage)
+                vpn_policy = storage.get_vpn_selection_policy()
                 health_map = storage.get_vpn_node_health_map()
                 quarantined_tags = {
                     tag
@@ -2060,6 +2143,8 @@ class GuiBackend:
                 use_wireguard_endpoints=True,
                 doh_tls_sni=doh_tls_sni,
                 tun_stack=tun_stack,
+                vpn_selection_mode=vpn_policy["mode"],
+                preferred_vpn_node=vpn_policy["priority_node"] or None,
             )
             sb_hash = hashlib.sha256(singbox_file.read_bytes()).hexdigest()
             sb_exe = self.bin_dir.resolve() / "sing-box.exe"
@@ -2154,18 +2239,13 @@ class GuiBackend:
             winws_running = bool((procs.get("winws2") or {}).get("running"))
             sb_running = bool((procs.get("sing-box") or {}).get("running"))
             if clean == "dpi_only":
-                if self._supervisor is not None and "sing-box" in self._supervisor.processes:
-                    self._supervisor.stop_process("sing-box")
-                elif sb_running:
-                    persisted = inspect_supervisor_state(logs_dir=self.logs_dir)
-                    old_sb = persisted.get("sing-box")
-                    if old_sb and old_sb.get("running") and isinstance(old_sb.get("pid"), int):
-                        try:
-                            p = psutil.Process(old_sb["pid"])
-                            p.terminate()
-                            p.wait(timeout=2.0)
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-                            pass
+                if self._supervisor is None:
+                    self._supervisor = ProcessSupervisor(
+                        bin_dir=self.bin_dir.resolve(),
+                        logs_dir=self.logs_dir.resolve(),
+                    )
+                    self._supervisor.adopt_persisted_state()
+                self._supervisor.stop_process("sing-box")
                 if _is_admin() and winws_running:
                     self.reload_winws2()
             else:
@@ -2390,6 +2470,7 @@ class GuiBackend:
                     "processes": self._collect_processes_state(),
                 }
 
+            clear_vpn_dns_cache()
             applied = self.trigger_apply_configs(iface=iface)
             bin_path = self.bin_dir.resolve()
             winws2_exe = bin_path / "winws2.exe"
@@ -2449,6 +2530,14 @@ class GuiBackend:
             self._desired_running = True
             self._last_winws2_hash = self._winws2_args_hash(applied["winws2_args"])
             self._last_winws2_reload_ts = time.monotonic()
+            try:
+                sb_cfg_path = Path(applied["singbox_config"])
+                self._last_singbox_hash = (
+                    hashlib.sha256(sb_cfg_path.read_bytes()).hexdigest() if sb_cfg_path.is_file() else ""
+                )
+            except OSError:
+                self._last_singbox_hash = ""
+            self._last_singbox_reload_ts = time.monotonic()
             self._last_gateway_ip = self._detect_local_gateway_ip()
             self._watchdog_timestamps.clear()
             self._watchdog_next_retry_ts = 0.0
@@ -2462,6 +2551,8 @@ class GuiBackend:
                     st.close()
             except Exception:  # noqa: BLE001
                 pass
+            if stack_mode != "dpi_only" and int(applied.get("vpn_nodes_count") or 0) > 0:
+                self._sync_singbox_vpn_selector()
             return {
                 "ok": True,
                 "started": True,
@@ -2473,33 +2564,45 @@ class GuiBackend:
 
     def stop_services(self) -> list[str]:
         """Stop all active processes held by ProcessSupervisor and any persisted PIDs."""
-        with self._lock:
-            self._desired_running = False
-            self._watchdog_next_retry_ts = 0.0
-            self._service_retry_ts.clear()
-            self._service_fail_counts.clear()
-            try:
-                st = Storage(self.db_path)
+        self._stopping = True
+        self._desired_running = False
+        try:
+            with self._lock:
+                self._desired_running = False
+                self._watchdog_next_retry_ts = 0.0
+                self._service_retry_ts.clear()
+                self._service_fail_counts.clear()
                 try:
-                    st.set_setting("stack_desired_running", "0")
-                finally:
-                    st.close()
-            except Exception:  # noqa: BLE001
-                pass
-            stopped: list[str] = []
-            if self._supervisor is not None:
-                for name in reversed(list(self._supervisor.processes.keys())):
-                    proc = self._supervisor.processes.get(name)
-                    was_running = proc is not None and proc.poll() is None
-                    self._supervisor.stop_process(name)
-                    if was_running:
-                        stopped.append(name)
-                self._supervisor = None
+                    st = Storage(self.db_path)
+                    try:
+                        st.set_setting("stack_desired_running", "0")
+                    finally:
+                        st.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                stopped: list[str] = []
+                if self._supervisor is not None:
+                    self._supervisor.adopt_persisted_state()
+                    all_names = list(
+                        reversed(list(dict.fromkeys([*self._supervisor._adopted.keys(), *self._supervisor.processes.keys()])))
+                    )
+                    for name in all_names:
+                        proc = self._supervisor.processes.get(name)
+                        adopted = self._supervisor._adopted.get(name)
+                        was_running = (proc is not None and proc.poll() is None) or bool(
+                            adopted and adopted.get("running")
+                        )
+                        self._supervisor.stop_process(name)
+                        if was_running:
+                            stopped.append(name)
+                    self._supervisor = None
 
-            for name in stop_persisted_supervisor(logs_dir=self.logs_dir):
-                if name not in stopped:
-                    stopped.append(name)
-            return stopped
+                for name in stop_persisted_supervisor(logs_dir=self.logs_dir, bin_dir=self.bin_dir.resolve()):
+                    if name not in stopped:
+                        stopped.append(name)
+                return stopped
+        finally:
+            self._stopping = False
 
     def reload_winws2(
         self,
@@ -2545,27 +2648,6 @@ class GuiBackend:
 
             cmd = self._build_winws2_cmd(applied["winws2_args"])
             if self._supervisor is None:
-                # Terminate only orphaned persisted winws2 and adopt running sing-box / tg-ws-proxy PIDs
-                persisted = inspect_supervisor_state(logs_dir=self.logs_dir)
-                old_winws = persisted.get("winws2")
-                if old_winws and old_winws.get("running") and isinstance(old_winws.get("pid"), int):
-                    terminated = False
-                    try:
-                        p = psutil.Process(old_winws["pid"])
-                        p.terminate()
-                        terminated = True
-                        p.wait(timeout=2.0)
-                    except psutil.TimeoutExpired:
-                        try:
-                            p.kill()
-                            p.wait(timeout=1.5)
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-                            pass
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-                    if terminated:
-                        # Allow WinDivert64.sys kernel driver to release the filter handle cleanly
-                        time.sleep(0.35)
                 self._supervisor = ProcessSupervisor(bin_dir=bin_path, logs_dir=self.logs_dir.resolve())
                 self._supervisor.adopt_persisted_state()
 
@@ -2653,43 +2735,65 @@ class GuiBackend:
         """Watchdog: monitor winws2/sing-box/tg-ws-proxy, rollback bad presets on repeated crashes, and react to gateway changes."""
         if not _is_admin():
             return {"checked": True, "healthy": True, "restarted": [], "skipped": "not_admin"}
+        if self._stopping:
+            return {"checked": True, "healthy": True, "restarted": [], "skipped": "stopping"}
 
         procs = self._collect_processes_state()
         winws_running = bool((procs.get("winws2") or {}).get("running"))
         sb_running = bool((procs.get("sing-box") or {}).get("running"))
         tg_running = bool((procs.get("tg-ws-proxy") or {}).get("running"))
 
-        desired_setting = False
+        raw_desired = ""
         stack_mode = "hybrid"
         active_preset_id = "auto"
         try:
             st = Storage(self.db_path)
             try:
-                desired_setting = st.get_setting("stack_desired_running", "0") == "1"
+                raw_desired = st.get_setting("stack_desired_running", "").strip()
                 stack_mode = st.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
                 active_preset_id = st.get_setting("active_zapret_preset_id", "auto").strip() or "auto"
             finally:
                 st.close()
         except Exception:  # noqa: BLE001
-            desired_setting = False
+            raw_desired = ""
 
-        should_be_running = bool(self._desired_running or desired_setting or sb_running or tg_running)
+        if raw_desired == "0" and not self._desired_running:
+            return {"checked": True, "healthy": True, "restarted": [], "skipped": "idle"}
+
+        should_be_running = bool(
+            self._desired_running or raw_desired == "1" or (raw_desired == "" and (sb_running or tg_running))
+        )
         if not should_be_running:
             return {"checked": True, "healthy": True, "restarted": [], "skipped": "idle"}
+
+        def _aborted_by_stop() -> bool:
+            if self._stopping:
+                return True
+            if self._desired_running:
+                return False
+            try:
+                st_chk = Storage(self.db_path)
+                try:
+                    return st_chk.get_setting("stack_desired_running", "").strip() == "0"
+                finally:
+                    st_chk.close()
+            except Exception:  # noqa: BLE001
+                return False
 
         restarted: list[str] = []
         network_changed = False
 
         # Recover dead sing-box (when hybrid mode is desired) and tg-ws-proxy with failure backoff
-        desired_stack_active = bool(self._desired_running or desired_setting)
+        desired_stack_active = bool(self._desired_running or raw_desired == "1")
         now_svc = time.monotonic()
 
         def _try_recover_aux(svc_name: str, recover_fn: Any) -> bool:
             with self._lock:
+                if _aborted_by_stop():
+                    return False
                 if now_svc < self._service_retry_ts.get(svc_name, 0.0):
                     return False
-            res = recover_fn()
-            with self._lock:
+                res = recover_fn()
                 if res.get("ok"):
                     self._service_fail_counts.pop(svc_name, None)
                     self._service_retry_ts.pop(svc_name, None)
@@ -2726,6 +2830,8 @@ class GuiBackend:
                 if not prev_gw:
                     self._last_gateway_ip = cur_gw
                 elif cur_gw != prev_gw:
+                    if _aborted_by_stop():
+                        return {"checked": True, "healthy": True, "restarted": restarted, "skipped": "stopping"}
                     self._last_gateway_ip = cur_gw
                     network_changed = True
                     clear_vpn_dns_cache()
@@ -2746,6 +2852,8 @@ class GuiBackend:
 
         now = time.monotonic()
         with self._lock:
+            if _aborted_by_stop():
+                return {"checked": True, "healthy": True, "restarted": restarted, "skipped": "stopping"}
             while self._watchdog_timestamps and (now - self._watchdog_timestamps[0]) > window_sec:
                 self._watchdog_timestamps.popleft()
             recent_crashes = len(self._watchdog_timestamps)
@@ -2768,13 +2876,19 @@ class GuiBackend:
                     "restarts_count": self._watchdog_restarts,
                 }
 
+        if _aborted_by_stop():
+            return {"checked": True, "healthy": True, "restarted": restarted, "skipped": "stopping"}
+
         tail_cur = _read_tail_lines(self.logs_dir / "winws2.log", max_lines=6).strip()
         tail_prev = _read_tail_lines(self.logs_dir / "winws2.prev.log", max_lines=6).strip()
         snippet = tail_cur or tail_prev
         crash_reason = snippet.splitlines()[-1].strip()[:180] if snippet else "Процесс winws2.exe неожиданно завершился"
 
         fallback_switched_to: str | None = None
-        res = self.reload_winws2()
+        with self._lock:
+            if _aborted_by_stop():
+                return {"checked": True, "healthy": True, "restarted": restarted, "skipped": "stopping"}
+            res = self.reload_winws2()
         # Roll back incompatible custom/Zapret2 preset automatically after >=2 rapid crashes or immediate failure
         if active_preset_id != "auto" and (recent_crashes >= 2 or not res.get("ok")):
             fallback_id = "auto"
@@ -2868,15 +2982,6 @@ class GuiBackend:
                 }
 
             if self._supervisor is None:
-                persisted = inspect_supervisor_state(logs_dir=self.logs_dir)
-                old_sb = persisted.get("sing-box")
-                if old_sb and old_sb.get("running") and isinstance(old_sb.get("pid"), int):
-                    try:
-                        p = psutil.Process(old_sb["pid"])
-                        p.terminate()
-                        p.wait(timeout=2.0)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-                        pass
                 self._supervisor = ProcessSupervisor(bin_dir=bin_path, logs_dir=self.logs_dir.resolve())
                 self._supervisor.adopt_persisted_state()
 
@@ -2887,11 +2992,16 @@ class GuiBackend:
                 rc = proc.poll()
                 if rc is not None:
                     self._supervisor.stop_process("sing-box")
+                    log_tail = _read_tail_lines(self.logs_dir / "sing-box.log", max_lines=8).strip()
+                    reason = f"sing-box exited prematurely on reload with code {rc}"
+                    if log_tail:
+                        last_line = log_tail.splitlines()[-1].strip()
+                        reason = f"{reason}: {last_line[:180]}"
                     return {
                         "ok": False,
                         "reloaded": False,
                         "requires_admin": False,
-                        "error": f"sing-box exited prematurely on reload with code {rc}",
+                        "error": reason,
                         "applied": applied,
                         "processes": self._collect_processes_state(),
                     }
@@ -2905,6 +3015,15 @@ class GuiBackend:
                     "processes": self._collect_processes_state(),
                 }
 
+            try:
+                self._last_singbox_hash = (
+                    hashlib.sha256(singbox_file.read_bytes()).hexdigest() if singbox_file.is_file() else ""
+                )
+            except OSError:
+                self._last_singbox_hash = ""
+            self._last_singbox_reload_ts = time.monotonic()
+            self._sync_singbox_vpn_selector()
+
             return {
                 "ok": True,
                 "reloaded": True,
@@ -2913,6 +3032,41 @@ class GuiBackend:
                 "applied": applied,
                 "processes": self._collect_processes_state(),
             }
+
+    def reload_singbox_if_changed(
+        self,
+        iface: int | None = None,
+        min_interval_sec: float = 15.0,
+    ) -> dict[str, Any]:
+        """Hot-reload sing-box ONLY if generated sing-box.json changed AND cooldown interval elapsed."""
+        with self._lock:
+            applied = self.trigger_apply_configs(iface=iface)
+            sb_path = Path(applied["singbox_config"]).resolve()
+            try:
+                new_hash = hashlib.sha256(sb_path.read_bytes()).hexdigest() if sb_path.is_file() else ""
+            except OSError:
+                new_hash = ""
+            procs = self._collect_processes_state()
+            sb_running = bool((procs.get("sing-box") or {}).get("running"))
+            if sb_running and self._last_singbox_hash and new_hash == self._last_singbox_hash:
+                return {
+                    "ok": True,
+                    "reloaded": False,
+                    "skipped": "unchanged",
+                    "applied": applied,
+                    "processes": procs,
+                }
+            elapsed = time.monotonic() - self._last_singbox_reload_ts
+            if sb_running and self._last_singbox_reload_ts > 0 and elapsed < min_interval_sec:
+                return {
+                    "ok": True,
+                    "reloaded": False,
+                    "skipped": "throttled",
+                    "retry_after_sec": round(min_interval_sec - elapsed, 1),
+                    "applied": applied,
+                    "processes": procs,
+                }
+        return self.reload_singbox(iface=iface)
 
     def _reload_running_services(self, *, winws2: bool = False, singbox: bool = False) -> None:
         """Quietly hot-reload already-running elevated services when config/rules change."""
@@ -2923,6 +3077,242 @@ class GuiBackend:
             self.reload_winws2()
         if singbox and bool((procs.get("sing-box") or {}).get("running")):
             self.reload_singbox()
+
+    def _sync_singbox_vpn_selector(self, *, retries: int = 2) -> None:
+        """Align live `vpn-select` outbound with stored VPN selection policy (overcoming singbox-cache.db)."""
+        try:
+            storage = Storage(self.db_path)
+            try:
+                nodes = storage.get_all_subscription_nodes()
+                if not nodes:
+                    return
+                vpn_policy = storage.get_vpn_selection_policy()
+                health_map = storage.get_vpn_node_health_map()
+            finally:
+                storage.close()
+
+            desired_target = "vpn-auto"
+            if vpn_policy["mode"] == "priority":
+                pref = str(vpn_policy.get("priority_node") or "").strip()
+                eligible = self.orchestrator.vpn.rank_candidates(
+                    nodes,
+                    health_map,
+                    mode="priority",
+                    preferred_tag=pref,
+                    allow_quarantined=False,
+                )
+                eligible_tags = {str(n.get("tag") or "").strip() for n in eligible}
+                if pref and pref in eligible_tags:
+                    desired_target = pref
+                elif eligible:
+                    top_prio = int(eligible[0].get("priority") if eligible[0].get("priority") is not None else 100)
+                    if top_prio < 100:
+                        desired_target = str(eligible[0].get("tag") or "").strip() or "vpn-auto"
+
+            proxies: dict[str, Any] = {}
+            for attempt in range(max(1, retries)):
+                proxies = self.clash_api.get_proxies_sync()
+                if proxies:
+                    break
+                if attempt + 1 < retries:
+                    time.sleep(0.25)
+
+            sel_info = proxies.get("vpn-select") if isinstance(proxies, dict) else None
+            if isinstance(sel_info, dict) and str(sel_info.get("now") or "") != desired_target:
+                if desired_target in proxies or desired_target == "vpn-auto":
+                    self.clash_api.select_outbound_sync("vpn-select", desired_target)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def get_vpn_selection_policy(self) -> dict[str, Any]:
+        """Return persisted VPN selection mode (`auto` | `priority`), preferred node tag, and priorities."""
+        storage = Storage(self.db_path)
+        try:
+            return storage.get_vpn_selection_policy()
+        finally:
+            storage.close()
+
+    def set_vpn_selection_mode(self, mode: str) -> dict[str, Any]:
+        """Switch VPN selection mode (`auto` vs `priority`), rebuild configs, and reconcile live Clash selector."""
+        clean_mode = "priority" if str(mode or "auto").strip().lower() == "priority" else "auto"
+        storage = Storage(self.db_path)
+        try:
+            policy = storage.set_vpn_selection_policy(mode=clean_mode)
+        finally:
+            storage.close()
+
+        applied = self.trigger_apply_configs()
+        reconcile_res: dict[str, Any] | None = None
+        sb_running = bool((self._collect_processes_state().get("sing-box") or {}).get("running"))
+        if sb_running:
+            if clean_mode == "auto":
+                self.clash_api.select_outbound_sync("vpn-select", "vpn-auto")
+                self.orchestrator.vpn._active_node_tag = None
+            reconcile_res = self.reconcile_vpn_health(force=True)
+        return {
+            "ok": True,
+            "policy": policy,
+            "applied": applied,
+            "reconcile": reconcile_res,
+        }
+
+    def set_vpn_priority_node(self, tag: str | None) -> dict[str, Any]:
+        """Pin a real VPN node as Priority #1 (and switch to priority mode), or revert to auto mode."""
+        clean_tag = str(tag or "").strip()
+        if not clean_tag or clean_tag == "vpn-auto":
+            return self.set_vpn_selection_mode("auto")
+
+        storage = Storage(self.db_path)
+        try:
+            nodes = storage.get_all_subscription_nodes()
+            match = next((n for n in nodes if str(n.get("tag") or "").strip() == clean_tag), None)
+            if match is None:
+                raise ValueError(f"VPN-узел не найден: {clean_tag}")
+            if is_placeholder_node(match):
+                raise ValueError(f"Узел «{clean_tag}» — служебная запись подписки, её нельзя выбрать приоритетной")
+            policy = storage.get_vpn_selection_policy()
+            priorities = dict(policy["priorities"])
+            for n in nodes:
+                n_tag = str(n.get("tag") or "").strip()
+                if n_tag and n_tag != clean_tag and int(n.get("priority") if n.get("priority") is not None else 100) == 1:
+                    priorities[n_tag] = 10
+            for k, v in list(priorities.items()):
+                if k != clean_tag and v == 1:
+                    priorities[k] = 10
+            priorities[clean_tag] = 1
+            new_policy = storage.set_vpn_selection_policy(
+                mode="priority",
+                priority_node=clean_tag,
+                priorities=priorities,
+            )
+        finally:
+            storage.close()
+
+        applied = self.trigger_apply_configs()
+        reconcile_res: dict[str, Any] | None = None
+        if bool((self._collect_processes_state().get("sing-box") or {}).get("running")):
+            reconcile_res = self.reconcile_vpn_health(force=True)
+        return {
+            "ok": True,
+            "policy": new_policy,
+            "priority_node": clean_tag,
+            "applied": applied,
+            "reconcile": reconcile_res,
+        }
+
+    def move_vpn_node_priority(self, tag: str, delta: int) -> dict[str, Any]:
+        """Shift a real VPN node up (`delta < 0`) or down (`delta > 0`) in priority ranking."""
+        clean_tag = str(tag or "").strip()
+        if not clean_tag:
+            raise ValueError("Не выбран VPN-узел")
+
+        storage = Storage(self.db_path)
+        try:
+            nodes = storage.get_all_subscription_nodes()
+            real_nodes = [
+                (idx, n)
+                for idx, n in enumerate(nodes)
+                if n.get("enabled", True) and not is_placeholder_node(n) and str(n.get("tag") or "").strip()
+            ]
+            real_nodes.sort(
+                key=lambda item: (
+                    int(item[1].get("priority") if item[1].get("priority") is not None else 100),
+                    item[0],
+                )
+            )
+            ordered_tags = [str(n.get("tag") or "").strip() for _idx, n in real_nodes]
+            if clean_tag not in ordered_tags:
+                raise ValueError(f"Реальный VPN-узел «{clean_tag}» не найден")
+            idx = ordered_tags.index(clean_tag)
+            step = -1 if delta < 0 else (1 if delta > 0 else 0)
+            new_idx = max(0, min(len(ordered_tags) - 1, idx + step))
+            if new_idx != idx:
+                ordered_tags.pop(idx)
+                ordered_tags.insert(new_idx, clean_tag)
+            new_priorities = {t: (1 if i == 0 else i * 10) for i, t in enumerate(ordered_tags)}
+            top_tag = ordered_tags[0]
+            new_policy = storage.set_vpn_selection_policy(
+                mode="priority",
+                priority_node=top_tag,
+                priorities=new_priorities,
+            )
+        finally:
+            storage.close()
+
+        applied = self.trigger_apply_configs()
+        reconcile_res: dict[str, Any] | None = None
+        if bool((self._collect_processes_state().get("sing-box") or {}).get("running")):
+            reconcile_res = self.reconcile_vpn_health(force=True)
+        return {
+            "ok": True,
+            "policy": new_policy,
+            "priority_node": top_tag,
+            "applied": applied,
+            "reconcile": reconcile_res,
+        }
+
+    def reconcile_vpn_health(
+        self,
+        min_interval_sec: float = 30.0,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Run throttled, non-reentrant active VPN node health check and automatic failover/failback."""
+        now = time.monotonic()
+        with self._lock:
+            if self._vpn_reconciling:
+                return {"ok": True, "skipped": "busy"}
+            if not force and self._last_vpn_reconcile_ts > 0 and (now - self._last_vpn_reconcile_ts) < min_interval_sec:
+                return {"ok": True, "skipped": "throttled"}
+            procs = self._collect_processes_state()
+            if not bool((procs.get("sing-box") or {}).get("running")):
+                return {"ok": True, "skipped": "singbox_stopped"}
+            self._vpn_reconciling = True
+
+        try:
+            storage = Storage(self.db_path)
+            try:
+                nodes = storage.get_all_subscription_nodes()
+                if not nodes:
+                    return {"ok": True, "action": "no_nodes", "selected": None, "probed": []}
+                res = _run_coro_sync(
+                    self.orchestrator.vpn.reconcile_active_node(
+                        storage,
+                        nodes,
+                        clash_client=self.clash_api,
+                        timeout=1.8,
+                        force=force,
+                    )
+                )
+            finally:
+                storage.close()
+
+            probed_list = res.get("probed") or []
+            with self._lock:
+                self._last_vpn_reconcile_ts = time.monotonic()
+                for p in probed_list:
+                    tag = str(p.get("tag") or "").strip()
+                    if tag:
+                        cached_item = dict(self._cached_vpn_nodes.get(tag) or {})
+                        cached_item.update(
+                            {
+                                "alive": p.get("alive"),
+                                "ping_ms": p.get("ping_ms"),
+                                "probe_result": p.get("probe_result"),
+                                "cb_state": p.get("cb_state"),
+                                "protocol_ok": p.get("protocol_ok"),
+                                "tunnel_verified": p.get("tunnel_verified"),
+                            }
+                        )
+                        self._cached_vpn_nodes[tag] = cached_item
+                if res.get("selected"):
+                    self._cached_vpn_health["best_node"] = res["selected"]
+                    sel_p = next((p for p in probed_list if p.get("tag") == res["selected"]), None)
+                    if sel_p is not None:
+                        self._cached_vpn_health["best_ping_ms"] = sel_p.get("ping_ms")
+            return res
+        finally:
+            with self._lock:
+                self._vpn_reconciling = False
 
     def rotate_vpn_node(self, target_tag: str | None = None, selector_tag: str = "vpn-select") -> dict[str, Any]:
         """Switch active VPN server via Clash API without TUN restart and persist selection."""
@@ -3050,9 +3440,13 @@ class GuiBackend:
                 coro = run_canary_cycle(storage, winws2_log_path=self.logs_dir / "winws2.log")
             else:
                 coro = run_canary_cycle(storage)
-            return _run_coro_sync(coro)
+            res = _run_coro_sync(coro)
         finally:
             storage.close()
+        if res.get("promoted") or res.get("downshifted"):
+            self.trigger_apply_configs()
+            self._reload_running_services(winws2=True, singbox=True)
+        return res
 
     def add_vpn_subscription(self, url_or_uri: str, sub_id: str = "default") -> int:
         """Fetch/parse a VPN subscription URL or URI, persist it, and regenerate sing-box/exclude configs."""
@@ -3065,6 +3459,7 @@ class GuiBackend:
 
         storage = Storage(self.db_path)
         try:
+            had_nodes_before = len(storage.get_all_subscription_nodes())
             storage.save_subscription(
                 sub_id=sub_id,
                 url_or_uri=clean_input,
@@ -3073,6 +3468,12 @@ class GuiBackend:
         finally:
             storage.close()
 
+        if had_nodes_before == 0:
+            sb_running = bool((self._collect_processes_state().get("sing-box") or {}).get("running"))
+            if not sb_running:
+                (self.bin_dir.resolve() / "singbox-cache.db").unlink(missing_ok=True)
+
+        clear_vpn_dns_cache()
         self.trigger_apply_configs()
         self._reload_running_services(winws2=True, singbox=True)
         return len(nodes)
@@ -3086,6 +3487,7 @@ class GuiBackend:
             storage.close()
 
         if any(count > 0 for count in results.values()):
+            clear_vpn_dns_cache()
             self.trigger_apply_configs()
             self._reload_running_services(winws2=True, singbox=True)
         return results

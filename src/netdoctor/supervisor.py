@@ -9,11 +9,13 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import zipfile
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -1118,20 +1120,19 @@ def inspect_supervisor_state(
 def stop_persisted_supervisor(
     state_path: str | Path | None = None,
     logs_dir: str | Path = Path("logs"),
+    bin_dir: str | Path | None = None,
 ) -> list[str]:
-    """Stop any live processes recorded in supervisor_state.json in reverse start order and clear state."""
+    """Stop any live processes (and child process trees) recorded in supervisor_state.json in reverse order."""
     resolved_state = Path(state_path) if state_path is not None else (Path(logs_dir) / "supervisor_state.json")
-    if not resolved_state.is_file():
-        return []
-
-    try:
-        data = json.loads(resolved_state.read_text(encoding="utf-8"))
-        procs = data.get("processes") if isinstance(data, dict) else None
-        if not isinstance(procs, dict):
+    procs: dict[str, Any] = {}
+    if resolved_state.is_file():
+        try:
+            data = json.loads(resolved_state.read_text(encoding="utf-8"))
+            raw_procs = data.get("processes") if isinstance(data, dict) else None
+            if isinstance(raw_procs, dict):
+                procs = raw_procs
+        except Exception:
             procs = {}
-    except Exception:
-        _write_bytes_atomic(resolved_state, b'{"processes": {}}\n')
-        return []
 
     stopped: list[str] = []
     for name in reversed(list(procs.keys())):
@@ -1140,19 +1141,212 @@ def stop_persisted_supervisor(
         expected_ct = info.get("create_time") if isinstance(info, dict) else None
         if _is_pid_running(pid, expected_create_time=expected_ct):
             try:
-                proc = psutil.Process(pid)
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3.0)
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2.0)
-                stopped.append(str(name))
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                if terminate_process_tree(int(pid)):
+                    stopped.append(str(name))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired, OSError, ValueError):
                 pass
 
-    _write_bytes_atomic(resolved_state, b'{"processes": {}}\n')
+    if bin_dir is not None:
+        for orphan_name in cleanup_orphaned_service_processes(bin_dir):
+            if orphan_name not in stopped:
+                stopped.append(orphan_name)
+
+    ports_to_wait: list[int] = []
+    for name in stopped:
+        ports_to_wait.extend(SERVICE_PORTS.get(name, ()))
+    if ports_to_wait:
+        wait_ports_released(ports_to_wait, timeout=3.0)
+
+    if resolved_state.is_file() or stopped:
+        _write_bytes_atomic(resolved_state, b'{"processes": {}}\n')
     return stopped
+
+
+SERVICE_PORTS: dict[str, tuple[int, ...]] = {
+    "sing-box": (2080, 19090),
+    "tg-ws-proxy": (10808,),
+    "byedpi": (10809,),
+}
+
+
+def is_local_port_busy(port: int, host: str = "127.0.0.1") -> bool:
+    """Return True if binding ``host:port`` fails (port already occupied)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        sock.bind((host, int(port)))
+        return False
+    except OSError:
+        return True
+    finally:
+        sock.close()
+
+
+def wait_ports_released(
+    ports: Sequence[int],
+    timeout: float = 3.0,
+    host: str = "127.0.0.1",
+) -> list[int]:
+    """Poll until all given local TCP ports become bindable or timeout expires; returns still-busy ports."""
+    unique_ports = list(dict.fromkeys(int(p) for p in ports if int(p) > 0))
+    if not unique_ports:
+        return []
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        busy = [p for p in unique_ports if is_local_port_busy(p, host=host)]
+        if not busy or time.monotonic() >= deadline:
+            return busy
+        time.sleep(0.05)
+
+
+def terminate_process_tree(
+    pid: int,
+    *,
+    extra_pids: Sequence[int] | None = None,
+    graceful_timeout: float = 1.5,
+    kill_timeout: float = 2.0,
+) -> bool:
+    """Terminate and reap a process along with its recursive children and any pre-snapshotted extra PIDs."""
+    self_pid = os.getpid()
+    seen_pids: set[int] = set()
+    targets: list[psutil.Process] = []
+
+    def _add_proc(p: psutil.Process) -> None:
+        try:
+            p_pid = int(p.pid)
+        except (psutil.Error, ValueError, TypeError):
+            return
+        if p_pid <= 0 or p_pid == self_pid or p_pid in seen_pids:
+            return
+        seen_pids.add(p_pid)
+        targets.append(p)
+
+    # Snapshot children BEFORE terminating parent so Windows venv launcher children are never orphaned
+    if isinstance(pid, int) and pid > 0 and pid != self_pid:
+        try:
+            root = psutil.Process(pid)
+            for child in root.children(recursive=True):
+                _add_proc(child)
+            _add_proc(root)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error, OSError):
+            pass
+
+    for raw_ep in extra_pids or ():
+        try:
+            ep = int(raw_ep)
+        except (TypeError, ValueError):
+            continue
+        if ep <= 0 or ep == self_pid or ep in seen_pids:
+            continue
+        try:
+            ep_proc = psutil.Process(ep)
+            for child in ep_proc.children(recursive=True):
+                _add_proc(child)
+            _add_proc(ep_proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error, OSError):
+            pass
+
+    if not targets:
+        return False
+
+    acted = False
+    for p in targets:
+        try:
+            if p.is_running():
+                p.terminate()
+                acted = True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error, OSError):
+            pass
+
+    try:
+        _gone, alive = psutil.wait_procs(targets, timeout=max(0.1, float(graceful_timeout)))
+    except Exception:
+        alive = [p for p in targets if p.is_running()]
+
+    if alive:
+        for p in alive:
+            try:
+                if p.is_running():
+                    p.kill()
+                    acted = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error, OSError):
+                pass
+        try:
+            psutil.wait_procs(alive, timeout=max(0.1, float(kill_timeout)))
+        except Exception:
+            pass
+
+    return acted
+
+
+def cleanup_orphaned_service_processes(
+    bin_dir: str | Path,
+    names: Sequence[str] | None = None,
+) -> list[str]:
+    """Terminate leftover netdoctor service processes (or venv child interpreters) scoped strictly to bin_dir."""
+    bin_path = Path(bin_dir).resolve()
+    target_names = set(names) if names is not None else {"tg-ws-proxy", "sing-box", "winws2", "byedpi"}
+
+    def _norm(p: str | Path) -> str:
+        return os.path.normcase(os.path.normpath(str(p)))
+
+    tg_dir_norm = _norm((bin_path / "tg-ws-proxy").resolve())
+    tg_script_norm = _norm((bin_path / "tg-ws-proxy" / "proxy" / "tg_ws_proxy.py").resolve())
+    tg_exe_norm = _norm((bin_path / "tg-ws-proxy" / "TgWsProxy_windows.exe").resolve())
+    sb_exe_norm = _norm((bin_path / "sing-box.exe").resolve())
+    winws_exe_norm = _norm((bin_path / "winws2.exe").resolve())
+    ciadpi_exe_norm = _norm((bin_path / "ciadpi.exe").resolve())
+
+    self_pid = os.getpid()
+    matches: list[tuple[str, int]] = []
+
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        try:
+            info = proc.info if isinstance(proc.info, dict) else {}
+            pid = int(info.get("pid") or 0)
+            if pid <= 0 or pid == self_pid:
+                continue
+            exe_raw = str(info.get("exe") or "").strip()
+            exe_norm = _norm(exe_raw) if exe_raw else ""
+            cmdline = [str(a) for a in (info.get("cmdline") or []) if a]
+            cmd_norms = [_norm(a) for a in cmdline]
+
+            svc_match: str | None = None
+            if "sing-box" in target_names and (
+                exe_norm == sb_exe_norm or (cmd_norms and cmd_norms[0] == sb_exe_norm)
+            ):
+                svc_match = "sing-box"
+            elif "winws2" in target_names and (
+                exe_norm == winws_exe_norm or (cmd_norms and cmd_norms[0] == winws_exe_norm)
+            ):
+                svc_match = "winws2"
+            elif "byedpi" in target_names and (
+                exe_norm == ciadpi_exe_norm or (cmd_norms and cmd_norms[0] == ciadpi_exe_norm)
+            ):
+                svc_match = "byedpi"
+            elif "tg-ws-proxy" in target_names:
+                if exe_norm == tg_exe_norm or (cmd_norms and cmd_norms[0] == tg_exe_norm):
+                    svc_match = "tg-ws-proxy"
+                elif any(
+                    cn == tg_script_norm or (cn.endswith("tg_ws_proxy.py") and tg_dir_norm in cn)
+                    for cn in cmd_norms
+                ):
+                    svc_match = "tg-ws-proxy"
+
+            if svc_match is not None:
+                matches.append((svc_match, pid))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError):
+            continue
+
+    cleaned: list[str] = []
+    for svc_name, pid in matches:
+        try:
+            if terminate_process_tree(pid) and svc_name not in cleaned:
+                cleaned.append(svc_name)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired, OSError):
+            pass
+    return cleaned
 
 
 def validate_singbox_config(bin_dir: str | Path, config_path: str | Path) -> tuple[bool, str]:
@@ -1189,6 +1383,7 @@ class ProcessSupervisor:
         self.logs_dir = Path(logs_dir)
         self.state_path = Path(state_path) if state_path is not None else (self.logs_dir / "supervisor_state.json")
         self.processes: dict[str, subprocess.Popen[bytes]] = {}
+        self._adopted: dict[str, dict[str, Any]] = {}
         self._log_files: dict[str, Any] = {}
         self._cmds: dict[str, list[str]] = {}
         self._started_at: dict[str, str] = {}
@@ -1198,13 +1393,16 @@ class ProcessSupervisor:
     def adopt_persisted_state(self) -> dict[str, Any]:
         """Read supervisor_state.json and return still-running processes not currently managed or stopped."""
         if not self.state_path.is_file():
+            self._adopted = {}
             return {}
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
         except Exception:
+            self._adopted = {}
             return {}
         procs = data.get("processes") if isinstance(data, dict) else None
         if not isinstance(procs, dict):
+            self._adopted = {}
             return {}
 
         adopted: dict[str, Any] = {}
@@ -1223,6 +1421,7 @@ class ProcessSupervisor:
                 if not isinstance(entry.get("cmd"), list):
                     entry["cmd"] = []
                 adopted[name_str] = entry
+        self._adopted = dict(adopted)
         return adopted
 
     def _save_state(self) -> None:
@@ -1254,11 +1453,23 @@ class ProcessSupervisor:
             if not exe_path.is_file() and shutil.which(exe) is None:
                 raise FileNotFoundError(f"Executable not found for '{name}': {exe}")
 
-        was_running = name in self.processes and self.processes[name].poll() is None
+        was_running = (name in self.processes and self.processes[name].poll() is None) or (
+            name in self._adopted
+            and _is_pid_running(
+                self._adopted[name].get("pid"),
+                expected_create_time=self._adopted[name].get("create_time"),
+            )
+        )
+        if not was_running:
+            persisted = inspect_supervisor_state(state_path=self.state_path)
+            was_running = bool((persisted.get(name) or {}).get("running"))
         self.stop_process(name)
         if was_running and name == "winws2":
             # Allow WinDivert64.sys kernel driver to finish releasing the filter handle cleanly
             time.sleep(0.35)
+        elif was_running and name == "sing-box":
+            # Allow Wintun adapter teardown to settle before re-creating netdoctor-tun
+            time.sleep(0.25)
 
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.logs_dir / f"{name}.log"
@@ -1306,37 +1517,74 @@ class ProcessSupervisor:
     def stop_process(self, name: str) -> None:
         self._stopped_names.add(name)
         proc = self.processes.pop(name, None)
+        adopted_info = self._adopted.pop(name, None)
         log_fp = self._log_files.pop(name, None)
         self._cmds.pop(name, None)
         self._started_at.pop(name, None)
         self._create_times.pop(name, None)
-        if proc and proc.poll() is None:
-            sig = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM)
+
+        target_pid: int | None = None
+        if proc is not None and proc.poll() is None:
+            target_pid = proc.pid
+        elif adopted_info and _is_pid_running(
+            adopted_info.get("pid"),
+            expected_create_time=adopted_info.get("create_time"),
+        ):
+            target_pid = int(adopted_info["pid"])
+        elif self.state_path.is_file():
             try:
-                proc.send_signal(sig)
-                proc.wait(timeout=1.5)
+                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+                st_entry = (data.get("processes") or {}).get(name) if isinstance(data, dict) else None
+                if isinstance(st_entry, dict) and _is_pid_running(
+                    st_entry.get("pid"),
+                    expected_create_time=st_entry.get("create_time"),
+                ):
+                    target_pid = int(st_entry["pid"])
+            except Exception:
+                pass
+
+        # Snapshot child PIDs (e.g. Windows venv pythonw.exe -> Python312\pythonw.exe) BEFORE signalling parent
+        child_pids: list[int] = []
+        if target_pid is not None:
+            try:
+                child_pids = [c.pid for c in psutil.Process(target_pid).children(recursive=True)]
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error, OSError):
+                child_pids = []
+
+        # Skip CTRL_BREAK_EVENT on Windows: fails with WinError 6 / CPython 3.12 SystemError under pythonw.exe and cannot reach CREATE_NO_WINDOW children
+        if os.name != "nt" and proc is not None and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=0.6)
             except (subprocess.TimeoutExpired, OSError, ValueError):
                 pass
-            if proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2.0)
-                except (subprocess.TimeoutExpired, OSError):
-                    if proc.poll() is None:
-                        try:
-                            proc.kill()
-                            proc.wait(timeout=1.5)
-                        except (subprocess.TimeoutExpired, OSError):
-                            pass
+
+        if target_pid is not None:
+            terminate_process_tree(target_pid, extra_pids=child_pids)
+
+        if proc is not None:
+            try:
+                proc.wait(timeout=0.5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        cleanup_orphaned_service_processes(self.bin_dir, names=(name,))
+
         if log_fp is not None:
             try:
                 log_fp.close()
             except OSError:
                 pass
+
+        ports = SERVICE_PORTS.get(name, ())
+        if ports:
+            wait_ports_released(ports, timeout=2.5)
+
         self._save_state()
 
     def stop_all(self) -> None:
-        for name in reversed(list(self.processes.keys())):
+        names = list(reversed(list(dict.fromkeys([*self._adopted.keys(), *self.processes.keys()]))))
+        for name in names:
             self.stop_process(name)
         self._save_state()
 

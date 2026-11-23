@@ -45,6 +45,7 @@ from netdoctor.selector import (
 )
 from netdoctor.storage import Storage
 from netdoctor.supervisor import _is_admin
+from netdoctor.vpn import infer_node_region, is_auto_select_node, is_placeholder_node
 
 _LOCAL_NETWORKS = (
     ipaddress.ip_network("10.0.0.0/8"),
@@ -1176,6 +1177,128 @@ class VpnLayerOrchestrator:
             return False
         return float(cand_rtt) < (float(active_rtt) * 0.65) and (float(active_rtt) - float(cand_rtt)) > 120.0
 
+    def rank_candidates(
+        self,
+        nodes: list[dict[str, Any]],
+        health_map: dict[str, dict[str, Any]] | None = None,
+        *,
+        mode: str = "auto",
+        preferred_tag: str | None = None,
+        exclude_tag: str | None = None,
+        prev_transport: str = "",
+        had_proto_block: bool = False,
+        allow_quarantined: bool = False,
+        probed_map: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rank real, enabled VPN candidates by health, policy mode (`auto` vs `priority`), transport diversity, and RTT."""
+        hmap = health_map or {}
+        pmap = probed_map or {}
+        clean_mode = "priority" if str(mode or "auto").strip().lower() == "priority" else "auto"
+        pref = (preferred_tag or "").strip()
+        excl = (exclude_tag or "").strip()
+
+        scored: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        for idx, n in enumerate(nodes):
+            if not isinstance(n, dict) or not n.get("enabled", True) or is_placeholder_node(n):
+                continue
+            tag = str(n.get("tag") or "").strip()
+            if not tag or (excl and tag == excl):
+                continue
+
+            h = hmap.get(tag) or {}
+            p = pmap.get(tag) or {}
+            raw_cb = str(p.get("cb_state") or h.get("cb_state") or "closed")
+            quar_until = str(h.get("quarantined_until") or "")
+            is_quarantined = raw_cb == "open" and not self._is_quarantine_expired(quar_until)
+            if is_quarantined and not allow_quarantined:
+                continue
+            effective_cb = "half_open" if (raw_cb == "open" and not is_quarantined) else raw_cb
+
+            alive_val = p["alive"] if "alive" in p else n.get("alive")
+            fails = int(p.get("consecutive_fails") if "consecutive_fails" in p else (h.get("consecutive_fails") or 0))
+            proto_ok = bool(p.get("protocol_ok") if "protocol_ok" in p else h.get("protocol_ok", 1))
+
+            if is_quarantined:
+                unhealthy_tier = 3
+            elif alive_val is False or fails > 0 or not proto_ok:
+                unhealthy_tier = 2
+            elif effective_cb == "half_open":
+                unhealthy_tier = 1
+            else:
+                unhealthy_tier = 0
+
+            transport = str(n.get("transport") or n.get("protocol") or "")
+            diff_transport_penalty = 0 if (not had_proto_block or transport != prev_transport) else 1
+
+            raw_region = str(n.get("region") or "").strip().lower()
+            region = (
+                raw_region
+                if raw_region and raw_region != "other"
+                else infer_node_region(str(n.get("display_name") or tag), str(n.get("server") or ""))
+            )
+            is_ru_penalty = 1 if region == "ru" else 0
+            try:
+                priority = int(n.get("priority") if n.get("priority") is not None else 100)
+            except (TypeError, ValueError):
+                priority = 100
+
+            raw_rtt = (
+                p.get("ping_ms")
+                if p.get("ping_ms") is not None
+                else (n.get("ping_ms") if n.get("ping_ms") is not None else h.get("ewma_rtt_ms"))
+            )
+            rtt = float(raw_rtt) if raw_rtt is not None else 5000.0
+
+            if clean_mode == "priority":
+                key: tuple[Any, ...] = (
+                    unhealthy_tier,
+                    diff_transport_penalty,
+                    0 if (pref and tag == pref) else 1,
+                    priority,
+                    is_ru_penalty if priority >= 100 else 0,
+                    rtt,
+                    idx,
+                    tag,
+                )
+            else:
+                key = (
+                    unhealthy_tier,
+                    diff_transport_penalty,
+                    is_ru_penalty,
+                    rtt,
+                    priority,
+                    idx,
+                    tag,
+                )
+            scored.append((key, n))
+
+        scored.sort(key=lambda item: item[0])
+        return [item[1] for item in scored]
+
+    async def _measure_clash_node_delay(
+        self,
+        clash_client: ClashApiClient,
+        clash_tag: str,
+        timeout: float,
+    ) -> tuple[bool, float | None, str]:
+        timeout_ms = int(max(timeout, 2.0) * 1000)
+        delay_res = await clash_client.measure_node_delay(
+            clash_tag,
+            url="https://www.gstatic.com/generate_204",
+            timeout_ms=timeout_ms,
+        )
+        if not delay_res.get("ok"):
+            err_low = str(delay_res.get("error") or "").lower()
+            if not any(m in err_low for m in ("not found", "no such host", "connection refused")):
+                delay_res = await clash_client.measure_node_delay(
+                    clash_tag,
+                    url="https://cp.cloudflare.com/generate_204",
+                    timeout_ms=timeout_ms,
+                )
+        if delay_res.get("ok") and delay_res.get("delay_ms") is not None:
+            return True, round(float(delay_res["delay_ms"]), 1), "ok"
+        return False, None, str(delay_res.get("error") or "timeout")
+
     async def probe_vpn_nodes(
         self,
         nodes: list[dict[str, Any]],
@@ -1188,6 +1311,19 @@ class VpnLayerOrchestrator:
             return []
 
         health_map = storage.get_vpn_node_health_map() if storage is not None else {}
+        policy = (
+            storage.get_vpn_selection_policy()
+            if storage is not None
+            else {
+                "mode": (
+                    "priority"
+                    if any(int(n.get("priority") if n.get("priority") is not None else 100) != 100 for n in nodes)
+                    else "auto"
+                ),
+                "priority_node": "",
+            }
+        )
+        proxies: dict[str, Any] = {}
         clash_available = False
         if clash_client is not None:
             proxies = await clash_client.get_proxies()
@@ -1197,14 +1333,49 @@ class VpnLayerOrchestrator:
 
         async def _probe_one(node: dict[str, Any]) -> dict[str, Any]:
             async with sem:
-                tag = str(node.get("tag") or "")
+                raw_tag = str(node.get("tag") or "")
+                clean_tag = raw_tag.strip()
                 server = str(node.get("server") or "").strip()
                 port = int(node.get("server_port") or 443)
                 proto = str(node.get("protocol") or "").lower()
-                is_udp_proto = proto in ("wireguard", "amneziawg", "hysteria2", "tuic")
+                is_udp_proto = proto in ("wireguard", "amneziawg", "hysteria", "hysteria2", "tuic")
+                try:
+                    prio = int(node.get("priority") if node.get("priority") is not None else 100)
+                except (TypeError, ValueError):
+                    prio = 100
+                enabled = bool(node.get("enabled", True))
+                builtin_auto = is_auto_select_node(node)
 
                 enriched = dict(node)
-                prev_health = health_map.get(tag) or {}
+                enriched["priority"] = prio
+                enriched["enabled"] = enabled
+                enriched["is_builtin_auto"] = builtin_auto
+
+                if is_placeholder_node(node):
+                    enriched.update(
+                        alive=False,
+                        ping_ms=None,
+                        probe_result="placeholder",
+                        cb_state="closed",
+                        protocol_ok=True,
+                        tunnel_verified=False,
+                        is_placeholder=True,
+                    )
+                    return enriched
+
+                enriched["is_placeholder"] = False
+                if not enabled:
+                    enriched.update(
+                        alive=False,
+                        ping_ms=None,
+                        probe_result="disabled",
+                        cb_state="closed",
+                        protocol_ok=True,
+                        tunnel_verified=False,
+                    )
+                    return enriched
+
+                prev_health = health_map.get(raw_tag) or health_map.get(clean_tag) or {}
                 prev_cb = str(prev_health.get("cb_state") or "closed")
                 if prev_cb == "open" and self._is_quarantine_expired(str(prev_health.get("quarantined_until") or "")):
                     prev_cb = "half_open"
@@ -1216,56 +1387,52 @@ class VpnLayerOrchestrator:
                         probe_result="invalid",
                         cb_state=prev_cb,
                         protocol_ok=False,
+                        tunnel_verified=False,
                     )
                     return enriched
 
-                tcp_res = None if is_udp_proto and clash_available else await probe_tcp(server, port=port, timeout=timeout)
-                tcp_ok = tcp_res.result == "ok" if tcp_res is not None else False
-                tcp_rtt = round(tcp_res.rtt_ms, 1) if (tcp_res is not None and tcp_res.rtt_ms is not None) else None
-
-                if clash_available and tag:
-                    delay_res = await clash_client.measure_node_delay(  # type: ignore[union-attr]
-                        tag,
-                        url="https://www.gstatic.com/generate_204",
-                        timeout_ms=int(max(timeout, 2.0) * 1000),
-                    )
-                    if not delay_res.get("ok"):
-                        delay_res = await clash_client.measure_node_delay(  # type: ignore[union-attr]
-                            tag,
-                            url="https://cp.cloudflare.com/generate_204",
-                            timeout_ms=int(max(timeout, 2.0) * 1000),
-                        )
-
-                    if delay_res.get("ok") and delay_res.get("delay_ms") is not None:
-                        tunnel_rtt = round(float(delay_res["delay_ms"]), 1)
+                clash_tag = raw_tag if raw_tag in proxies else (clean_tag if clean_tag in proxies else None)
+                if clash_available and clash_tag:
+                    ok, tunnel_rtt, err_msg = await self._measure_clash_node_delay(clash_client, clash_tag, timeout)  # type: ignore[arg-type]
+                    if ok:
                         enriched["alive"] = True
                         enriched["ping_ms"] = tunnel_rtt
                         enriched["probe_result"] = "ok"
                         enriched["protocol_ok"] = True
                         enriched["tunnel_verified"] = True
                     else:
+                        tcp_ok = False
+                        if not is_udp_proto:
+                            tcp_res = await probe_tcp(server, port=port, timeout=min(timeout, 1.0))
+                            tcp_ok = tcp_res.result == "ok"
                         enriched["alive"] = False
                         enriched["ping_ms"] = None
-                        enriched["probe_result"] = "protocol_block" if tcp_ok else str(delay_res.get("error") or "timeout")
+                        enriched["probe_result"] = "protocol_block" if tcp_ok else err_msg
                         enriched["protocol_ok"] = False if tcp_ok else bool(prev_health.get("protocol_ok", 1))
                         enriched["tunnel_verified"] = True
                 else:
+                    tcp_res = await probe_tcp(server, port=port, timeout=timeout)
+                    tcp_ok = tcp_res.result == "ok"
+                    tcp_rtt = round(tcp_res.rtt_ms, 1) if tcp_res.rtt_ms is not None else None
                     enriched["alive"] = tcp_ok
                     enriched["ping_ms"] = tcp_rtt
-                    enriched["probe_result"] = tcp_res.result if tcp_res is not None else "unknown"
+                    enriched["probe_result"] = tcp_res.result
                     enriched["protocol_ok"] = True if tcp_ok else bool(prev_health.get("protocol_ok", 1))
                     enriched["tunnel_verified"] = False
 
-                if storage is not None and tag:
+                db_tag = clean_tag or raw_tag
+                if storage is not None and db_tag:
                     if prev_cb == "half_open":
                         storage.conn.execute(
                             "UPDATE vpn_node_health SET cb_state = 'half_open' WHERE node_tag = ?",
-                            (tag,),
+                            (db_tag,),
                         )
                         storage.conn.commit()
+                    node_for_db = dict(enriched)
+                    node_for_db["tag"] = db_tag
                     rec = self.record_node_result(
                         storage,
-                        enriched,
+                        node_for_db,
                         ok=bool(enriched["alive"]),
                         rtt_ms=enriched["ping_ms"],
                         protocol_ok=bool(enriched["protocol_ok"]),
@@ -1280,15 +1447,30 @@ class VpnLayerOrchestrator:
                 return enriched
 
         probed = await asyncio.gather(*(_probe_one(n) for n in nodes))
-        probed.sort(
-            key=lambda n: (
+        sel_mode = str(policy.get("mode") or "auto")
+        pref_node = str(policy.get("priority_node") or "").strip()
+
+        def _probed_sort_key(n: dict[str, Any]) -> tuple[Any, ...]:
+            tag = str(n.get("tag") or "").strip()
+            ping = n["ping_ms"] if n.get("ping_ms") is not None else 99999.0
+            prio = int(n.get("priority") if n.get("priority") is not None else 100)
+            base = (
+                1 if n.get("is_placeholder") else 0,
+                0 if n.get("enabled", True) else 1,
                 1 if n.get("cb_state") == "open" else 0,
                 0 if n.get("alive") else 1,
-                n["ping_ms"] if n.get("ping_ms") is not None else 99999.0,
-                int(n.get("priority") or 100),
-                str(n.get("tag") or ""),
             )
-        )
+            if sel_mode == "priority":
+                return (
+                    *base,
+                    0 if (pref_node and tag == pref_node) else 1,
+                    prio,
+                    ping,
+                    tag,
+                )
+            return (*base, ping, prio, tag)
+
+        probed.sort(key=_probed_sort_key)
         return probed
 
     def rotate_vpn_node(
@@ -1300,69 +1482,472 @@ class VpnLayerOrchestrator:
         target_tag: str | None = None,
         selector_tag: str = "vpn-select",
     ) -> dict[str, Any]:
-        """Rotate to an explicit or next healthy/different-transport VPN node via Clash API without TUN restart."""
+        """Rotate to an explicit, auto-pool, or next healthy/priority VPN node via Clash API without TUN restart."""
         if not nodes:
             return {"ok": False, "error": "Нет настроенных VPN-узлов", "selected": None}
 
+        policy = storage.get_vpn_selection_policy()
         health_map = storage.get_vpn_node_health_map()
-        prev_tag = self._active_node_tag
+        prev_selector_now: str | None = self._active_node_tag
+        prev_leaf_tag: str | None = self._active_node_tag
         if clash_client is not None:
             proxies = clash_client.get_proxies_sync()
-            sel_info = proxies.get(selector_tag) if isinstance(proxies, dict) else None
-            if isinstance(sel_info, dict) and sel_info.get("now"):
-                prev_tag = str(sel_info["now"])
+            sel_now, leaf_now, _ = ClashApiClient.resolve_active_proxy(proxies, selector_tag)
+            if sel_now:
+                prev_selector_now = sel_now
+            if leaf_now:
+                prev_leaf_tag = leaf_now
 
-        prev_node = next((n for n in nodes if str(n.get("tag")) == prev_tag), None)
-        prev_health = health_map.get(prev_tag or "") or {}
+        prev_node = next(
+            (n for n in nodes if str(n.get("tag") or "").strip() == (prev_leaf_tag or "")),
+            None,
+        )
+        prev_health = health_map.get(prev_leaf_tag or "") or {}
         prev_transport = str((prev_node or {}).get("transport") or (prev_node or {}).get("protocol") or "")
         had_proto_block = prev_health.get("protocol_ok") == 0
 
         if target_tag:
-            chosen = next((n for n in nodes if str(n.get("tag")) == target_tag), None)
+            clean_target = target_tag.strip()
+            if clean_target == "vpn-auto" or clean_target.startswith("ut-"):
+                switched_live = False
+                closed_sockets = 0
+                if clash_client is not None:
+                    switched_live = clash_client.select_outbound_sync(selector_tag, clean_target)
+                    if prev_leaf_tag and prev_leaf_tag != clean_target and prev_leaf_tag not in ("vpn-auto", "direct"):
+                        closed_sockets = clash_client.close_connections_by_node_sync(prev_leaf_tag)
+                self._active_node_tag = clean_target
+                self._last_switch_ts = time.monotonic()
+                return {
+                    "ok": True,
+                    "previous": prev_leaf_tag or prev_selector_now,
+                    "selected": clean_target,
+                    "selector": selector_tag,
+                    "switched_live": switched_live,
+                    "closed_connections": closed_sockets,
+                    "transport": "auto",
+                    "region": "auto",
+                }
+            chosen = next((n for n in nodes if str(n.get("tag") or "").strip() == clean_target), None)
             if chosen is None:
-                return {"ok": False, "error": f"Узел {target_tag} не найден", "selected": None}
+                return {"ok": False, "error": f"Узел {clean_target} не найден", "selected": None}
+            if is_placeholder_node(chosen):
+                return {
+                    "ok": False,
+                    "error": f"Узел «{clean_target}» — служебный заголовок подписки, а не VPN-сервер",
+                    "selected": None,
+                }
         else:
-            candidates = []
-            for n in nodes:
-                tag = str(n.get("tag") or "")
-                if not tag or tag == prev_tag:
-                    continue
-                h = health_map.get(tag) or {}
-                if str(h.get("cb_state") or "closed") == "open" and not self._is_quarantine_expired(
-                    str(h.get("quarantined_until") or "")
-                ):
-                    continue
-                transport = str(n.get("transport") or n.get("protocol") or "")
-                diff_transport_penalty = 0 if (not had_proto_block or transport != prev_transport) else 1
-                rtt_score = h.get("ewma_rtt_ms") if h.get("ewma_rtt_ms") is not None else 5000.0
-                candidates.append((diff_transport_penalty, int(n.get("priority") or 100), float(rtt_score), n))
-            candidates.sort(key=lambda item: (item[0], item[1], item[2], str(item[3].get("tag") or "")))
-            if not candidates:
-                # Fallback if all remaining nodes were quarantined or single-node pool
-                fallback = [n for n in nodes if str(n.get("tag")) != prev_tag] or nodes
-                chosen = fallback[0]
-            else:
-                chosen = candidates[0][3]
+            ranked = self.rank_candidates(
+                nodes,
+                health_map,
+                mode=policy["mode"],
+                preferred_tag=policy["priority_node"],
+                exclude_tag=prev_leaf_tag,
+                prev_transport=prev_transport,
+                had_proto_block=had_proto_block,
+                allow_quarantined=False,
+            )
+            if not ranked:
+                ranked = self.rank_candidates(
+                    nodes,
+                    health_map,
+                    mode=policy["mode"],
+                    preferred_tag=policy["priority_node"],
+                    exclude_tag=prev_leaf_tag,
+                    prev_transport=prev_transport,
+                    had_proto_block=had_proto_block,
+                    allow_quarantined=True,
+                )
+            if not ranked:
+                ranked = self.rank_candidates(
+                    nodes,
+                    health_map,
+                    mode=policy["mode"],
+                    preferred_tag=policy["priority_node"],
+                    exclude_tag=None,
+                    allow_quarantined=True,
+                )
+            if not ranked:
+                return {
+                    "ok": False,
+                    "error": "Нет доступных реальных VPN-узлов (в подписке только служебные записи)",
+                    "selected": None,
+                }
+            chosen = ranked[0]
 
-        chosen_tag = str(chosen.get("tag") or "")
+        chosen_tag = str(chosen.get("tag") or "").strip()
         switched_live = False
         closed_sockets = 0
         if clash_client is not None:
             switched_live = clash_client.select_outbound_sync(selector_tag, chosen_tag)
-            if prev_tag and prev_tag != chosen_tag:
-                closed_sockets = clash_client.close_connections_by_node_sync(prev_tag)
+            if prev_leaf_tag and prev_leaf_tag != chosen_tag and prev_leaf_tag not in ("vpn-auto", "direct"):
+                closed_sockets = clash_client.close_connections_by_node_sync(prev_leaf_tag)
 
         self._active_node_tag = chosen_tag
         self._last_switch_ts = time.monotonic()
         return {
             "ok": True,
-            "previous": prev_tag,
+            "previous": prev_leaf_tag or prev_selector_now,
             "selected": chosen_tag,
             "selector": selector_tag,
             "switched_live": switched_live,
             "closed_connections": closed_sockets,
             "transport": chosen.get("transport"),
             "region": chosen.get("region"),
+        }
+
+    async def reconcile_active_node(
+        self,
+        storage: Storage,
+        nodes: list[dict[str, Any]],
+        *,
+        clash_client: ClashApiClient,
+        selector_tag: str = "vpn-select",
+        timeout: float = 1.8,
+        force: bool = False,
+        failback_cooldown_sec: float = 60.0,
+    ) -> dict[str, Any]:
+        """Automatically verify active VPN node health via Clash API and perform failover or priority failback."""
+        proxies = await clash_client.get_proxies()
+        if not proxies:
+            return {"ok": False, "action": "clash_unavailable", "selected": None, "probed": []}
+
+        real_nodes = [n for n in nodes if n.get("enabled", True) and not is_placeholder_node(n)]
+        if not real_nodes:
+            return {"ok": True, "action": "no_nodes", "selected": None, "probed": []}
+
+        policy = storage.get_vpn_selection_policy()
+        health_map = storage.get_vpn_node_health_map()
+        sel_now, active_leaf, _ = ClashApiClient.resolve_active_proxy(proxies, selector_tag)
+
+        priority_node = str(policy.get("priority_node") or "").strip()
+        has_custom_prio = bool(priority_node) or any(
+            int(n.get("priority") if n.get("priority") is not None else 100) < 100 for n in real_nodes
+        )
+        effective_mode = "priority" if (policy.get("mode") == "priority" and has_custom_prio) else "auto"
+
+        sem = asyncio.Semaphore(10)
+        probed_results: dict[str, dict[str, Any]] = {}
+
+        async def _probe_via_clash(node: dict[str, Any]) -> dict[str, Any]:
+            tag = str(node.get("tag") or "").strip()
+            if tag in probed_results:
+                return probed_results[tag]
+            async with sem:
+                if tag in probed_results:
+                    return probed_results[tag]
+                if not tag or tag not in proxies:
+                    res = {
+                        "tag": tag,
+                        "alive": False,
+                        "ping_ms": None,
+                        "probe_result": "not_in_clash",
+                        "protocol_ok": True,
+                        "cb_state": "closed",
+                        "consecutive_fails": 0,
+                        "ewma_rtt_ms": None,
+                        "tunnel_verified": True,
+                        "node": node,
+                    }
+                    if tag:
+                        probed_results[tag] = res
+                    return res
+
+                prev_h = health_map.get(tag) or {}
+                prev_cb = str(prev_h.get("cb_state") or "closed")
+                if prev_cb == "open" and self._is_quarantine_expired(str(prev_h.get("quarantined_until") or "")):
+                    storage.conn.execute(
+                        "UPDATE vpn_node_health SET cb_state = 'half_open' WHERE node_tag = ?",
+                        (tag,),
+                    )
+                    storage.conn.commit()
+
+                ok, rtt, err = await self._measure_clash_node_delay(clash_client, tag, timeout)
+                proto_ok = True
+                probe_err = err
+                if not ok:
+                    proto = str(node.get("protocol") or "").lower()
+                    is_udp = proto in ("wireguard", "amneziawg", "hysteria", "hysteria2", "tuic")
+                    srv = str(node.get("server") or "").strip()
+                    port = int(node.get("server_port") or 443)
+                    if not is_udp and srv:
+                        tcp_res = await probe_tcp(srv, port=port, timeout=min(timeout, 1.0))
+                        if tcp_res.result == "ok":
+                            proto_ok = False
+                            probe_err = "protocol_block"
+                        else:
+                            proto_ok = bool(prev_h.get("protocol_ok", 1))
+                    else:
+                        proto_ok = bool(prev_h.get("protocol_ok", 1))
+
+                node_for_db = dict(node)
+                node_for_db["tag"] = tag
+                rec = self.record_node_result(
+                    storage,
+                    node_for_db,
+                    ok=ok,
+                    rtt_ms=rtt,
+                    protocol_ok=proto_ok,
+                    error=probe_err,
+                )
+                res = {
+                    "tag": tag,
+                    "alive": ok,
+                    "ping_ms": rtt,
+                    "probe_result": probe_err,
+                    "protocol_ok": proto_ok,
+                    "cb_state": rec["cb_state"],
+                    "consecutive_fails": rec["consecutive_fails"],
+                    "ewma_rtt_ms": rec["ewma_rtt_ms"],
+                    "tunnel_verified": True,
+                    "node": node,
+                }
+                probed_results[tag] = res
+                return res
+
+        async def _probe_eligible_pool() -> None:
+            eligible: list[dict[str, Any]] = []
+            all_in_clash: list[dict[str, Any]] = []
+            for n in real_nodes:
+                t = str(n.get("tag") or "").strip()
+                if not t or t not in proxies or t in probed_results:
+                    continue
+                all_in_clash.append(n)
+                h = health_map.get(t) or {}
+                cb = str(h.get("cb_state") or "closed")
+                is_quar = cb == "open" and not self._is_quarantine_expired(str(h.get("quarantined_until") or ""))
+                if not is_quar or force:
+                    eligible.append(n)
+            targets = eligible or all_in_clash
+            if targets:
+                await asyncio.gather(*(_probe_via_clash(n) for n in targets))
+
+        def _is_quarantined_tag(t: str) -> bool:
+            h = health_map.get(t) or {}
+            return str(h.get("cb_state") or "closed") == "open" and not self._is_quarantine_expired(
+                str(h.get("quarantined_until") or "")
+            )
+
+        if effective_mode == "priority":
+            def _prio_sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int, int]:
+                idx, n = item
+                t = str(n.get("tag") or "").strip()
+                try:
+                    pr = int(n.get("priority") if n.get("priority") is not None else 100)
+                except (TypeError, ValueError):
+                    pr = 100
+                raw_reg = str(n.get("region") or "").strip().lower()
+                reg = (
+                    raw_reg
+                    if raw_reg and raw_reg != "other"
+                    else infer_node_region(str(n.get("display_name") or t), str(n.get("server") or ""))
+                )
+                is_ru = 1 if reg == "ru" else 0
+                return (0 if (priority_node and t == priority_node) else 1, pr, is_ru if pr >= 100 else 0, idx)
+
+            ordered = [n for _idx, n in sorted(enumerate(real_nodes), key=_prio_sort_key)]
+            ordered_tags = [str(n.get("tag") or "").strip() for n in ordered]
+            node_by_tag = {str(n.get("tag") or "").strip(): n for n in ordered if str(n.get("tag") or "").strip()}
+
+            active_alive = False
+            if active_leaf and active_leaf in node_by_tag and active_leaf in proxies:
+                active_probe = await _probe_via_clash(node_by_tag[active_leaf])
+                active_alive = bool(active_probe.get("alive"))
+
+            if active_alive and ordered_tags and active_leaf == ordered_tags[0]:
+                if sel_now != active_leaf:
+                    await clash_client.select_outbound(selector_tag, active_leaf)
+                self._active_node_tag = active_leaf
+                return {
+                    "ok": True,
+                    "action": "keep_priority",
+                    "selector": active_leaf,
+                    "selected": active_leaf,
+                    "previous": active_leaf,
+                    "probed": list(probed_results.values()),
+                }
+
+            if active_alive and active_leaf in ordered_tags:
+                active_rank = ordered_tags.index(active_leaf)
+                higher_candidates = [
+                    n
+                    for n in ordered[:active_rank]
+                    if str(n.get("tag") or "").strip() in proxies
+                    and (force or not _is_quarantined_tag(str(n.get("tag") or "").strip()))
+                ]
+                if higher_candidates:
+                    await asyncio.gather(*(_probe_via_clash(n) for n in higher_candidates))
+                    top_alive = next(
+                        (
+                            n
+                            for n in ordered[:active_rank]
+                            if probed_results.get(str(n.get("tag") or "").strip(), {}).get("alive")
+                        ),
+                        None,
+                    )
+                    cooldown_ok = (
+                        force
+                        or self._last_switch_ts <= 0
+                        or (time.monotonic() - self._last_switch_ts) >= failback_cooldown_sec
+                        or sel_now in ("vpn-auto", "direct")
+                    )
+                    if top_alive is not None and cooldown_ok:
+                        win_tag = str(top_alive.get("tag") or "").strip()
+                        switched = await clash_client.select_outbound(selector_tag, win_tag)
+                        self._active_node_tag = win_tag
+                        self._last_switch_ts = time.monotonic()
+                        return {
+                            "ok": True,
+                            "action": "failback_priority",
+                            "selector": win_tag,
+                            "selected": win_tag,
+                            "previous": active_leaf or sel_now,
+                            "switched_live": switched,
+                            "closed_connections": 0,
+                            "probed": list(probed_results.values()),
+                        }
+                self._active_node_tag = active_leaf
+                return {
+                    "ok": True,
+                    "action": "keep_fallback",
+                    "selector": sel_now,
+                    "selected": active_leaf,
+                    "previous": active_leaf,
+                    "probed": list(probed_results.values()),
+                }
+
+            await _probe_eligible_pool()
+            fresh_health = storage.get_vpn_node_health_map()
+            alive_nodes = [p["node"] for p in probed_results.values() if p.get("alive")]
+            ranked = self.rank_candidates(
+                alive_nodes,
+                fresh_health,
+                mode="priority",
+                preferred_tag=priority_node,
+                probed_map=probed_results,
+            )
+            if ranked:
+                winner_tag = str(ranked[0].get("tag") or "").strip()
+                switched = await clash_client.select_outbound(selector_tag, winner_tag)
+                closed = 0
+                if active_leaf and active_leaf != winner_tag and active_leaf not in ("vpn-auto", "direct"):
+                    closed = await clash_client.close_connections_by_node(active_leaf)
+                self._active_node_tag = winner_tag
+                self._last_switch_ts = time.monotonic()
+                return {
+                    "ok": True,
+                    "action": "failover_priority",
+                    "selector": winner_tag,
+                    "selected": winner_tag,
+                    "previous": active_leaf or sel_now,
+                    "switched_live": switched,
+                    "closed_connections": closed,
+                    "probed": list(probed_results.values()),
+                }
+
+            if sel_now != "vpn-auto" and "vpn-auto" in proxies:
+                await clash_client.select_outbound(selector_tag, "vpn-auto")
+            return {
+                "ok": False,
+                "action": "all_unavailable",
+                "selector": "vpn-auto" if "vpn-auto" in proxies else sel_now,
+                "selected": None,
+                "previous": active_leaf or sel_now,
+                "probed": list(probed_results.values()),
+            }
+
+        # Auto mode
+        node_by_tag = {str(n.get("tag") or "").strip(): n for n in real_nodes if str(n.get("tag") or "").strip()}
+        auto_info = proxies.get("vpn-auto") if isinstance(proxies.get("vpn-auto"), dict) else None
+        auto_leaf = str(auto_info["now"]).strip() if (auto_info and auto_info.get("now")) else None
+
+        active_alive = False
+        if active_leaf and active_leaf in node_by_tag and active_leaf in proxies:
+            active_probe = await _probe_via_clash(node_by_tag[active_leaf])
+            active_alive = bool(active_probe.get("alive"))
+            if sel_now == "vpn-auto" and active_alive:
+                self._active_node_tag = active_leaf
+                return {
+                    "ok": True,
+                    "action": "keep_auto",
+                    "selector": "vpn-auto",
+                    "selected": active_leaf,
+                    "previous": active_leaf,
+                    "probed": list(probed_results.values()),
+                }
+
+        if sel_now != "vpn-auto":
+            cooldown_ok = (
+                not active_alive
+                or force
+                or self._last_switch_ts <= 0
+                or (time.monotonic() - self._last_switch_ts) >= failback_cooldown_sec
+            )
+            if auto_leaf and auto_leaf in node_by_tag and auto_leaf in proxies and cooldown_ok:
+                auto_probe = await _probe_via_clash(node_by_tag[auto_leaf])
+                if auto_probe.get("alive"):
+                    switched = await clash_client.select_outbound(selector_tag, "vpn-auto")
+                    closed = 0
+                    if not active_alive and active_leaf and active_leaf != auto_leaf and active_leaf not in ("vpn-auto", "direct"):
+                        closed = await clash_client.close_connections_by_node(active_leaf)
+                    self._active_node_tag = auto_leaf
+                    self._last_switch_ts = time.monotonic()
+                    return {
+                        "ok": True,
+                        "action": "return_to_auto",
+                        "selector": "vpn-auto",
+                        "selected": auto_leaf,
+                        "previous": active_leaf or sel_now,
+                        "switched_live": switched,
+                        "closed_connections": closed,
+                        "probed": list(probed_results.values()),
+                    }
+            if active_alive:
+                self._active_node_tag = active_leaf
+                return {
+                    "ok": True,
+                    "action": "keep_failover",
+                    "selector": sel_now,
+                    "selected": active_leaf,
+                    "previous": active_leaf,
+                    "probed": list(probed_results.values()),
+                }
+
+        await _probe_eligible_pool()
+        fresh_health = storage.get_vpn_node_health_map()
+        alive_nodes = [p["node"] for p in probed_results.values() if p.get("alive")]
+        ranked = self.rank_candidates(
+            alive_nodes,
+            fresh_health,
+            mode="auto",
+            probed_map=probed_results,
+        )
+        if ranked:
+            winner_tag = str(ranked[0].get("tag") or "").strip()
+            switched = await clash_client.select_outbound(selector_tag, winner_tag)
+            closed = 0
+            if active_leaf and active_leaf != winner_tag and active_leaf not in ("vpn-auto", "direct"):
+                closed = await clash_client.close_connections_by_node(active_leaf)
+            self._active_node_tag = winner_tag
+            self._last_switch_ts = time.monotonic()
+            return {
+                "ok": True,
+                "action": "failover",
+                "selector": winner_tag,
+                "selected": winner_tag,
+                "previous": active_leaf or sel_now,
+                "switched_live": switched,
+                "closed_connections": closed,
+                "probed": list(probed_results.values()),
+            }
+
+        return {
+            "ok": False,
+            "action": "all_unavailable",
+            "selector": sel_now,
+            "selected": None,
+            "previous": active_leaf or sel_now,
+            "probed": list(probed_results.values()),
         }
 
     async def check_tg_proxy(
@@ -1420,32 +2005,45 @@ class VpnLayerOrchestrator:
         nodes: list[dict[str, Any]],
         processes: dict[str, Any] | None = None,
         clash_client: ClashApiClient | None = None,
+        storage: Storage | None = None,
     ) -> dict[str, Any]:
         """Summarize Layer 4 sing-box/VPN and tg-ws-proxy state synchronously."""
         vpn_domains = sorted({d.domain for d in decisions if d.layer == "vpn"})
         sb_running = bool(((processes or {}).get("sing-box") or {}).get("running"))
         tg_running = bool(((processes or {}).get("tg-ws-proxy") or {}).get("running"))
-        best_node = self._active_node_tag or (nodes[0].get("tag") if nodes else None)
+        real_nodes = [n for n in nodes if not is_placeholder_node(n)]
+        placeholder_count = len(nodes) - len(real_nodes)
+        policy = storage.get_vpn_selection_policy() if storage is not None else {"mode": "auto", "priority_node": ""}
+        selector_now: str | None = None
+        best_ping_ms: float | None = None
+        best_node = (
+            self._active_node_tag
+            or (str(real_nodes[0].get("tag")) if real_nodes else (str(nodes[0].get("tag")) if nodes else None))
+        )
         if sb_running and clash_client is not None:
             proxies = clash_client.get_proxies_sync()
-            sel = proxies.get("vpn-select") if isinstance(proxies, dict) else None
-            if isinstance(sel, dict) and sel.get("now"):
-                now_tag = str(sel["now"])
-                if now_tag.startswith("ut-") and isinstance(proxies.get(now_tag), dict) and proxies[now_tag].get("now"):
-                    now_tag = str(proxies[now_tag]["now"])
-                elif now_tag == "vpn-auto" and isinstance(proxies.get("vpn-auto"), dict) and proxies["vpn-auto"].get("now"):
-                    now_tag = str(proxies["vpn-auto"]["now"])
-                best_node = now_tag
-                self._active_node_tag = now_tag
+            sel_now, leaf_now, hist_delay = ClashApiClient.resolve_active_proxy(proxies, "vpn-select")
+            if sel_now:
+                selector_now = sel_now
+            if leaf_now:
+                best_node = leaf_now
+                self._active_node_tag = leaf_now
+            if hist_delay is not None:
+                best_ping_ms = hist_delay
         return {
             "layer": "vpn",
             "status": "running" if sb_running else ("ready" if nodes else "empty"),
             "running": sb_running,
             "tg_proxy_running": tg_running,
             "total_count": len(nodes),
+            "real_count": len(real_nodes),
+            "placeholder_count": placeholder_count,
             "alive_count": None,
             "best_node": best_node,
-            "best_ping_ms": None,
+            "best_ping_ms": best_ping_ms,
+            "selector_now": selector_now,
+            "selection_mode": policy["mode"],
+            "priority_node": policy["priority_node"],
             "vpn_domains_count": len(vpn_domains),
         }
 
@@ -2028,6 +2626,8 @@ class RealtimeConnectionMonitor:
         dpi_orch = DpiLayerOrchestrator()
         any_saved = False
         dpi_or_vpn_changed = False
+        winws2_changed = False
+        singbox_changed = False
 
         # Load DB state and filter pinned domains BEFORE awaiting network probes concurrently
         storage = Storage(backend.db_path)
@@ -2146,6 +2746,14 @@ class RealtimeConnectionMonitor:
                 any_saved = True
                 if new_dec.layer in ("dpi", "vpn", "dns"):
                     dpi_or_vpn_changed = True
+                if new_dec.layer == "dpi" or (
+                    existing is not None and existing.layer == "dpi" and new_dec.layer != "dpi"
+                ):
+                    winws2_changed = True
+                if new_dec.layer in ("vpn", "dns") or (
+                    existing is not None and existing.layer in ("vpn", "dns") and new_dec.layer != existing.layer
+                ):
+                    singbox_changed = True
                 with self._lock:
                     self.auto_healed_count += 1
                 self.record_event(dom, proc_name, action, new_dec.layer, new_dec.strategy_id)
@@ -2164,15 +2772,22 @@ class RealtimeConnectionMonitor:
         if any_saved:
             self.invalidate_scan_cache()
 
-        if any_saved and dpi_or_vpn_changed:
+        if any_saved and (dpi_or_vpn_changed or winws2_changed or singbox_changed):
             procs = backend._collect_processes_state()
-            if ((procs.get("winws2") or {}).get("running")) and _is_admin():
+            is_adm = _is_admin()
+            if ((procs.get("winws2") or {}).get("running")) and is_adm:
                 if hasattr(backend, "reload_winws2_if_changed"):
                     backend.reload_winws2_if_changed(min_interval_sec=20.0)
                 else:
                     backend.reload_winws2()
             else:
                 backend.trigger_apply_configs()
+
+            if singbox_changed and ((procs.get("sing-box") or {}).get("running")) and is_adm:
+                if hasattr(backend, "reload_singbox_if_changed"):
+                    backend.reload_singbox_if_changed(min_interval_sec=15.0)
+                else:
+                    backend.reload_singbox()
 
         if any_saved:
             # Re-scan after healing so returned connections reflect new strategies
@@ -2225,7 +2840,13 @@ class MasterRoutingOrchestrator:
         active_dns = self.dns.get_active_dns(storage)
         dns_summary = self.dns.inspect_status(decisions, verdict_rows, active_dns=active_dns)
         dpi_summary = self.dpi.inspect_status(decisions, logs_dir / "winws2.log", processes=processes)
-        vpn_summary = self.vpn.inspect_status(decisions, nodes, processes=processes, clash_client=clash_client)
+        vpn_summary = self.vpn.inspect_status(
+            decisions,
+            nodes,
+            processes=processes,
+            clash_client=clash_client,
+            storage=storage,
+        )
 
         if probe_live:
             dns_live, vpn_live = await asyncio.gather(
