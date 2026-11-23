@@ -1111,6 +1111,7 @@ class VpnLayerOrchestrator:
     def __init__(self) -> None:
         self._active_node_tag: str | None = None
         self._last_switch_ts: float = 0.0
+        self._pending_optimal_node: str | None = None
 
     @staticmethod
     def _is_quarantine_expired(quarantined_until: str, now_dt: datetime | None = None) -> bool:
@@ -1841,26 +1842,18 @@ class VpnLayerOrchestrator:
                 if sel_now != active_leaf:
                     await clash_client.select_outbound(selector_tag, active_leaf)
                 self._active_node_tag = active_leaf
+                self._pending_optimal_node = None
                 return {
                     "ok": True,
                     "action": "keep_priority",
                     "selector": active_leaf,
                     "selected": active_leaf,
                     "previous": active_leaf,
+                    "pending_node": None,
                     "probed": list(probed_results.values()),
                 }
 
             if active_alive and active_leaf in ordered_tags:
-                if not force and active_has_live_traffic:
-                    self._active_node_tag = active_leaf
-                    return {
-                        "ok": True,
-                        "action": "keep_active_session",
-                        "selector": sel_now,
-                        "selected": active_leaf,
-                        "previous": active_leaf,
-                        "probed": list(probed_results.values()),
-                    }
                 active_rank = ordered_tags.index(active_leaf)
                 higher_candidates = [
                     n
@@ -1868,6 +1861,7 @@ class VpnLayerOrchestrator:
                     if str(n.get("tag") or "").strip() in proxies
                     and (force or not _is_quarantined_tag(str(n.get("tag") or "").strip()))
                 ]
+                top_alive: dict[str, Any] | None = None
                 if higher_candidates:
                     await asyncio.gather(*(_probe_via_clash(n) for n in higher_candidates))
                     top_alive = next(
@@ -1878,34 +1872,52 @@ class VpnLayerOrchestrator:
                         ),
                         None,
                     )
+                top_tag = str(top_alive.get("tag") or "").strip() if top_alive is not None else None
+                if not force and active_has_live_traffic:
+                    self._active_node_tag = active_leaf
+                    self._pending_optimal_node = top_tag
+                    return {
+                        "ok": True,
+                        "action": "keep_active_session",
+                        "selector": sel_now,
+                        "selected": active_leaf,
+                        "previous": active_leaf,
+                        "pending_node": self._pending_optimal_node,
+                        "probed": list(probed_results.values()),
+                    }
+                if top_tag:
                     cooldown_ok = (
                         force
+                        or self._pending_optimal_node == top_tag
                         or self._last_switch_ts <= 0
                         or (time.monotonic() - self._last_switch_ts) >= failback_cooldown_sec
                         or sel_now in ("vpn-auto", "direct")
                     )
-                    if top_alive is not None and cooldown_ok:
-                        win_tag = str(top_alive.get("tag") or "").strip()
-                        switched = await clash_client.select_outbound(selector_tag, win_tag)
-                        self._active_node_tag = win_tag
+                    if cooldown_ok:
+                        switched = await clash_client.select_outbound(selector_tag, top_tag)
+                        self._active_node_tag = top_tag
+                        self._pending_optimal_node = None
                         self._last_switch_ts = time.monotonic()
                         return {
                             "ok": True,
                             "action": "failback_priority",
-                            "selector": win_tag,
-                            "selected": win_tag,
+                            "selector": top_tag,
+                            "selected": top_tag,
                             "previous": active_leaf or sel_now,
                             "switched_live": switched,
                             "closed_connections": 0,
+                            "pending_node": None,
                             "probed": list(probed_results.values()),
                         }
                 self._active_node_tag = active_leaf
+                self._pending_optimal_node = top_tag
                 return {
                     "ok": True,
                     "action": "keep_fallback",
                     "selector": sel_now,
                     "selected": active_leaf,
                     "previous": active_leaf,
+                    "pending_node": self._pending_optimal_node,
                     "probed": list(probed_results.values()),
                 }
 
@@ -1926,6 +1938,7 @@ class VpnLayerOrchestrator:
                 if active_leaf and active_leaf != winner_tag and active_leaf not in ("vpn-auto", "direct"):
                     closed = await clash_client.close_connections_by_node(active_leaf)
                 self._active_node_tag = winner_tag
+                self._pending_optimal_node = None
                 self._last_switch_ts = time.monotonic()
                 return {
                     "ok": True,
@@ -1935,17 +1948,20 @@ class VpnLayerOrchestrator:
                     "previous": active_leaf or sel_now,
                     "switched_live": switched,
                     "closed_connections": closed,
+                    "pending_node": None,
                     "probed": list(probed_results.values()),
                 }
 
             if sel_now != "vpn-auto" and "vpn-auto" in proxies:
                 await clash_client.select_outbound(selector_tag, "vpn-auto")
+            self._pending_optimal_node = None
             return {
                 "ok": False,
                 "action": "all_unavailable",
                 "selector": "vpn-auto" if "vpn-auto" in proxies else sel_now,
                 "selected": None,
                 "previous": active_leaf or sel_now,
+                "pending_node": None,
                 "probed": list(probed_results.values()),
             }
 
@@ -1959,59 +1975,70 @@ class VpnLayerOrchestrator:
             active_alive = await _check_active_node_alive(node_by_tag[active_leaf], active_leaf)
             if sel_now == "vpn-auto" and active_alive:
                 self._active_node_tag = active_leaf
+                self._pending_optimal_node = None
                 return {
                     "ok": True,
                     "action": "keep_auto",
                     "selector": "vpn-auto",
                     "selected": active_leaf,
                     "previous": active_leaf,
+                    "pending_node": None,
                     "probed": list(probed_results.values()),
                 }
 
         if sel_now != "vpn-auto":
+            auto_alive = False
+            if auto_leaf and auto_leaf in node_by_tag and auto_leaf in proxies:
+                auto_probe = await _probe_via_clash(node_by_tag[auto_leaf])
+                auto_alive = bool(auto_probe.get("alive"))
             if active_alive and not force and active_has_live_traffic:
                 self._active_node_tag = active_leaf
+                self._pending_optimal_node = "vpn-auto" if auto_alive else None
                 return {
                     "ok": True,
                     "action": "keep_active_session",
                     "selector": sel_now,
                     "selected": active_leaf,
                     "previous": active_leaf,
+                    "pending_node": self._pending_optimal_node,
                     "probed": list(probed_results.values()),
                 }
             cooldown_ok = (
                 not active_alive
                 or force
+                or self._pending_optimal_node == "vpn-auto"
                 or self._last_switch_ts <= 0
                 or (time.monotonic() - self._last_switch_ts) >= failback_cooldown_sec
             )
-            if auto_leaf and auto_leaf in node_by_tag and auto_leaf in proxies and cooldown_ok:
-                auto_probe = await _probe_via_clash(node_by_tag[auto_leaf])
-                if auto_probe.get("alive"):
-                    switched = await clash_client.select_outbound(selector_tag, "vpn-auto")
-                    closed = 0
-                    if not active_alive and active_leaf and active_leaf != auto_leaf and active_leaf not in ("vpn-auto", "direct"):
-                        closed = await clash_client.close_connections_by_node(active_leaf)
-                    self._active_node_tag = auto_leaf
-                    self._last_switch_ts = time.monotonic()
-                    return {
-                        "ok": True,
-                        "action": "return_to_auto",
-                        "selector": "vpn-auto",
-                        "selected": auto_leaf,
-                        "previous": active_leaf or sel_now,
-                        "switched_live": switched,
-                        "closed_connections": closed,
-                        "probed": list(probed_results.values()),
-                    }
+            if auto_alive and cooldown_ok:
+                switched = await clash_client.select_outbound(selector_tag, "vpn-auto")
+                closed = 0
+                if not active_alive and active_leaf and active_leaf != auto_leaf and active_leaf not in ("vpn-auto", "direct"):
+                    closed = await clash_client.close_connections_by_node(active_leaf)
+                self._active_node_tag = auto_leaf
+                self._pending_optimal_node = None
+                self._last_switch_ts = time.monotonic()
+                return {
+                    "ok": True,
+                    "action": "return_to_auto",
+                    "selector": "vpn-auto",
+                    "selected": auto_leaf,
+                    "previous": active_leaf or sel_now,
+                    "switched_live": switched,
+                    "closed_connections": closed,
+                    "pending_node": None,
+                    "probed": list(probed_results.values()),
+                }
             if active_alive:
                 self._active_node_tag = active_leaf
+                self._pending_optimal_node = "vpn-auto" if auto_alive else None
                 return {
                     "ok": True,
                     "action": "keep_failover",
                     "selector": sel_now,
                     "selected": active_leaf,
                     "previous": active_leaf,
+                    "pending_node": self._pending_optimal_node,
                     "probed": list(probed_results.values()),
                 }
 
@@ -2031,6 +2058,7 @@ class VpnLayerOrchestrator:
             if active_leaf and active_leaf != winner_tag and active_leaf not in ("vpn-auto", "direct"):
                 closed = await clash_client.close_connections_by_node(active_leaf)
             self._active_node_tag = winner_tag
+            self._pending_optimal_node = None
             self._last_switch_ts = time.monotonic()
             return {
                 "ok": True,
@@ -2040,15 +2068,18 @@ class VpnLayerOrchestrator:
                 "previous": active_leaf or sel_now,
                 "switched_live": switched,
                 "closed_connections": closed,
+                "pending_node": None,
                 "probed": list(probed_results.values()),
             }
 
+        self._pending_optimal_node = None
         return {
             "ok": False,
             "action": "all_unavailable",
             "selector": sel_now,
             "selected": None,
             "previous": active_leaf or sel_now,
+            "pending_node": None,
             "probed": list(probed_results.values()),
         }
 
@@ -2770,6 +2801,8 @@ class RealtimeConnectionMonitor:
         dpi_or_vpn_changed = False
         winws2_changed = False
         singbox_changed = False
+        has_new_domain = False
+        bypass_fell = not bypass
 
         # Load DB state and filter pinned domains BEFORE awaiting network probes concurrently
         storage = Storage(backend.db_path)
@@ -2886,16 +2919,27 @@ class RealtimeConnectionMonitor:
                     action = f"Автоподбор ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
 
                 any_saved = True
-                if new_dec.layer in ("dpi", "vpn", "dns"):
-                    dpi_or_vpn_changed = True
-                if new_dec.layer == "dpi" or (
-                    existing is not None and existing.layer == "dpi" and new_dec.layer != "dpi"
-                ):
-                    winws2_changed = True
-                if new_dec.layer in ("vpn", "dns") or (
-                    existing is not None and existing.layer in ("vpn", "dns") and new_dec.layer != existing.layer
-                ):
-                    singbox_changed = True
+                decision_changed = (
+                    existing is None
+                    or existing.layer != new_dec.layer
+                    or existing.strategy_id != new_dec.strategy_id
+                    or existing.status != new_dec.status
+                )
+                if decision_changed:
+                    if existing is None:
+                        has_new_domain = True
+                    elif existing.layer == "dpi" and bypass and tls_broken:
+                        bypass_fell = True
+                    if new_dec.layer in ("dpi", "vpn", "dns"):
+                        dpi_or_vpn_changed = True
+                    if new_dec.layer == "dpi" or (
+                        existing is not None and existing.layer == "dpi" and new_dec.layer != "dpi"
+                    ):
+                        winws2_changed = True
+                    if new_dec.layer in ("vpn", "dns") or (
+                        existing is not None and existing.layer in ("vpn", "dns") and new_dec.layer != existing.layer
+                    ):
+                        singbox_changed = True
                 with self._lock:
                     self.auto_healed_count += 1
                 self.record_event(dom, proc_name, action, new_dec.layer, new_dec.strategy_id)
@@ -2918,9 +2962,14 @@ class RealtimeConnectionMonitor:
         if any_saved and (dpi_or_vpn_changed or winws2_changed or singbox_changed):
             procs = backend._collect_processes_state()
             is_adm = _is_admin()
+            urgent_reload = bool(has_new_domain or bypass_fell)
+            defer_active = bool(bypass)
             if ((procs.get("winws2") or {}).get("running")) and is_adm:
                 if hasattr(backend, "reload_winws2_if_changed"):
-                    w_res = backend.reload_winws2_if_changed(min_interval_sec=20.0, defer_if_active=True)
+                    w_res = backend.reload_winws2_if_changed(
+                        min_interval_sec=0.0 if urgent_reload else 20.0,
+                        defer_if_active=defer_active,
+                    )
                     if isinstance(w_res, dict) and w_res.get("deferred"):
                         reload_deferred.append("winws2")
                 else:
@@ -2930,7 +2979,10 @@ class RealtimeConnectionMonitor:
 
             if singbox_changed and ((procs.get("sing-box") or {}).get("running")) and is_adm:
                 if hasattr(backend, "reload_singbox_if_changed"):
-                    sb_res = backend.reload_singbox_if_changed(min_interval_sec=15.0, defer_if_active=True)
+                    sb_res = backend.reload_singbox_if_changed(
+                        min_interval_sec=0.0 if urgent_reload else 15.0,
+                        defer_if_active=defer_active,
+                    )
                     if isinstance(sb_res, dict) and sb_res.get("deferred"):
                         reload_deferred.append("sing-box")
                 else:

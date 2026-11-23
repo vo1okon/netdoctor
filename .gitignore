@@ -18,6 +18,7 @@ logs/
 
 # Generated runtime configs & personal VPN credentials
 configs/sing-box.json
+configs/xray.json
 configs/winws2_live_at.txt
 configs/winws2_preset.txt
 

@@ -900,6 +900,435 @@ DEFAULT_BYPASS_PROCESSES: tuple[str, ...] = (
     "ag_dns.exe",
 )
 
+# Games whose non-web sockets bypass TUN/VPN for zero-drop stability while port 80/443 mod/API traffic keeps DPI/VPN.
+DEFAULT_GAME_PROCESSES: tuple[str, ...] = (
+    # Sandbox / Survival / Co-op
+    "javaw.exe",
+    "java.exe",
+    "Minecraft.exe",
+    "Minecraft.Windows.exe",
+    "RobloxPlayerBeta.exe",
+    "RobloxStudioBeta.exe",
+    "RustClient.exe",
+    "DayZ_x64.exe",
+    "Terraria.exe",
+    "ShooterGame.exe",
+    "ArkAscended.exe",
+    "valheim.exe",
+    "Palworld-Win64-Shipping.exe",
+    "dontstarve_steam_x64.exe",
+    "factorio.exe",
+    "FactoryGameSteam-Win64-Shipping.exe",
+    "FactoryGame-Win64-Shipping.exe",
+    "ProjectZomboid64.exe",
+    "7DaysToDie.exe",
+    "VRising.exe",
+    "enshrouded.exe",
+    "ONCE_HUMAN.exe",
+    "SCUM.exe",
+    "Unturned.exe",
+    "SoTGame.exe",
+    "NMS.exe",
+    "Lethal Company.exe",
+    "Content Warning.exe",
+    "Phasmophobia.exe",
+    "Among Us.exe",
+    "Goose Goose Duck.exe",
+    "gmod.exe",
+    "hl2.exe",
+    "SonsOfTheForest.exe",
+    "TheForest.exe",
+    "Maine-Win64-Shipping.exe",
+    "Astro-Win64-Shipping.exe",
+    "FSD-Win64-Shipping.exe",
+    "Risk of Rain 2.exe",
+    "CoreKeeper.exe",
+    "Stardew Valley.exe",
+    "raft.exe",
+    "Subnautica.exe",
+    "Barotrauma.exe",
+    "REPO.exe",
+    "Schedule I.exe",
+    "Peak.exe",
+    # FPS / TPS / Tactical Shooters
+    "cs2.exe",
+    "csgo.exe",
+    "VALORANT-Win64-Shipping.exe",
+    "VALORANT.exe",
+    "RiotClientServices.exe",
+    "RainbowSix.exe",
+    "RainbowSix_Vulkan.exe",
+    "RainbowSix_BE.exe",
+    "r5apex.exe",
+    "r5apex_dx12.exe",
+    "FortniteClient-Win64-Shipping.exe",
+    "TslGame.exe",
+    "cod.exe",
+    "ModernWarfare.exe",
+    "BlackOpsColdWar.exe",
+    "Overwatch.exe",
+    "tf_win64.exe",
+    "tf.exe",
+    "EscapeFromTarkov.exe",
+    "EscapeFromTarkov_BE.exe",
+    "UAGame.exe",
+    "HuntGame.exe",
+    "Discovery.exe",
+    "helldivers2.exe",
+    "bf2042.exe",
+    "bfv.exe",
+    "bf1.exe",
+    "bf4.exe",
+    "destiny2.exe",
+    "Warframe.x64.exe",
+    "HaloInfinite.exe",
+    "Marvel-Win64-Shipping.exe",
+    "DeltaForceClient-Win64-Shipping.exe",
+    "SquadGame.exe",
+    "HLL-Win64-Shipping.exe",
+    "arma3_x64.exe",
+    "arma3.exe",
+    "ArmaReforgerSteam.exe",
+    "InsurgencyClient-Win64-Shipping.exe",
+    "ReadyOrNot-Win64-Shipping.exe",
+    "payday2_win32_release.exe",
+    "PAYDAY3Client-Win64-Shipping.exe",
+    "left4dead2.exe",
+    "KFGame.exe",
+    "stalcraftw.exe",
+    "enlisted.exe",
+    "Crossout.exe",
+    "GZWClientSteam-Win64-Shipping.exe",
+    "Bodycam-Win64-Shipping.exe",
+    "BattleBit.exe",
+    "XDefiant.exe",
+    "PortalWars-Win64-Shipping.exe",
+    "Paladins.exe",
+    "QuakeChampions.exe",
+    "FragPunk.exe",
+    "Strinova-Win64-Shipping.exe",
+    "SCPSL.exe",
+    "Splitgate2-Win64-Shipping.exe",
+    "TheFirstDescendant-Win64-Shipping.exe",
+    "Remnant2-Win64-Shipping.exe",
+    "Back4Blood.exe",
+    "wwzRetailEgs.exe",
+    "Darktide.exe",
+    "vermintide2_dx12.exe",
+    # MOBA / Strategy
+    "dota2.exe",
+    "League of Legends.exe",
+    "LeagueClient.exe",
+    "LeagueClientUx.exe",
+    "deadlock.exe",
+    "Smite.exe",
+    "Hemingway-Win64-Shipping.exe",
+    "HeroesOfTheStorm_x64.exe",
+    "SC2_x64.exe",
+    "AoE2DE_s.exe",
+    "RelicCardinal.exe",
+    "CivilizationVI.exe",
+    "CivilizationVI_DX12.exe",
+    "hoi4.exe",
+    "eu4.exe",
+    "stellaris.exe",
+    "ck3.exe",
+    "RelicCoH3.exe",
+    "Warhammer3.exe",
+    "Warcraft III.exe",
+    "AgeOfMythologyRetold_s.exe",
+    "BeyondAllReason.exe",
+    # MMORPG / ARPG / Gacha / Vehicles
+    "Wow.exe",
+    "WowClassic.exe",
+    "ffxiv_dx11.exe",
+    "eso64.exe",
+    "Gw2-64.exe",
+    "BlackDesert64.exe",
+    "LOSTARK.exe",
+    "NewWorld.exe",
+    "TL.exe",
+    "Albion-Online.exe",
+    "RuneLite.exe",
+    "rs2client.exe",
+    "L2.exe",
+    "archeage.exe",
+    "PathOfExile.exe",
+    "PathOfExileSteam.exe",
+    "PathOfExile_x64.exe",
+    "PathOfExile2.exe",
+    "PathOfExile2Steam.exe",
+    "Diablo IV.exe",
+    "Diablo III64.exe",
+    "Last Epoch.exe",
+    "GenshinImpact.exe",
+    "StarRail.exe",
+    "ZenlessZoneZero.exe",
+    "Client-Win64-Shipping.exe",
+    "QRSL.exe",
+    "aces.exe",
+    "WorldOfTanks.exe",
+    "WorldOfWarships64.exe",
+    "exefile.exe",
+    "StarCitizen.exe",
+    "EliteDangerous64.exe",
+    "MapleStory.exe",
+    "metin2client.exe",
+    "elementclient_64.exe",
+    "Neverwinter.exe",
+    "swtor.exe",
+    "lotroclient64.exe",
+    "DDOClient64.exe",
+    # Open World / Sports / Racing / Fighting / Social / Card
+    "GTA5.exe",
+    "GTA5_Enhanced.exe",
+    "FiveM_GTAProcess.exe",
+    "FiveM_b2802_GTAProcess.exe",
+    "FiveM_b2944_GTAProcess.exe",
+    "FiveM_b3095_GTAProcess.exe",
+    "ragemp_v.exe",
+    "altv-client.exe",
+    "RDR2.exe",
+    "RocketLeague.exe",
+    "FC24.exe",
+    "FC25.exe",
+    "FIFA23.exe",
+    "NBA2K24.exe",
+    "NBA2K25.exe",
+    "ForzaHorizon5.exe",
+    "acs.exe",
+    "AC2-Win64-Shipping.exe",
+    "BeamNG.drive.x64.exe",
+    "eurotrucks2.exe",
+    "amtrucks.exe",
+    "SnowRunner.exe",
+    "iRacingSim64DX11.exe",
+    "DeadByDaylight-Win64-Shipping.exe",
+    "FallGuys_client_game.exe",
+    "PartyAnimals.exe",
+    "MonsterHunterWorld.exe",
+    "MonsterHunterRise.exe",
+    "MonsterHunterWilds.exe",
+    "eldenring.exe",
+    "bg3.exe",
+    "bg3_dx11.exe",
+    "Warhammer 40000 Space Marine 2 - Retail.exe",
+    "Chivalry2-Win64-Shipping.exe",
+    "Mordhau-Win64-Shipping.exe",
+    "ForHonor.exe",
+    "NarakaBladepoint.exe",
+    "Polaris-Win64-Shipping.exe",
+    "StreetFighter6.exe",
+    "MK12.exe",
+    "Brawlhalla.exe",
+    "Hearthstone.exe",
+    "MTGA.exe",
+    "masterduel.exe",
+    "VRChat.exe",
+    "RecRoom.exe",
+    "PaliaClient-Win64-Shipping.exe",
+    "Sky.exe",
+)
+
+GAME_BYPASS_PORTS: tuple[int, ...] = (25565, 19132, 19133, 3074, 2099, 5223, 6667, 6672, 27900, 27901, 28910)
+
+GAME_BYPASS_PORT_RANGES: tuple[str, ...] = (
+    "27015:27050",
+    "5000:5500",
+    "6112:6119",
+    "7000:8000",
+    "7777:7780",
+    "8393:8400",
+    "9000:9100",
+    "61455:61458",
+)
+
+
+def needs_xray_bridge(node: VpnNode | dict[str, Any]) -> bool:
+    """Return True if a VLESS node requires Xray-core sidecar bridging (Reality or xhttp/splithttp)."""
+    if isinstance(node, VpnNode):
+        enabled = bool(getattr(node, "enabled", True))
+        proto = str(node.protocol or "").strip().lower()
+        ob = node.raw_outbound if isinstance(node.raw_outbound, dict) else {}
+    elif isinstance(node, dict):
+        enabled = bool(node.get("enabled", True))
+        proto = str(node.get("protocol") or "").strip().lower()
+        ob = node.get("raw_outbound") if isinstance(node.get("raw_outbound"), dict) else {}
+    else:
+        return False
+
+    if not enabled or proto != "vless" or is_placeholder_node(node):
+        return False
+
+    tls = ob.get("tls")
+    if isinstance(tls, dict):
+        reality = tls.get("reality")
+        if isinstance(reality, dict) and reality.get("enabled"):
+            return True
+
+    tr = ob.get("transport")
+    if isinstance(tr, dict):
+        tr_type = str(tr.get("type") or "").strip().lower()
+        if tr_type in ("xhttp", "splithttp"):
+            return True
+    return False
+
+
+def generate_xray_bridge_config(
+    vpn_nodes: list[VpnNode],
+    *,
+    output_path: str | Path | None = None,
+    base_port: int = 18100,
+    dns_server: str = "1.1.1.1",
+    enable_byedpi: bool = False,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Build Xray-core local SOCKS5 bridge config for VLESS Reality/xhttp nodes and return (config, {tag: port})."""
+    used_tags: set[str] = {"direct", "tg-ws-out", "vpn-auto", "vpn-select", "vpn-ai"}
+    if enable_byedpi:
+        used_tags.add("byedpi-out")
+
+    inbounds: list[dict[str, Any]] = []
+    xray_outbounds: list[dict[str, Any]] = []
+    rules: list[dict[str, Any]] = []
+    bridge_ports: dict[str, int] = {}
+
+    for idx, node in enumerate(vpn_nodes):
+        raw_tag = str(node.tag or node.raw_outbound.get("tag") or node.protocol or "vpn-node")
+        unique_tag = _unique_tag(raw_tag, used_tags)
+        if not needs_xray_bridge(node):
+            continue
+
+        ob = dict(node.raw_outbound) if isinstance(node.raw_outbound, dict) else {}
+        server = str(ob.get("server") or node.server or "").strip()
+        try:
+            port = int(ob.get("server_port") or node.server_port or 443)
+        except (TypeError, ValueError):
+            port = 443
+        uuid = str(ob.get("uuid") or "").strip()
+        if not server or not uuid:
+            continue
+
+        socks_port = int(base_port) + len(bridge_ports)
+        bridge_ports[unique_tag] = socks_port
+        in_tag = f"in-{idx}"
+        out_tag = f"out-{idx}"
+
+        inbounds.append(
+            {
+                "tag": in_tag,
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": True},
+            }
+        )
+
+        user_entry: dict[str, Any] = {"id": uuid, "encryption": "none"}
+        flow = str(ob.get("flow") or "").strip()
+        if flow:
+            user_entry["flow"] = flow
+
+        tr = ob.get("transport") if isinstance(ob.get("transport"), dict) else {}
+        tr_type = str(tr.get("type") or "tcp").strip().lower()
+        net_map = {
+            "http": "tcp",
+            "h2": "h2",
+            "ws": "ws",
+            "grpc": "grpc",
+            "httpupgrade": "httpupgrade",
+            "xhttp": "xhttp",
+            "splithttp": "splithttp",
+        }
+        xray_net = net_map.get(tr_type, "tcp")
+        stream_settings: dict[str, Any] = {
+            "network": xray_net,
+            "sockopt": {"domainStrategy": "UseIPv4"},
+        }
+        if xray_net == "ws":
+            ws_obj: dict[str, Any] = {"path": str(tr.get("path") or "/")}
+            hdrs = tr.get("headers")
+            if isinstance(hdrs, dict) and hdrs:
+                ws_obj["headers"] = {str(k): str(v) for k, v in hdrs.items()}
+            stream_settings["wsSettings"] = ws_obj
+        elif xray_net == "grpc":
+            stream_settings["grpcSettings"] = {"serviceName": str(tr.get("service_name") or "")}
+        elif xray_net in ("httpupgrade", "xhttp", "splithttp"):
+            key = f"{xray_net}Settings"
+            tr_obj: dict[str, Any] = {"path": str(tr.get("path") or "/")}
+            if tr.get("host"):
+                h_val = tr["host"]
+                tr_obj["host"] = str(h_val[0]) if isinstance(h_val, list) and h_val else str(h_val)
+            stream_settings[key] = tr_obj
+
+        tls = ob.get("tls") if isinstance(ob.get("tls"), dict) else {}
+        reality = tls.get("reality") if isinstance(tls.get("reality"), dict) else {}
+        fp = str((tls.get("utls") or {}).get("fingerprint") or "chrome").strip() or "chrome"
+        sni = str(tls.get("server_name") or server).strip() or server
+
+        if reality.get("enabled"):
+            stream_settings["security"] = "reality"
+            stream_settings["realitySettings"] = {
+                "serverName": sni,
+                "fingerprint": fp,
+                "publicKey": str(reality.get("public_key") or ""),
+                "shortId": str(reality.get("short_id") or ""),
+                "spiderX": "",
+            }
+        elif tls.get("enabled"):
+            stream_settings["security"] = "tls"
+            tls_settings: dict[str, Any] = {"serverName": sni, "fingerprint": fp}
+            alpn = tls.get("alpn")
+            if isinstance(alpn, list) and alpn:
+                tls_settings["alpn"] = [str(a) for a in alpn]
+            if tls.get("insecure"):
+                tls_settings["allowInsecure"] = True
+            stream_settings["tlsSettings"] = tls_settings
+        else:
+            stream_settings["security"] = "none"
+
+        xray_outbounds.append(
+            {
+                "tag": out_tag,
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [
+                        {
+                            "address": server,
+                            "port": port,
+                            "users": [user_entry],
+                        }
+                    ]
+                },
+                "streamSettings": stream_settings,
+            }
+        )
+        rules.append({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag})
+
+    xray_dns = list(
+        dict.fromkeys(
+            s
+            for s in (
+                dns_server if _is_ip_address(dns_server) else "",
+                "1.1.1.1",
+                "8.8.8.8",
+                "localhost",
+            )
+            if s
+        )
+    )
+    cfg: dict[str, Any] = {
+        "log": {"loglevel": "warning"},
+        "dns": {"servers": xray_dns},
+        "inbounds": inbounds,
+        "outbounds": [*xray_outbounds, {"protocol": "freedom", "tag": "direct"}],
+        "routing": {"domainStrategy": "AsIs", "rules": rules},
+    }
+    if output_path and bridge_ports:
+        out_file = Path(output_path)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    return cfg, bridge_ports
+
 
 def generate_singbox_config(
     decisions: list[Decision],
@@ -925,6 +1354,7 @@ def generate_singbox_config(
     tun_stack: str = "gvisor",
     vpn_selection_mode: str = "auto",
     preferred_vpn_node: str | None = None,
+    xray_bridge_ports: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Generate sing-box 1.12+/1.14+ JSON configuration combining global + per-domain DoH/bypass DNS rules, Telegram proxy route, multi-VPN regional/auto/AI urltest/selector outbounds, and Clash API."""
     vpn_nodes = vpn_nodes or []
@@ -1166,7 +1596,7 @@ def generate_singbox_config(
                 "tag": "tun-in",
                 "interface_name": "netdoctor-tun",
                 "address": ["172.19.0.1/30"],
-                "mtu": 1400,
+                "mtu": 9000,
                 "auto_route": True,
                 "strict_route": False,
                 "stack": resolved_stack,
@@ -1233,7 +1663,17 @@ def generate_singbox_config(
         is_wg = ob.get("type") == "wireguard" or node.protocol in ("wireguard", "amneziawg")
         is_ts = ob.get("type") == "tailscale" or node.protocol == "tailscale"
 
-        if is_ts:
+        if xray_bridge_ports and unique_tag in xray_bridge_ports:
+            outbounds.append(
+                {
+                    "type": "socks",
+                    "tag": unique_tag,
+                    "server": "127.0.0.1",
+                    "server_port": int(xray_bridge_ports[unique_tag]),
+                    "version": "5",
+                }
+            )
+        elif is_ts:
             endpoints.append(_build_tailscale_endpoint(ob, node))
         elif is_wg and use_wireguard_endpoints:
             endpoints.append(_build_wireguard_endpoint(ob, node, extended_core=extended_core))
@@ -1372,11 +1812,33 @@ def generate_singbox_config(
         # Scope process bypass to TUN only so mixed-in explicit proxy probes from python/pythonw still test VPN routes
         proc_bypass_rule["inbound"] = ["tun-in"]
 
+    game_proc_subrules: list[dict[str, Any]] = [
+        {"process_name": list(DEFAULT_GAME_PROCESSES)},
+        {"port": [53, 80, 443, 8080, 8443], "invert": True},
+    ]
+    game_port_rule: dict[str, Any] = {
+        "port": list(GAME_BYPASS_PORTS),
+        "port_range": list(GAME_BYPASS_PORT_RANGES),
+        "outbound": "direct",
+    }
+    if enable_tun:
+        game_proc_subrules.append({"inbound": ["tun-in"]})
+        game_port_rule["inbound"] = ["tun-in"]
+    game_proc_rule: dict[str, Any] = {
+        "type": "logical",
+        "mode": "and",
+        "rules": game_proc_subrules,
+        "outbound": "direct",
+    }
+
     route_rules: list[dict[str, Any]] = [
-        {"action": "sniff"},
+        {"port": [53, 80, 443, 8080, 8443], "action": "sniff", "timeout": "100ms"},
         {"protocol": "dns", "action": "hijack-dns"},
         # Prevent routing loops and preserve external unlocker / IDE apps (Antigravity, xray, happ, etc.)
         proc_bypass_rule,
+        # Keep multiplayer game streams direct while preserving DPI/VPN for web/mod ports (80/443/8080/8443)
+        game_proc_rule,
+        game_port_rule,
     ]
 
     if bypass_list:

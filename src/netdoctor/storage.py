@@ -518,6 +518,11 @@ class Storage:
                     node["priority"] = 100
                 else:
                     node["priority"] = int(node["priority"])
+                raw_reg = str(node.get("region") or "").strip().lower()
+                if not raw_reg or raw_reg == "other":
+                    from netdoctor.vpn import infer_node_region
+
+                    node["region"] = infer_node_region(shown_name, str(node.get("server") or ""))
                 if "enabled" not in node or node.get("enabled") is None:
                     node["enabled"] = True
                 else:

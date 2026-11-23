@@ -206,6 +206,9 @@ class NetdoctorController:
     def trigger_apply_configs(self) -> dict[str, Any]:
         return self.backend.trigger_apply_configs()
 
+    def force_apply_pending_changes(self, iface: int | None = None) -> dict[str, Any]:
+        return self.backend.force_apply_pending_changes(iface=iface)
+
     def trigger_stop(self) -> list[str]:
         return self.backend.stop_services()
 
@@ -1278,6 +1281,16 @@ class NetdoctorGuiApp(tk.Tk):
             "Запустить от Admin",
             self.on_elevate,
             "warn",
+            pady=8,
+        )
+        self._pending_btn_slot = tk.Frame(ctrl, bg=CARD)
+        self._pending_btn_slot.pack(side="right")
+        self.apply_pending_btn = self.make_button(
+            self._pending_btn_slot,
+            "Применить правила",
+            self.on_force_apply_pending,
+            "ghost",
+            padx=12,
             pady=8,
         )
 
@@ -3373,6 +3386,19 @@ class NetdoctorGuiApp(tk.Tk):
             lbl.configure(fg=FG if running else MUTED)
 
         stack_running = bool(snap.get("running"))
+        pending = snap.get("pending_changes") or {}
+        p_cnt = int(pending.get("count") or 0)
+        if p_cnt > 0:
+            self._restyle_button(self.apply_pending_btn, f"Применить правила ({p_cnt})", "warn")
+            if not self.apply_pending_btn.winfo_manager():
+                self.apply_pending_btn.pack(side="right", padx=(0, 8))
+        elif stack_running:
+            self._restyle_button(self.apply_pending_btn, "Применить правила", "ghost")
+            if not self.apply_pending_btn.winfo_manager():
+                self.apply_pending_btn.pack(side="right", padx=(0, 8))
+        elif self.apply_pending_btn.winfo_manager():
+            self.apply_pending_btn.pack_forget()
+
         preset_locked = self.active_preset_id != "auto"
         wd = snap.get("watchdog") or {}
         wd_cnt = int(wd.get("restarts_count") or 0)
@@ -4451,6 +4477,28 @@ class NetdoctorGuiApp(tk.Tk):
             self._after_change()
 
         self.run_bg("Hot-reload winws2", lambda: self.backend.reload_winws2(iface=iface), done)
+
+    def on_force_apply_pending(self) -> None:
+        try:
+            iface = self._iface()
+        except ValueError as exc:
+            self.set_status(str(exc), ERR_TEXT)
+            return
+
+        def done(res: dict[str, Any]) -> None:
+            reloaded = res.get("reloaded") or []
+            vpn_sw = res.get("vpn_switched")
+            parts: list[str] = []
+            if reloaded:
+                parts.append(f"перезагружено: {', '.join(reloaded)}")
+            if vpn_sw:
+                parts.append(f"VPN -> {vpn_sw}")
+            summary = "; ".join(parts) if parts else "конфиги обновлены"
+            self.log_console(f"[APPLY] Новые правила принудительно применены ({summary})")
+            self.set_status(f"Правила применены ({summary})", OK_TEXT)
+            self._after_change()
+
+        self.run_bg("Применение новых правил", lambda: self.backend.force_apply_pending_changes(iface=iface), done)
 
     def _format_deps_status(self, res: dict[str, Any]) -> None:
         if res.get("fetch_error"):

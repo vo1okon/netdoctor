@@ -66,6 +66,13 @@ UPSTREAM_RELEASES: dict[str, dict[str, str]] = {
         "binary_name": "ciadpi.exe",
         "license": "MIT",
     },
+    "xray": {
+        "repo": "XTLS/Xray-core",
+        "asset_keyword": "Xray-windows-64.zip",
+        "direct_archive": "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip",
+        "binary_name": "xray.exe",
+        "license": "MPL-2.0 (external binary only)",
+    },
 }
 
 
@@ -192,6 +199,56 @@ async def fetch_singbox_binary(
                     _write_bytes_atomic(target_exe, zf.read(member))
                     return target_exe
         raise RuntimeError("sing-box.exe not found inside downloaded archive")
+
+    if client is not None:
+        return await _fetch_with(client)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as own_client:
+        return await _fetch_with(own_client)
+
+
+async def fetch_xray_binary(
+    bin_dir: Path = DEFAULT_BIN_DIR,
+    timeout: float = 60.0,
+    *,
+    force: bool = False,
+    client: httpx.AsyncClient | None = None,
+) -> Path:
+    """Download latest official XTLS/Xray-core Windows amd64 release binary into bin_dir."""
+    bin_dir = Path(bin_dir)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    target_exe = bin_dir / "xray.exe"
+    if target_exe.exists() and not force:
+        return target_exe
+
+    async def _fetch_with(active_client: httpx.AsyncClient) -> Path:
+        download_url: str | None = None
+        try:
+            resp = await active_client.get("https://api.github.com/repos/XTLS/Xray-core/releases/latest")
+            if resp.is_success:
+                release = resp.json()
+                assets = release.get("assets") or []
+                for asset in assets:
+                    name = str(asset.get("name") or "")
+                    if name.endswith(".dgst"):
+                        continue
+                    if "xray-windows-64.zip" in name.lower():
+                        download_url = asset.get("browser_download_url")
+                        break
+        except Exception:  # noqa: BLE001
+            download_url = None
+        if not download_url:
+            download_url = UPSTREAM_RELEASES["xray"]["direct_archive"]
+
+        dl_resp = await active_client.get(download_url)
+        dl_resp.raise_for_status()
+
+        with zipfile.ZipFile(io.BytesIO(dl_resp.content), "r") as zf:
+            for member in zf.namelist():
+                rel = _safe_rel_path(member, strip_root=False)
+                if rel is not None and rel.name.lower() == "xray.exe":
+                    _write_bytes_atomic(target_exe, zf.read(member))
+                    return target_exe
+        raise RuntimeError("xray.exe not found inside downloaded archive")
 
     if client is not None:
         return await _fetch_with(client)
@@ -1166,6 +1223,7 @@ SERVICE_PORTS: dict[str, tuple[int, ...]] = {
     "sing-box": (2080, 19090),
     "tg-ws-proxy": (10808,),
     "byedpi": (10809,),
+    "xray": (18100,),
 }
 
 
@@ -1286,7 +1344,7 @@ def cleanup_orphaned_service_processes(
 ) -> list[str]:
     """Terminate leftover netdoctor service processes (or venv child interpreters) scoped strictly to bin_dir."""
     bin_path = Path(bin_dir).resolve()
-    target_names = set(names) if names is not None else {"tg-ws-proxy", "sing-box", "winws2", "byedpi"}
+    target_names = set(names) if names is not None else {"tg-ws-proxy", "sing-box", "winws2", "byedpi", "xray"}
 
     def _norm(p: str | Path) -> str:
         return os.path.normcase(os.path.normpath(str(p)))
@@ -1297,6 +1355,7 @@ def cleanup_orphaned_service_processes(
     sb_exe_norm = _norm((bin_path / "sing-box.exe").resolve())
     winws_exe_norm = _norm((bin_path / "winws2.exe").resolve())
     ciadpi_exe_norm = _norm((bin_path / "ciadpi.exe").resolve())
+    xray_exe_norm = _norm((bin_path / "xray.exe").resolve())
 
     self_pid = os.getpid()
     matches: list[tuple[str, int]] = []
@@ -1325,6 +1384,10 @@ def cleanup_orphaned_service_processes(
                 exe_norm == ciadpi_exe_norm or (cmd_norms and cmd_norms[0] == ciadpi_exe_norm)
             ):
                 svc_match = "byedpi"
+            elif "xray" in target_names and (
+                exe_norm == xray_exe_norm or (cmd_norms and cmd_norms[0] == xray_exe_norm)
+            ):
+                svc_match = "xray"
             elif "tg-ws-proxy" in target_names:
                 if exe_norm == tg_exe_norm or (cmd_norms and cmd_norms[0] == tg_exe_norm):
                     svc_match = "tg-ws-proxy"
@@ -1357,6 +1420,27 @@ def validate_singbox_config(bin_dir: str | Path, config_path: str | Path) -> tup
     try:
         proc = subprocess.run(
             [str(exe), "check", "-c", str(config_path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            creationflags=_NO_WINDOW,
+        )
+        return proc.returncode == 0, (proc.stderr or proc.stdout or "").strip()
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, str(exc)
+
+
+def validate_xray_config(bin_dir: str | Path, config_path: str | Path) -> tuple[bool, str]:
+    """Validate an Xray-core JSON config via `xray.exe run -test -c <config_path>` if binary is present."""
+    exe = Path(bin_dir) / "xray.exe"
+    if not exe.is_file():
+        return True, "skipped"
+    try:
+        proc = subprocess.run(
+            [str(exe), "run", "-test", "-c", str(config_path)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

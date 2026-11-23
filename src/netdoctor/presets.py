@@ -335,7 +335,7 @@ def parse_bat_to_winws2_text(bat_content: str, preset_name: str = "") -> str:
     if global_flags:
         lines.extend(global_flags)
     else:
-        lines.append("--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443,1024-65535")
+        lines.append("--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443")
         lines.append("--wf-udp-out=443,19294-19344,50000-50100,1024-65535")
 
     emitted = 0
@@ -507,11 +507,7 @@ def compile_zapret_preset(
             "--ctrack-disable=0",
             "--ipcache-lifetime=8400",
             "--ipcache-hostname=1",
-            (
-                "--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443,1024-65535"
-                if game_filter
-                else "--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443"
-            ),
+            "--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443",
             "--wf-tcp-in=80,443",
             (
                 "--wf-udp-out=443,19294-19344,50000-50100,1024-65535"

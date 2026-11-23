@@ -34,6 +34,8 @@ from netdoctor.config_gen import (
     detect_physical_egress_route,
     generate_singbox_config,
     generate_winws2_config,
+    generate_xray_bridge_config,
+    needs_xray_bridge,
 )
 from netdoctor.dynamics import run_canary_cycle
 from netdoctor.models import Decision, Protocol, Strategy, VerdictClass, VpnNode
@@ -81,9 +83,11 @@ from netdoctor.supervisor import (
     ProcessSupervisor,
     _is_admin,
     fetch_all_bins,
+    fetch_xray_binary,
     inspect_supervisor_state,
     stop_persisted_supervisor,
     validate_singbox_config,
+    validate_xray_config,
     verify_binaries,
 )
 from netdoctor.tray import (
@@ -412,6 +416,30 @@ def launch_gui_detached(
 
 _WEB_KEEPALIVE_PORTS: frozenset[int] = frozenset({53, 80, 443, 8080, 8443})
 _ACTIVE_FLOW_IDLE_SEC: float = 15.0
+_ACTIVE_SESSION_GRACE_SEC: float = 60.0
+_GAME_PROCESS_HINTS: tuple[str, ...] = (
+    "javaw.exe",
+    "java.exe",
+    "minecraft",
+    "cs2.exe",
+    "dota2.exe",
+    "valorant",
+    "roblox",
+    "r5apex.exe",
+    "gta5.exe",
+    "overwatch.exe",
+    "rustclient.exe",
+    "fortnite",
+    "escapefromtarkov",
+    "deadlock",
+    "wow.exe",
+    "league of legends.exe",
+)
+
+
+def _is_game_process(proc_name: str) -> bool:
+    low = (proc_name or "").strip().lower()
+    return bool(low and any(hint in low for hint in _GAME_PROCESS_HINTS))
 
 
 class GuiBackend:
@@ -451,9 +479,11 @@ class GuiBackend:
         self._last_winws2_reload_ts: float = 0.0
         self._last_singbox_hash: str = ""
         self._last_singbox_reload_ts: float = 0.0
+        self._last_xray_hash: str = ""
         self._pending_winws2_reload: bool = False
         self._pending_singbox_reload: bool = False
         self._clash_conn_traffic: dict[str, tuple[int, float]] = {}
+        self._last_stateful_session_ts: float = 0.0
         self._desired_running: bool = False
         self._stopping: bool = False
         self._watchdog_restarts: int = 0
@@ -463,6 +493,7 @@ class GuiBackend:
         self._last_crash_reason: str = ""
         self._last_preset_error: str = ""
         self._last_gateway_ip: str = ""
+        self._gw_change_pending: str = ""
         self._service_retry_ts: dict[str, float] = {}
         self._service_fail_counts: dict[str, int] = {}
         self._strategies_seeded_sig: tuple[Any, ...] | None = None
@@ -735,6 +766,15 @@ class GuiBackend:
                 "backoff_active": time.monotonic() < self._watchdog_next_retry_ts,
             }
             preset_compile_error = self._last_preset_error
+            pending_vpn_node = getattr(self.orchestrator.vpn, "_pending_optimal_node", None)
+            pending_changes = {
+                "winws2": bool(self._pending_winws2_reload),
+                "singbox": bool(self._pending_singbox_reload),
+                "vpn_node": pending_vpn_node,
+                "count": int(bool(self._pending_winws2_reload))
+                + int(bool(self._pending_singbox_reload))
+                + int(bool(pending_vpn_node)),
+            }
 
         return {
             "network_key": net_key,
@@ -770,6 +810,7 @@ class GuiBackend:
             "zapret_mode": "preset" if active_preset_id != "auto" else "auto",
             "zapret_presets_count": len(all_zapret_presets),
             "preset_compile_error": preset_compile_error,
+            "pending_changes": pending_changes,
             "test_summary": test_summary,
             "watchdog": watchdog_state,
         }
@@ -2136,6 +2177,29 @@ class GuiBackend:
                     d for d in decisions if not (d.layer == "vpn" and not getattr(d, "pinned", False))
                 ]
 
+            xray_file = self.configs_dir / "xray.json"
+            xray_exe = self.bin_dir.resolve() / "xray.exe"
+            xray_bridge_ports: dict[str, int] = {}
+            xray_valid = True
+            xray_err = ""
+            if xray_exe.is_file() and any(needs_xray_bridge(n) for n in vpn_nodes):
+                _xcfg, candidate_ports = generate_xray_bridge_config(
+                    vpn_nodes,
+                    output_path=xray_file,
+                    dns_server=str(active_dns.get("ip") or "1.1.1.1"),
+                    enable_byedpi=byedpi_fallback,
+                )
+                if candidate_ports:
+                    xray_valid, xray_err = validate_xray_config(self.bin_dir, xray_file)
+                    if xray_valid:
+                        xray_bridge_ports = candidate_ports
+                    else:
+                        xray_file.unlink(missing_ok=True)
+                else:
+                    xray_file.unlink(missing_ok=True)
+            else:
+                xray_file.unlink(missing_ok=True)
+
             singbox_file = self.configs_dir / "sing-box.json"
             generate_singbox_config(
                 decisions=singbox_decisions,
@@ -2156,6 +2220,7 @@ class GuiBackend:
                 tun_stack=tun_stack,
                 vpn_selection_mode=vpn_policy["mode"],
                 preferred_vpn_node=vpn_policy["priority_node"] or None,
+                xray_bridge_ports=xray_bridge_ports or None,
             )
             sb_hash = hashlib.sha256(singbox_file.read_bytes()).hexdigest()
             sb_exe = self.bin_dir.resolve() / "sing-box.exe"
@@ -2174,6 +2239,10 @@ class GuiBackend:
                 "singbox_config": str(singbox_file),
                 "singbox_valid": sb_valid,
                 "singbox_check_error": sb_err,
+                "xray_config": str(xray_file) if xray_bridge_ports else "",
+                "xray_bridge_count": len(xray_bridge_ports),
+                "xray_valid": xray_valid,
+                "xray_check_error": xray_err,
                 "hostlists_count": len(hostlists),
                 "hostlists": sorted(hostlists.keys()),
                 "vpn_nodes_count": len(vpn_nodes),
@@ -2257,6 +2326,8 @@ class GuiBackend:
                     )
                     self._supervisor.adopt_persisted_state()
                 self._supervisor.stop_process("sing-box")
+                self._supervisor.stop_process("xray")
+                self._last_xray_hash = ""
                 if _is_admin() and winws_running:
                     self.reload_winws2()
             else:
@@ -2337,6 +2408,9 @@ class GuiBackend:
         self,
         winws_args: list[str],
         singbox_file: Path,
+        *,
+        xray_file: Path | None = None,
+        xray_bridge_count: int = 0,
     ) -> list[tuple[str, list[str], Path | None]]:
         bin_path = self.bin_dir.resolve()
         specs: list[tuple[str, list[str], Path | None]] = []
@@ -2390,9 +2464,95 @@ class GuiBackend:
 
         specs.append(("winws2", self._build_winws2_cmd(winws_args), bin_path))
         if stack_mode != "dpi_only":
+            xray_exe = bin_path / "xray.exe"
+            if xray_bridge_count > 0 and xray_exe.is_file() and xray_file is not None and xray_file.is_file():
+                specs.append(("xray", [str(xray_exe), "run", "-c", str(xray_file.resolve())], bin_path))
             singbox_exe = bin_path / "sing-box.exe"
             specs.append(("sing-box", [str(singbox_exe), "run", "-c", str(singbox_file.resolve())], bin_path))
         return specs
+
+    @staticmethod
+    def _has_xray_inbounds(xray_file: Path) -> bool:
+        if not xray_file.is_file():
+            return False
+        try:
+            data = json.loads(xray_file.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return False
+        inbounds = data.get("inbounds") if isinstance(data, dict) else None
+        return bool(isinstance(inbounds, list) and len(inbounds) > 0)
+
+    def ensure_xray_binary(self, *, force: bool = False) -> Path | None:
+        """Download official XTLS/Xray-core xray.exe into bin_dir if missing or forced."""
+        with self._deps_lock:
+            try:
+                return _run_coro_sync(fetch_xray_binary(self.bin_dir, force=force))
+            except Exception:  # noqa: BLE001
+                return None
+
+    def _refresh_stale_subscriptions_if_needed(self, max_age_sec: float = 3600.0) -> bool:
+        """Refresh HTTP(S) VPN subscriptions on startup when cached nodes are older than max_age_sec."""
+        try:
+            storage = Storage(self.db_path)
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            subs = storage.get_subscriptions()
+            if not subs:
+                return False
+            now_utc = datetime.now(timezone.utc)
+            needs_refresh = False
+            for sub in subs:
+                url = str(sub.get("url_or_uri") or "").strip().lower()
+                if not url.startswith(("http://", "https://")):
+                    continue
+                raw_ts = str(sub.get("updated_at") or "").strip()
+                if not raw_ts:
+                    needs_refresh = True
+                    break
+                try:
+                    dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_sec = (now_utc - dt.astimezone(timezone.utc)).total_seconds()
+                except ValueError:
+                    age_sec = max_age_sec
+                if age_sec >= max_age_sec:
+                    needs_refresh = True
+                    break
+            if not needs_refresh:
+                return False
+            results = _run_coro_sync(refresh_all_subscriptions(storage, timeout=5.0))
+            return any(count > 0 for count in results.values())
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            storage.close()
+
+    def _restart_xray(self) -> dict[str, Any]:
+        """Start or reload managed xray.exe SOCKS5 Reality bridge via ProcessSupervisor."""
+        with self._lock:
+            bin_path = self.bin_dir.resolve()
+            xray_exe = bin_path / "xray.exe"
+            xray_file = (self.configs_dir / "xray.json").resolve()
+            if not xray_exe.is_file() or not self._has_xray_inbounds(xray_file):
+                return {"ok": False, "reloaded": False, "error": "xray.exe or active xray.json not available"}
+            if self._supervisor is None:
+                self._supervisor = ProcessSupervisor(bin_dir=bin_path, logs_dir=self.logs_dir.resolve())
+                self._supervisor.adopt_persisted_state()
+            try:
+                proc = self._supervisor.reload_process(
+                    "xray",
+                    [str(xray_exe), "run", "-c", str(xray_file)],
+                    cwd=bin_path,
+                )
+                try:
+                    self._last_xray_hash = hashlib.sha256(xray_file.read_bytes()).hexdigest()
+                except OSError:
+                    self._last_xray_hash = ""
+                return {"ok": True, "reloaded": True, "pid": proc.pid}
+            except OSError as exc:
+                return {"ok": False, "reloaded": False, "error": str(exc)}
 
     def _restart_tg_ws_proxy(self) -> dict[str, Any]:
         """Restart tg-ws-proxy via ProcessSupervisor if crashed."""
@@ -2468,6 +2628,23 @@ class GuiBackend:
         if not self.has_core_binaries(stack_mode):
             deps_report = self.ensure_deps(force=False)
 
+        self._refresh_stale_subscriptions_if_needed()
+        if (
+            stack_mode != "dpi_only"
+            and (self.bin_dir.resolve() / "sing-box.exe").is_file()
+            and not (self.bin_dir.resolve() / "xray.exe").is_file()
+        ):
+            try:
+                st_xray = Storage(self.db_path)
+                try:
+                    needs_xray = any(needs_xray_bridge(n) for n in st_xray.get_all_subscription_nodes())
+                finally:
+                    st_xray.close()
+            except Exception:  # noqa: BLE001
+                needs_xray = False
+            if needs_xray:
+                self.ensure_xray_binary()
+
         with self._lock:
             self.stop_services()
 
@@ -2509,9 +2686,12 @@ class GuiBackend:
                     "processes": self._collect_processes_state(),
                 }
 
+            xray_cfg_str = str(applied.get("xray_config") or "").strip()
             specs = self._build_stack_specs(
                 winws_args=applied["winws2_args"],
                 singbox_file=Path(applied["singbox_config"]),
+                xray_file=Path(xray_cfg_str) if xray_cfg_str else None,
+                xray_bridge_count=int(applied.get("xray_bridge_count") or 0),
             )
             sup = ProcessSupervisor(bin_dir=bin_path, logs_dir=self.logs_dir.resolve())
             try:
@@ -2544,6 +2724,7 @@ class GuiBackend:
             self._pending_winws2_reload = False
             self._pending_singbox_reload = False
             self._clash_conn_traffic.clear()
+            self._last_stateful_session_ts = 0.0
             try:
                 sb_cfg_path = Path(applied["singbox_config"])
                 self._last_singbox_hash = (
@@ -2551,8 +2732,18 @@ class GuiBackend:
                 )
             except OSError:
                 self._last_singbox_hash = ""
+            try:
+                xray_cfg_path = Path(xray_cfg_str) if xray_cfg_str else None
+                self._last_xray_hash = (
+                    hashlib.sha256(xray_cfg_path.read_bytes()).hexdigest()
+                    if xray_cfg_path is not None and xray_cfg_path.is_file()
+                    else ""
+                )
+            except OSError:
+                self._last_xray_hash = ""
             self._last_singbox_reload_ts = time.monotonic()
             self._last_gateway_ip = self._detect_local_gateway_ip()
+            self._gw_change_pending = ""
             self._watchdog_timestamps.clear()
             self._watchdog_next_retry_ts = 0.0
             self._service_retry_ts.clear()
@@ -2587,6 +2778,9 @@ class GuiBackend:
                 self._pending_winws2_reload = False
                 self._pending_singbox_reload = False
                 self._clash_conn_traffic.clear()
+                self._last_stateful_session_ts = 0.0
+                self._gw_change_pending = ""
+                self._last_xray_hash = ""
                 self._service_retry_ts.clear()
                 self._service_fail_counts.clear()
                 try:
@@ -2711,25 +2905,87 @@ class GuiBackend:
                 "processes": self._collect_processes_state(),
             }
 
+    def _scan_psutil_stateful_connections(self) -> list[dict[str, Any]]:
+        """Inspect host TCP ESTABLISHED & connected UDP sockets via psutil for active game/voice/non-web traffic."""
+        found: list[dict[str, Any]] = []
+        for c in RealtimeConnectionMonitor._read_inet_connections():
+            sock_type = getattr(c, "type", socket.SOCK_STREAM)
+            is_tcp = sock_type == socket.SOCK_STREAM
+            is_udp = sock_type == socket.SOCK_DGRAM
+            if is_tcp:
+                if str(getattr(c, "status", "") or "") != "ESTABLISHED":
+                    continue
+            elif not is_udp:
+                continue
+
+            raddr = getattr(c, "raddr", None)
+            if not raddr:
+                continue
+            rip = str(getattr(raddr, "ip", None) or (raddr[0] if len(raddr) >= 1 else ""))
+            rport = int(getattr(raddr, "port", None) or (raddr[1] if len(raddr) >= 2 else 0))
+            if not rip or not _is_external_ip(rip) or rport <= 0:
+                continue
+
+            pid = getattr(c, "pid", None)
+            proc_name = self.orchestrator.monitor._resolve_pid_name(pid).lower()
+            if (
+                proc_name in _INTERNAL_PROXY_PROCESSES
+                or proc_name in ("xray.exe", "tg-ws-proxy.exe")
+                or "tgwsproxy" in proc_name
+            ):
+                continue
+
+            if rport in _WEB_KEEPALIVE_PORTS and not _is_game_process(proc_name):
+                continue
+
+            found.append(
+                {
+                    "process": proc_name,
+                    "remote": f"{rip}:{rport}",
+                    "port": rport,
+                    "stateful": True,
+                    "flowing": True,
+                }
+            )
+        return found
+
     def _active_working_connections(self, *, service: str) -> list[dict[str, Any]]:
-        """Return currently active working connections (stateful non-web sessions or actively flowing transfers)."""
+        """Return currently active working connections (stateful non-web/game sessions or actively flowing transfers)."""
         procs = self._collect_processes_state()
         sb_running = bool((procs.get("sing-box") or {}).get("running"))
         winws_running = bool((procs.get("winws2") or {}).get("running"))
         protected: list[dict[str, Any]] = []
+        now = time.monotonic()
+
+        def _grace_entry() -> list[dict[str, Any]]:
+            with self._lock:
+                last_ts = self._last_stateful_session_ts
+            if last_ts > 0 and (now - last_ts) < _ACTIVE_SESSION_GRACE_SEC:
+                return [
+                    {
+                        "process": "active_session_grace",
+                        "remote": "grace",
+                        "port": 0,
+                        "stateful": True,
+                        "flowing": False,
+                    }
+                ]
+            return []
 
         if sb_running:
             try:
                 conn_data = self.clash_api.get_connections_sync()
             except Exception:  # noqa: BLE001
                 conn_data = {}
-            if not isinstance(conn_data, dict):
-                return []
-            raw_conns = conn_data.get("connections")
+            raw_conns = conn_data.get("connections") if isinstance(conn_data, dict) else None
             if not isinstance(raw_conns, list):
-                return []
+                fallback = self._scan_psutil_stateful_connections()
+                if fallback:
+                    with self._lock:
+                        self._last_stateful_session_ts = now
+                    return fallback
+                return _grace_entry()
 
-            now = time.monotonic()
             seen_ids: set[str] = set()
             with self._lock:
                 for c in raw_conns:
@@ -2748,7 +3004,7 @@ class GuiBackend:
                     proc_name = Path(raw_proc.replace("\\", "/")).name.lower() if raw_proc else ""
                     if proc_name and (
                         proc_name in _INTERNAL_PROXY_PROCESSES
-                        or proc_name == "tg-ws-proxy.exe"
+                        or proc_name in ("xray.exe", "tg-ws-proxy.exe")
                         or "tgwsproxy" in proc_name
                     ):
                         continue
@@ -2781,53 +3037,33 @@ class GuiBackend:
                             self._clash_conn_traffic[conn_id] = (total, now)
                             actively_flowing = True
 
-                    is_stateful_non_web = rport not in _WEB_KEEPALIVE_PORTS
-                    if is_stateful_non_web or actively_flowing:
+                    is_stateful = (rport not in _WEB_KEEPALIVE_PORTS) or _is_game_process(proc_name)
+                    if is_stateful:
+                        self._last_stateful_session_ts = now
+                    if is_stateful or actively_flowing:
                         protected.append(
                             {
                                 "process": proc_name or "sing-box",
                                 "remote": f"{rip}:{rport}",
                                 "port": rport,
-                                "stateful": is_stateful_non_web,
+                                "stateful": is_stateful,
                                 "flowing": actively_flowing,
                             }
                         )
 
                 for stale_id in [k for k in self._clash_conn_traffic if k not in seen_ids]:
                     self._clash_conn_traffic.pop(stale_id, None)
-            return protected
+            if protected:
+                return protected
+            return _grace_entry()
 
         if service == "winws2" and winws_running:
-            for c in RealtimeConnectionMonitor._read_inet_connections():
-                if str(getattr(c, "status", "") or "") != "ESTABLISHED":
-                    continue
-                if getattr(c, "type", socket.SOCK_STREAM) != socket.SOCK_STREAM:
-                    continue
-                raddr = getattr(c, "raddr", None)
-                if not raddr:
-                    continue
-                rip = str(getattr(raddr, "ip", None) or (raddr[0] if len(raddr) >= 1 else ""))
-                rport = int(getattr(raddr, "port", None) or (raddr[1] if len(raddr) >= 2 else 0))
-                if not rip or not _is_external_ip(rip) or rport <= 0 or rport in _WEB_KEEPALIVE_PORTS:
-                    continue
-                pid = getattr(c, "pid", None)
-                proc_name = self.orchestrator.monitor._resolve_pid_name(pid).lower()
-                if (
-                    proc_name in _INTERNAL_PROXY_PROCESSES
-                    or proc_name == "tg-ws-proxy.exe"
-                    or "tgwsproxy" in proc_name
-                ):
-                    continue
-                protected.append(
-                    {
-                        "process": proc_name,
-                        "remote": f"{rip}:{rport}",
-                        "port": rport,
-                        "stateful": True,
-                        "flowing": True,
-                    }
-                )
-            return protected
+            found = self._scan_psutil_stateful_connections()
+            if found:
+                with self._lock:
+                    self._last_stateful_session_ts = now
+                return found
+            return _grace_entry()
 
         return []
 
@@ -2957,6 +3193,23 @@ class GuiBackend:
                 self._service_retry_ts[svc_name] = now_svc + min(60.0, float(15 * (2 ** min(fails - 1, 2))))
                 return False
 
+        xray_running = bool((procs.get("xray") or {}).get("running"))
+        xray_exe = self.bin_dir.resolve() / "xray.exe"
+        xray_cfg = self.configs_dir / "xray.json"
+        if xray_running:
+            with self._lock:
+                self._service_fail_counts.pop("xray", None)
+                self._service_retry_ts.pop("xray", None)
+        elif (
+            desired_stack_active
+            and stack_mode != "dpi_only"
+            and xray_exe.is_file()
+            and self._has_xray_inbounds(xray_cfg)
+        ):
+            if _try_recover_aux("xray", self._restart_xray):
+                restarted.append("xray")
+                xray_running = True
+
         if sb_running:
             with self._lock:
                 self._service_fail_counts.pop("sing-box", None)
@@ -2983,9 +3236,16 @@ class GuiBackend:
             if cur_gw:
                 if not prev_gw:
                     self._last_gateway_ip = cur_gw
-                elif cur_gw != prev_gw:
+                    self._gw_change_pending = ""
+                elif cur_gw == prev_gw:
+                    self._gw_change_pending = ""
+                elif self._gw_change_pending != cur_gw:
+                    # Require 2 consecutive ticks seeing the new gateway to ignore transient adapter/VPN blips
+                    self._gw_change_pending = cur_gw
+                else:
                     if _aborted_by_stop():
                         return {"checked": True, "healthy": True, "restarted": restarted, "skipped": "stopping"}
+                    self._gw_change_pending = ""
                     self._last_gateway_ip = cur_gw
                     network_changed = True
                     clear_vpn_dns_cache()
@@ -3006,6 +3266,9 @@ class GuiBackend:
                     w_pend = self.reload_winws2_if_changed(min_interval_sec=20.0, defer_if_active=True)
                     if w_pend.get("reloaded") and "winws2" not in restarted:
                         restarted.append("winws2")
+                if sb_running and stack_mode != "dpi_only" and getattr(self.orchestrator.vpn, "_pending_optimal_node", None):
+                    if not self._active_working_connections(service="sing-box"):
+                        self.reconcile_vpn_health(min_interval_sec=0.0)
             return {
                 "checked": True,
                 "healthy": True,
@@ -3148,8 +3411,34 @@ class GuiBackend:
                 self._supervisor = ProcessSupervisor(bin_dir=bin_path, logs_dir=self.logs_dir.resolve())
                 self._supervisor.adopt_persisted_state()
 
+            xray_exe = bin_path / "xray.exe"
+            xray_cfg_raw = str(applied.get("xray_config") or "").strip()
+            xray_bridge_count = int(applied.get("xray_bridge_count") or 0)
             cmd = [str(singbox_exe), "run", "-c", str(singbox_file)]
             try:
+                if xray_bridge_count > 0 and xray_exe.is_file() and xray_cfg_raw:
+                    xray_path = Path(xray_cfg_raw).resolve()
+                    try:
+                        new_xray_hash = (
+                            hashlib.sha256(xray_path.read_bytes()).hexdigest() if xray_path.is_file() else ""
+                        )
+                    except OSError:
+                        new_xray_hash = ""
+                    xray_running = bool((self._collect_processes_state().get("xray") or {}).get("running"))
+                    if not xray_running or new_xray_hash != self._last_xray_hash:
+                        self._supervisor.reload_process(
+                            "xray",
+                            [str(xray_exe), "run", "-c", str(xray_path)],
+                            cwd=bin_path,
+                        )
+                        time.sleep(0.2)
+                        self._last_xray_hash = new_xray_hash
+                else:
+                    procs_now = self._collect_processes_state()
+                    if bool((procs_now.get("xray") or {}).get("running")) or "xray" in self._supervisor.processes:
+                        self._supervisor.stop_process("xray")
+                    self._last_xray_hash = ""
+
                 proc = self._supervisor.reload_process("sing-box", cmd, cwd=bin_path)
                 time.sleep(0.35)
                 rc = proc.poll()
@@ -3204,7 +3493,7 @@ class GuiBackend:
         *,
         defer_if_active: bool = False,
     ) -> dict[str, Any]:
-        """Hot-reload sing-box ONLY if generated sing-box.json changed AND cooldown interval elapsed."""
+        """Hot-reload sing-box (and xray bridge) ONLY if config changed AND cooldown interval elapsed."""
         with self._lock:
             applied = self.trigger_apply_configs(iface=iface)
             sb_path = Path(applied["singbox_config"]).resolve()
@@ -3212,9 +3501,24 @@ class GuiBackend:
                 new_hash = hashlib.sha256(sb_path.read_bytes()).hexdigest() if sb_path.is_file() else ""
             except OSError:
                 new_hash = ""
+            xray_cfg_raw = str(applied.get("xray_config") or "").strip()
+            xray_path = Path(xray_cfg_raw).resolve() if xray_cfg_raw else None
+            try:
+                new_xray_hash = (
+                    hashlib.sha256(xray_path.read_bytes()).hexdigest()
+                    if xray_path is not None and xray_path.is_file()
+                    else ""
+                )
+            except OSError:
+                new_xray_hash = ""
             procs = self._collect_processes_state()
             sb_running = bool((procs.get("sing-box") or {}).get("running"))
-            if sb_running and self._last_singbox_hash and new_hash == self._last_singbox_hash:
+            if (
+                sb_running
+                and self._last_singbox_hash
+                and new_hash == self._last_singbox_hash
+                and new_xray_hash == self._last_xray_hash
+            ):
                 self._pending_singbox_reload = False
                 return {
                     "ok": True,
@@ -3489,6 +3793,7 @@ class GuiBackend:
                     sel_p = next((p for p in probed_list if p.get("tag") == res["selected"]), None)
                     if sel_p is not None:
                         self._cached_vpn_health["best_ping_ms"] = sel_p.get("ping_ms")
+                self._cached_vpn_health["pending_node"] = res.get("pending_node")
             return res
         finally:
             with self._lock:
@@ -3515,6 +3820,39 @@ class GuiBackend:
             if res.get("ok") and res.get("selected"):
                 self._cached_vpn_health["best_node"] = res["selected"]
         return res
+
+    def force_apply_pending_changes(self, iface: int | None = None) -> dict[str, Any]:
+        """Rebuild configs and immediately hot-reload running services + pending VPN switches, ignoring deferral."""
+        applied = self.trigger_apply_configs(iface=iface)
+        procs = self._collect_processes_state()
+        is_adm = _is_admin()
+        reloaded: list[str] = []
+        vpn_switched: str | None = None
+
+        if bool((procs.get("winws2") or {}).get("running")) and is_adm:
+            w_res = self.reload_winws2_if_changed(iface=iface, min_interval_sec=0.0, defer_if_active=False)
+            if isinstance(w_res, dict) and w_res.get("reloaded"):
+                reloaded.append("winws2")
+
+        if bool((procs.get("sing-box") or {}).get("running")) and is_adm:
+            sb_res = self.reload_singbox_if_changed(iface=iface, min_interval_sec=0.0, defer_if_active=False)
+            if isinstance(sb_res, dict) and sb_res.get("reloaded"):
+                reloaded.append("sing-box")
+            if getattr(self.orchestrator.vpn, "_pending_optimal_node", None):
+                vpn_res = self.reconcile_vpn_health(min_interval_sec=0.0, force=True)
+                if isinstance(vpn_res, dict) and vpn_res.get("selected"):
+                    vpn_switched = str(vpn_res["selected"])
+
+        with self._lock:
+            self._pending_winws2_reload = False
+            self._pending_singbox_reload = False
+
+        return {
+            "ok": True,
+            "reloaded": reloaded,
+            "vpn_switched": vpn_switched,
+            "applied": applied,
+        }
 
     def set_byedpi_fallback(self, enabled: bool) -> dict[str, Any]:
         """Enable or disable ByeDPI (ciadpi.exe SOCKS5) fallback mode and rebuild configs."""
