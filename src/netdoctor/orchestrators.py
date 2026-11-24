@@ -707,6 +707,11 @@ AI_GEOBLOCK_DOMAINS: tuple[str, ...] = (
     "notion.so",
     "spotify.com",
     "canva.com",
+    "login.live.com",
+    "account.live.com",
+    "xboxlive.com",
+    "minecraftservices.com",
+    "mojang.com",
 )
 
 
@@ -2214,7 +2219,7 @@ class VpnLayerOrchestrator:
 class RealtimeConnectionMonitor:
     """Real-time connection scanner & automatic per-domain strategy orchestrator."""
 
-    def __init__(self, rdns_ttl_sec: float = 300.0, cooldown_sec: float = 45.0) -> None:
+    def __init__(self, rdns_ttl_sec: float = 300.0, cooldown_sec: float = 12.0) -> None:
         self._lock = threading.RLock()
         self.rdns_ttl_sec = rdns_ttl_sec
         self.cooldown_sec = cooldown_sec
@@ -2863,6 +2868,7 @@ class RealtimeConnectionMonitor:
             backend._seed_default_strategies(storage)
             strategy_pool = storage.get_strategies()
             has_real_vpn = storage.has_usable_vpn()
+            can_dns_bypass = storage.get_setting("stack_mode", "hybrid").strip().lower() != "dpi_only"
             active_decisions = {
                 (d.domain.lower(), d.protocol): d for d in storage.get_decisions(net_key, active_only=False)
             }
@@ -2882,7 +2888,7 @@ class RealtimeConnectionMonitor:
                     # User explicitly pinned this working rule — never churn it automatically!
                     continue
                 prev_fails = existing.consecutive_fails if existing is not None else 0
-                cd_sec = min(600.0, self.cooldown_sec * (2 ** min(max(prev_fails, 0), 4)))
+                cd_sec = min(300.0, self.cooldown_sec * (2 ** min(max(prev_fails, 0), 4)))
                 self.cooldown_until[dom] = now_cd + cd_sec
                 eligible.append((dom, proc_name, reason, existing))
 
@@ -2919,7 +2925,35 @@ class RealtimeConnectionMonitor:
                     or "circular" in reason
                     or (existing is not None and existing.layer == "dpi" and bypass)
                 )
-                if existing is not None and existing.layer == "dpi" and bypass and tls_broken:
+                wants_smart_dns = (
+                    not has_real_vpn
+                    and can_dns_bypass
+                    and (VerdictClass.IP_BLOCK in report.verdicts or is_geoblock_or_ai_domain(dom))
+                    and (tls_failed or existing is None or existing.layer != "dns")
+                )
+                if existing is not None and existing.layer == "dns" and bypass and tls_broken and can_dns_bypass:
+                    if existing.fallback_strategies:
+                        new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
+                        action = f"DNS fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                    else:
+                        new_dec = await DnsLayerOrchestrator().roll_dns_for_domain(
+                            dom,
+                            network_key=net_key,
+                            storage=storage,
+                            timeout=min(timeout, 1.5),
+                        )
+                        storage.save_decision(new_dec)
+                        action = f"Подбор DNS ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                elif wants_smart_dns and (existing is None or existing.layer != "dns"):
+                    new_dec = await DnsLayerOrchestrator().roll_dns_for_domain(
+                        dom,
+                        network_key=net_key,
+                        storage=storage,
+                        timeout=min(timeout, 1.5),
+                    )
+                    storage.save_decision(new_dec)
+                    action = f"SmartDNS ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                elif existing is not None and existing.layer == "dpi" and bypass and tls_broken:
                     # If no fallbacks remain and no real VPN is configured, rotate to next untested ordered TLS strategies
                     if not existing.fallback_strategies and not has_real_vpn and ordered_tls_ids:
                         if existing.strategy_id in ordered_tls_ids:

@@ -687,6 +687,11 @@ def test_gui_minsize_layout_no_clipping_and_dns_alert(tmp_path: Path) -> None:
         assert app.pin_btn.winfo_height() >= 22
         assert app.unpin_btn.winfo_height() >= 22
         # Verify vertical scrolling works when rule form exceeds canvas height or on mousewheel
+        assert int(float(str(app.rule_canvas.cget("yscrollincrement")))) > 0
+        app.override_layer_var.set("dpi")
+        wheel_ev = SimpleNamespace(widget=app.override_layer_cb, delta=-120)
+        assert app._on_rule_mousewheel(wheel_ev) == "break"
+        assert app.override_layer_var.get() == "dpi"
         app.rule_canvas.yview_moveto(1.0)
         app.update_idletasks()
         assert app.rule_canvas.yview()[1] >= 0.99

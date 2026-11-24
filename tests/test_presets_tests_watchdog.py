@@ -1492,10 +1492,10 @@ async def test_auto_heal_single_apply_parallel_probes_and_exponential_cooldown(
     assert len(res["healed"]) == 2
     assert inflight["max"] == 2
     assert apply_calls == 1
-    # Exponential cooldown: fail1 had consecutive_fails=1 -> 2*45s=90s cooldown, fail2 had 0 -> 45s cooldown
+    # Exponential cooldown: fail1 had consecutive_fails=1 -> 2*12s=24s cooldown, fail2 had 0 -> 12s cooldown
     cd1 = backend.orchestrator.monitor.cooldown_until["fail1.example"] - t_before
     cd2 = backend.orchestrator.monitor.cooldown_until["fail2.example"] - t_before
-    assert cd1 > cd2 + 30.0
+    assert cd1 > cd2 + 8.0
 
     # Tick with no eligible candidates (on cooldown) skips second scan_active_connections
     scan_calls = 0

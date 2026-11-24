@@ -1586,3 +1586,162 @@ def test_realtime_ip_map_ignores_shared_cdn_and_stub_verdict_ips(tmp_path: Path)
         assert mon.ip_to_domain["203.0.113.55"] == "unique.example"
     finally:
         st.close()
+
+
+def test_auto_heal_no_vpn_uses_smart_dns_for_login_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without VPN, IP-blocked Microsoft/Xbox auth (login.live.com) uses SmartDNS and rotates DNS fallbacks."""
+    import netdoctor.orchestrators as orch_mod
+    from netdoctor.models import (
+        DnsProbeResult,
+        NetworkFingerprint,
+        NetworkKind,
+        ProbesSummary,
+        QuicProbeResult,
+        StallProbeResult,
+        TcpProbeResult,
+        TlsProbeResult,
+    )
+
+    assert orch_mod.is_geoblock_or_ai_domain("login.live.com")
+    assert orch_mod.is_geoblock_or_ai_domain("xsts.auth.xboxlive.com")
+
+    db_path = tmp_path / "live_dns.db"
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=logs_dir,
+        bin_dir=tmp_path / "bin",
+    )
+    net = NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP")
+
+    monkeypatch.setattr(orch_mod, "detect_bypass_active", lambda: True)
+    monkeypatch.setattr(orch_mod, "_is_admin", lambda: True)
+
+    async def fake_net(timeout: float = 2.0) -> NetworkFingerprint:
+        return net
+
+    async def fake_probes(domain: str, timeout: float = 2.0) -> ProbesSummary:
+        return ProbesSummary(
+            dns=DnsProbeResult(system="ok", doh="ok", doh_ips=["20.190.159.130"]),
+            tcp=TcpProbeResult(result="timeout", target_ip="20.190.159.130"),
+            tls=TlsProbeResult(real_sni="timeout", neutral_sni="timeout"),
+            stall=StallProbeResult(result="skipped"),
+            quic=QuicProbeResult(result="timeout"),
+        )
+
+    async def fake_roll_dns(
+        self: Any,
+        domain: str,
+        network_key: str,
+        storage: Any = None,
+        timeout: float = 1.8,
+    ) -> Decision:
+        return Decision(
+            network_key=network_key,
+            domain=domain,
+            protocol=Protocol.TLS,
+            layer="dns",
+            strategy_id="dns:xbox_dns",
+            fallback_strategies=["dns:comss_dns"],
+        )
+
+    monkeypatch.setattr(orch_mod, "detect_network_fingerprint", fake_net)
+    monkeypatch.setattr(orch_mod, "run_domain_probes", fake_probes)
+    monkeypatch.setattr(orch_mod.DnsLayerOrchestrator, "roll_dns_for_domain", fake_roll_dns)
+    monkeypatch.setattr(
+        backend.orchestrator.monitor,
+        "scan_active_connections",
+        lambda *a, **kw: [
+            {
+                "process": "prismlauncher.exe",
+                "domain": "login.live.com",
+                "layer": "direct",
+                "health": "needs_fix",
+                "socket_status": "SYN_SENT",
+                "active_healthy": False,
+            }
+        ],
+    )
+    monkeypatch.setattr(backend, "_collect_processes_state", lambda: {"winws2": {"running": True}, "sing-box": {"running": True}})
+    monkeypatch.setattr(backend, "reload_winws2_if_changed", lambda **kw: {"ok": True, "reloaded": False})
+    monkeypatch.setattr(backend, "reload_singbox_if_changed", lambda **kw: {"ok": True, "reloaded": True})
+
+    # Tick 1: assigns SmartDNS instead of useless DPI for IP-blocked login.live.com without VPN
+    res1 = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
+    assert res1["healed"] and res1["healed"][0]["layer"] == "dns"
+    assert res1["healed"][0]["strategy_id"] == "dns:xbox_dns"
+
+    # Tick 2 (after cooldown expires): promotes DNS fallback instead of wiping DNS rule back to DPI
+    backend.orchestrator.monitor.cooldown_until.clear()
+    res2 = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
+    assert res2["healed"] and res2["healed"][0]["layer"] == "dns"
+    assert res2["healed"][0]["strategy_id"] == "dns:comss_dns"
+
+
+def test_run_diag_sync_rotates_fallback_when_bypass_active_and_dpi_still_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pressing 'Подбор DPI' while bypass is active must advance to fallback instead of re-saving broken pool[0]."""
+    import netdoctor.gui_backend as gb_mod
+    from netdoctor.models import (
+        DnsProbeResult,
+        NetworkFingerprint,
+        NetworkKind,
+        ProbesSummary,
+        QuicProbeResult,
+        StallProbeResult,
+        TcpProbeResult,
+        TlsProbeResult,
+    )
+
+    db_path = tmp_path / "diag_rotate.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    net = NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP")
+    st = Storage(db_path)
+    try:
+        nk = st.upsert_network(net)
+        st.upsert_strategies(DEFAULT_STRATEGIES)
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="login.live.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_alt1_199_fake_fakedsplit",
+                fallback_strategies=["tls_alt12_1104_sferum_seqovl", "tls_alt13_1104_sochi_hostfakesplit"],
+            )
+        )
+    finally:
+        st.close()
+
+    async def fake_net(timeout: float = 2.5) -> NetworkFingerprint:
+        return net
+
+    async def fake_probes(domain: str, timeout: float = 2.5) -> ProbesSummary:
+        return ProbesSummary(
+            dns=DnsProbeResult(system="ok", doh="ok", doh_ips=["20.190.147.10"]),
+            tcp=TcpProbeResult(result="ok", rtt_ms=1085.2, target_ip="20.190.147.10"),
+            tls=TlsProbeResult(real_sni="timeout", neutral_sni="ok"),
+            stall=StallProbeResult(result="skipped"),
+            quic=QuicProbeResult(result="timeout"),
+        )
+
+    monkeypatch.setattr(gb_mod, "detect_bypass_active", lambda: True)
+    monkeypatch.setattr(gb_mod, "detect_network_fingerprint", fake_net)
+    monkeypatch.setattr(gb_mod, "run_domain_probes", fake_probes)
+    monkeypatch.setattr(backend, "trigger_apply_configs", lambda iface=None: {})
+    monkeypatch.setattr(backend, "_reload_running_services", lambda **kw: None)
+
+    rows = backend.run_diag_sync(["login.live.com"])
+    tls_row = next(r for r in rows if r["domain"] == "login.live.com" and r["protocol"] == "tls")
+    assert tls_row["strategy_id"] == "tls_alt12_1104_sferum_seqovl"
+    assert tls_row["consecutive_fails"] == 1

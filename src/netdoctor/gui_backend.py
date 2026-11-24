@@ -38,7 +38,7 @@ from netdoctor.config_gen import (
     generate_xray_bridge_config,
     needs_xray_bridge,
 )
-from netdoctor.dynamics import run_canary_cycle
+from netdoctor.dynamics import promote_fallback_on_failure, run_canary_cycle
 from netdoctor.models import Decision, Protocol, Strategy, VerdictClass, VpnNode
 from netdoctor.orchestrators import (
     ANTIGRAVITY_CRITICAL_DOMAINS,
@@ -2028,7 +2028,18 @@ class GuiBackend:
                         )
                     ):
                         continue
-                    storage.save_decision(cand_dec)
+                    if (
+                        bypass
+                        and not can_live_eval
+                        and prev_dec is not None
+                        and prev_dec.layer == "dpi"
+                        and cand_dec.layer == "dpi"
+                        and cand_dec.strategy_id == prev_dec.strategy_id
+                    ):
+                        # Current DPI strategy still fails while bypass is active: rotate to next fallback instead of re-saving pool[0]
+                        promote_fallback_on_failure(storage, prev_dec, vpn_available=vpn_available)
+                    else:
+                        storage.save_decision(cand_dec)
                     if VerdictClass.QUIC_BLOCK in verdicts:
                         report = next(r for r in reports if r.domain == dom)
                         storage.save_verdict(net_key, report, protocol=Protocol.QUIC)

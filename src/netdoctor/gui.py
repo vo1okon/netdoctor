@@ -3466,19 +3466,27 @@ class NetdoctorGuiApp(tk.Tk):
         right_outer = tk.Frame(panel, bg=CARD_ALT, highlightthickness=1, highlightbackground=BORDER)
         right_outer.grid(row=0, column=1, sticky="nsew", padx=(6, 10), pady=8)
 
-        self.rule_canvas = tk.Canvas(right_outer, bg=CARD_ALT, highlightthickness=0, bd=0, height=195)
+        self.rule_canvas = tk.Canvas(
+            right_outer, bg=CARD_ALT, highlightthickness=0, bd=0, height=195, yscrollincrement=18
+        )
         rule_vsb = ttk.Scrollbar(right_outer, orient="vertical")
         self._rule_vsb = rule_vsb
 
         def _sync_rule_scrollbar(first: str, last: str) -> None:
             rule_vsb.set(first, last)
             try:
-                need_scroll = float(first) > 0.001 or float(last) < 0.999
+                canv_h = self.rule_canvas.winfo_height()
+                req_h = right.winfo_reqheight()
+                if canv_h > 10:
+                    need_scroll = req_h > canv_h + 4
+                else:
+                    need_scroll = float(first) > 0.001 or float(last) < 0.999
                 if need_scroll:
                     if not rule_vsb.winfo_ismapped():
                         rule_vsb.pack(side="right", fill="y")
-                elif rule_vsb.winfo_ismapped():
+                elif rule_vsb.winfo_ismapped() and (canv_h <= 10 or req_h <= canv_h - 4):
                     rule_vsb.pack_forget()
+                    self.rule_canvas.yview_moveto(0.0)
             except (ValueError, tk.TclError):
                 pass
 
@@ -3620,27 +3628,29 @@ class NetdoctorGuiApp(tk.Tk):
     def _on_rule_mousewheel(self, event: Any) -> str | None:
         if self._closed or not hasattr(self, "rule_canvas"):
             return None
+        is_combo = isinstance(getattr(event, "widget", None), ttk.Combobox)
         try:
             if not self.rule_canvas.winfo_viewable():
-                return None
+                return "break" if is_combo else None
             first, last = self.rule_canvas.yview()
             if float(first) <= 0.001 and float(last) >= 0.999:
-                return None
+                return "break" if is_combo else None
         except tk.TclError:
             return None
         delta = getattr(event, "delta", 0)
         if delta:
-            step = -1 if delta > 0 else 1
+            step = -2 if delta > 0 else 2
             if abs(delta) >= 120:
-                step = int(-delta / 120)
+                step = int(-delta / 120) * 2
+            if (step < 0 and float(first) <= 0.0) or (step > 0 and float(last) >= 1.0):
+                return "break"
             self.rule_canvas.yview_scroll(step, "units")
             return "break"
-        return None
+        return "break" if is_combo else None
 
     def _bind_rule_mousewheel(self, widget: tk.Misc) -> None:
-        """Recursively attach <MouseWheel> handler to rule management panel widgets (excluding Combobox dropdown wheel)."""
-        if not isinstance(widget, ttk.Combobox):
-            widget.bind("<MouseWheel>", self._on_rule_mousewheel, add="+")
+        """Recursively attach <MouseWheel> handler to rule management panel widgets (also stops Combobox accidental wheel changes)."""
+        widget.bind("<MouseWheel>", self._on_rule_mousewheel, add="+")
         for child in widget.winfo_children():
             self._bind_rule_mousewheel(child)
 
@@ -5644,7 +5654,7 @@ class NetdoctorGuiApp(tk.Tk):
         def runner() -> None:
             try:
                 if auto_heal:
-                    res = self.backend.run_realtime_auto_heal_tick(max_domains_per_tick=1, require_running=True)
+                    res = self.backend.run_realtime_auto_heal_tick(max_domains_per_tick=3, require_running=True)
                 else:
                     res = self.backend.scan_live_connections()
             except Exception as exc:  # noqa: BLE001

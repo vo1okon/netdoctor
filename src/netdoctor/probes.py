@@ -564,12 +564,13 @@ async def probe_stall(
             effective_path = raw_up if raw_up.startswith("/") else f"/{raw_up}"
 
     t0 = time.perf_counter()
+    deadline = t0 + timeout
     total_read = 0
     writer: asyncio.StreamWriter | None = None
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port, ssl=ctx, server_hostname=sni),
-            timeout=timeout,
+            timeout=max(0.1, deadline - time.perf_counter()),
         )
         req = (
             f"GET {effective_path} HTTP/1.1\r\n"
@@ -578,10 +579,13 @@ async def probe_stall(
             f"Connection: close\r\n\r\n"
         ).encode("ascii")
         writer.write(req)
-        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        await asyncio.wait_for(writer.drain(), timeout=max(0.1, deadline - time.perf_counter()))
 
         while total_read < 32768:
-            chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+            rem = deadline - time.perf_counter()
+            if rem <= 0:
+                raise asyncio.TimeoutError
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=rem)
             if not chunk:
                 break
             total_read += len(chunk)
