@@ -481,9 +481,17 @@ async def probe_tcp(ip: str, port: int = 443, timeout: float = 3.0) -> TcpProbeR
         return TcpProbeResult(result="reset", target_ip=ip)
 
 
-async def _single_tls_handshake(ip: str, port: int, sni: str, verify: bool, timeout: float) -> tuple[str, float | None]:
+async def _single_tls_handshake(
+    ip: str,
+    port: int,
+    sni: str,
+    verify: bool,
+    timeout: float,
+    *,
+    allow_alert: bool = False,
+) -> tuple[str, float | None]:
     """Perform a single TLS handshake to ip:port with specified SNI.
-    If verify=False (for neutral SNI probe), any TLS response from server (even alert/cert mismatch) counts as 'ok'
+    If allow_alert=True (for neutral SNI probe), a TLS alert response from the server counts as 'ok'
     because it proves TSPU did not drop/reset the ClientHello.
     """
     ctx = ssl.create_default_context()
@@ -512,8 +520,9 @@ async def _single_tls_handshake(ip: str, port: int, sni: str, verify: bool, time
         msg = str(e).lower()
         if "internal error" in msg or "eof" in msg or "reset" in msg:
             return "reset", None
-        # A TLS alert (e.g. unrecognized_name) from the server on neutral SNI proves our ClientHello reached the server!
-        if "alert" in msg or "tlsv1" in msg or "unrecognized_name" in msg:
+        # A TLS alert (e.g. unrecognized_name) on neutral SNI proves ClientHello reached the server,
+        # whereas on real SNI it means the server rejected the SNI (e.g. from fake/corrupted ClientHello).
+        if allow_alert and ("alert" in msg or "tlsv1" in msg or "unrecognized_name" in msg):
             return "ok", round((time.perf_counter() - t0) * 1000.0, 2)
         return "reset", None
     except asyncio.TimeoutError:
@@ -532,8 +541,8 @@ async def probe_tls(
     """Compare TLS handshake with real SNI vs neutral SNI concurrently to the same IP."""
     silence_proactor_connection_reset()
     (real_res, ttfb), (neutral_res, _) = await asyncio.gather(
-        _single_tls_handshake(ip, port, real_sni, verify=False, timeout=timeout),
-        _single_tls_handshake(ip, port, neutral_sni, verify=False, timeout=timeout),
+        _single_tls_handshake(ip, port, real_sni, verify=False, timeout=timeout, allow_alert=False),
+        _single_tls_handshake(ip, port, neutral_sni, verify=False, timeout=timeout, allow_alert=True),
     )
     return TlsProbeResult(real_sni=real_res, neutral_sni=neutral_res, ttfb_ms=ttfb)
 

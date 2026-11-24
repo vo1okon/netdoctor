@@ -1983,3 +1983,30 @@ def test_scan_active_connections_ignores_self_probes_fin_wait_and_quic_stalls(
         assert onedrive_tls["health"] != "needs_fix"
     finally:
         st.close()
+
+
+def test_singbox_dns_cname_underscore_and_tls_unrecognized_name_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CNAME chains with underscores map to original domain and TLS alerts fail real_sni while passing neutral_sni."""
+    import ssl
+    import netdoctor.orchestrators as orch_mod
+    import netdoctor.probes as probes_mod
+
+    sb_log = "\n".join(
+        [
+            "+0300 2026-11-24 22:41:19 INFO [1048385708 6ms] dns: exchanged CNAME account.ubisoft.com. 8182 IN CNAME account.ubisoft.akadns.net.",
+            "+0300 2026-11-24 22:41:19 INFO [1048385708 6ms] dns: exchanged CNAME account.ubisoft.akadns.net. 8182 IN CNAME lb-prod-acc_ount-pdc.ubisoft.com.",
+            "+0300 2026-11-24 22:41:19 INFO [1048385708 6ms] dns: exchanged A lb-prod-acc_ount-pdc.ubisoft.com. 8182 IN A 130.254.91.66",
+        ]
+    )
+    parsed = orch_mod._parse_singbox_dns_ip_map(sb_log)
+    assert parsed["130.254.91.66"] == "account.ubisoft.com"
+
+    async def fake_open_conn(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        raise ssl.SSLError("[SSL: TLSV1_ALERT_UNRECOGNIZED_NAME] tlsv1 alert unrecognized name")
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_conn)
+    tls_res = asyncio.run(probes_mod.probe_tls("130.254.91.66", real_sni="account.ubisoft.com"))
+    assert tls_res.real_sni == "reset"
+    assert tls_res.neutral_sni == "ok"

@@ -450,11 +450,11 @@ def _parse_singbox_failed_ips(sb_tail: str) -> set[str]:
 
 
 _SINGBOX_DNS_CNAME_RE = re.compile(
-    r"\[(\d+)\s+[^\]]+\]\s+dns:\s+(?:exchanged|cached)\s+CNAME\s+([a-z0-9.-]+\.[a-z]{2,})\.?\s+\d+\s+IN\s+CNAME\s+([a-z0-9.-]+\.[a-z]{2,})\.?",
+    r"\[(\d+)\s+[^\]]+\]\s+dns:\s+(?:exchanged|cached)\s+CNAME\s+([a-z0-9._-]+\.[a-z]{2,})\.?\s+\d+\s+IN\s+CNAME\s+([a-z0-9._-]+\.[a-z]{2,})\.?",
     re.IGNORECASE,
 )
 _SINGBOX_DNS_A_RE = re.compile(
-    r"(?:\[(\d+)\s+[^\]]+\]\s+)?dns:\s+(?:exchanged|cached)\s+A\s+([a-z0-9.-]+\.[a-z]{2,})\.?\s+\d+\s+IN\s+A\s+(\d{1,3}(?:\.\d{1,3}){3})\b",
+    r"(?:\[(\d+)\s+[^\]]+\]\s+)?dns:\s+(?:exchanged|cached)\s+A\s+([a-z0-9._-]+\.[a-z]{2,})\.?\s+\d+\s+IN\s+A\s+(\d{1,3}(?:\.\d{1,3}){3})\b",
     re.IGNORECASE,
 )
 _SINGBOX_CLOSED_ERR_RE = re.compile(
