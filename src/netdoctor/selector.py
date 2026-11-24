@@ -850,6 +850,32 @@ def _ordered_pool(candidates: list[Strategy] | None, protocol: Protocol) -> list
     return pool
 
 
+def _diverse_fallbacks(
+    pool: list[Strategy],
+    winner_id: str,
+    winner_family: str = "",
+    limit: int = 2,
+) -> list[str]:
+    """Pick fallback strategy IDs preferring distinct families from the winner and each other."""
+    chosen: list[str] = []
+    used_families: set[str] = {winner_family} if winner_family else set()
+    for cand in pool:
+        if cand.id == winner_id or cand.id in chosen:
+            continue
+        if cand.family not in used_families:
+            chosen.append(cand.id)
+            used_families.add(cand.family)
+            if len(chosen) >= limit:
+                return chosen
+    for cand in pool:
+        if cand.id == winner_id or cand.id in chosen:
+            continue
+        chosen.append(cand.id)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 def _non_vpn_fallback_decision(
     network_key: str,
     domain: str,
@@ -866,7 +892,7 @@ def _non_vpn_fallback_decision(
             protocol=protocol,
             layer="dpi",
             strategy_id=winner.id,
-            fallback_strategies=[s.id for s in pool[1:3]],
+            fallback_strategies=_diverse_fallbacks(pool, winner.id, winner.family),
             status=status,
         )
     return Decision(
@@ -1010,7 +1036,7 @@ async def evaluate_domains_live_batch(
 
             for dom, ev in zip(domains_list, evals):
                 if ev.success_rate >= min_success_rate:
-                    fallbacks = [s.id for s in pool if s.id != strat.id][:2]
+                    fallbacks = _diverse_fallbacks(pool, strat.id, strat.family)
                     decisions[dom] = Decision(
                         network_key=network_key,
                         domain=dom,
@@ -1042,7 +1068,7 @@ async def evaluate_domains_live_batch(
     for dom in unresolved:
         if pool:
             winner_strat = pool[0]
-            fallback_ids = [s.id for s in pool[1:3]]
+            fallback_ids = _diverse_fallbacks(pool, winner_strat.id, winner_strat.family)
             decisions[dom] = Decision(
                 network_key=network_key,
                 domain=dom,
@@ -1107,7 +1133,7 @@ async def select_best_strategy(
             protocol=protocol,
             layer="dpi",
             strategy_id=winner_strat.id,
-            fallback_strategies=[s.id for s in pool[1:3]],
+            fallback_strategies=_diverse_fallbacks(pool, winner_strat.id, winner_strat.family),
         )
 
     eval_fn = evaluator or (lambda d, i, s: default_strategy_evaluator(d, i, s))
@@ -1129,7 +1155,7 @@ async def select_best_strategy(
                 protocol=protocol,
                 layer="dpi",
                 strategy_id=winner_strat.id,
-                fallback_strategies=[s.id for s in pool[1:3]],
+                fallback_strategies=_diverse_fallbacks(pool, winner_strat.id, winner_strat.family),
             )
 
         if not vpn_available:
@@ -1149,11 +1175,11 @@ async def select_best_strategy(
         key=lambda e: (e.strategy.tier, -e.throughput_kbps, e.ttfb_ms)
     )
     winner = passing[0]
-    fallbacks = [e.strategy.id for e in passing[1:3]]
+    fallbacks = _diverse_fallbacks([e.strategy for e in passing], winner.strategy.id, winner.strategy.family)
     if early_stop and len(fallbacks) < 2:
-        for cand in pool:
-            if cand.id != winner.strategy.id and cand.id not in fallbacks:
-                fallbacks.append(cand.id)
+        for fb_id in _diverse_fallbacks(pool, winner.strategy.id, winner.strategy.family, limit=4):
+            if fb_id not in fallbacks:
+                fallbacks.append(fb_id)
             if len(fallbacks) >= 2:
                 break
 

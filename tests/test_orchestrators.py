@@ -2010,3 +2010,141 @@ def test_singbox_dns_cname_underscore_and_tls_unrecognized_name_alert(
     tls_res = asyncio.run(probes_mod.probe_tls("130.254.91.66", real_sni="account.ubisoft.com"))
     assert tls_res.real_sni == "reset"
     assert tls_res.neutral_sni == "ok"
+
+
+def test_diverse_fallbacks_pick_different_families(tmp_path: Path) -> None:
+    """Fallbacks must span distinct strategy families, and winws2 catch-all must put non-fake splits first."""
+    from netdoctor.config_gen import generate_winws2_config
+    from netdoctor.models import Strategy, VerdictClass
+    from netdoctor.selector import select_best_strategy
+
+    cands = [
+        Strategy(id="fake_1", family="fake_fakedsplit", protocol=Protocol.TLS, tier=2, args_template=["--lua-desync=fake:blob=x"]),
+        Strategy(id="fake_2", family="fake_fakedsplit", protocol=Protocol.TLS, tier=2, args_template=["--lua-desync=fake:blob=y"]),
+        Strategy(id="fake_3", family="fake_fakedsplit", protocol=Protocol.TLS, tier=2, args_template=["--lua-desync=fake:blob=z"]),
+        Strategy(id="split_1", family="multisplit", protocol=Protocol.TLS, tier=2, args_template=["--lua-desync=multisplit:pos=2"]),
+        Strategy(id="disorder_1", family="multidisorder", protocol=Protocol.TLS, tier=2, args_template=["--lua-desync=multidisorder:pos=1,midsld"]),
+    ]
+
+    dec = asyncio.run(
+        select_best_strategy(
+            network_key="AS12389:home:default",
+            domain="ubisoft.com",
+            ip="130.254.91.66",
+            verdicts=[VerdictClass.SNI_DPI],
+            candidates=cands,
+            evaluator=None,
+            early_stop=True,
+        )
+    )
+    assert dec.layer == "dpi"
+    strat_map = {s.id: s for s in cands}
+    win_family = strat_map[dec.strategy_id].family if dec.strategy_id else ""
+    fb_families = [strat_map[sid].family for sid in dec.fallback_strategies]
+    assert len(set([win_family, *fb_families])) == 1 + len(dec.fallback_strategies)
+
+    args, _ = generate_winws2_config(
+        decisions=[],
+        strategies=strat_map,
+        lists_dir=tmp_path / "lists",
+        enable_circular_catchall=True,
+    )
+    circ_idx = next(i for i, tok in enumerate(args) if tok.startswith("--lua-desync=circular"))
+    first_catchall_strat = args[circ_idx + 1]
+    assert "fake" not in first_catchall_strat
+
+
+def test_find_best_bypass_for_domain_cascade_dpi_dns_vpn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """find_best_bypass_for_domain cascades Direct -> diverse DPI -> SmartDNS -> VPN and stops at first working."""
+    from netdoctor.models import NetworkFingerprint, NetworkKind
+
+    db_path = tmp_path / "best_cascade.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    st = Storage(db_path)
+    try:
+        nk = st.upsert_network(NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP"))
+        st.set_setting("stack_mode", "hybrid")
+        st.save_subscription(
+            "default",
+            "vless://test",
+            [
+                {
+                    "tag": "nl-1",
+                    "protocol": "vless",
+                    "server": "198.51.100.1",
+                    "server_port": 443,
+                    "enabled": True,
+                    "raw_outbound": {
+                        "type": "vless",
+                        "tag": "nl-1",
+                        "server": "198.51.100.1",
+                        "server_port": 443,
+                        "uuid": "00000000-0000-0000-0000-000000000001",
+                    },
+                }
+            ],
+        )
+    finally:
+        st.close()
+
+    monkeypatch.setattr(backend, "_collect_processes_state", lambda: {"winws2": {"running": False}, "sing-box": {"running": False}})
+
+    # Scenario 1: direct fails, 1st DPI fails, 2nd DPI (different family) succeeds -> picks 2nd DPI
+    calls_1: list[str] = []
+
+    def probe_1(dom: str, *, proxy_url: str | None = None, timeout: float = 3.0) -> dict[str, Any]:
+        calls_1.append(proxy_url or "direct_or_dpi")
+        if len(calls_1) <= 2:
+            return {"ok": False, "error": "reset"}
+        return {"ok": True, "latency_ms": 42.0}
+
+    res1 = backend.find_best_bypass_for_domain("site1.example", probe_fn=probe_1)
+    assert res1["ok"] is True
+    assert res1["winner"]["layer"] == "dpi"
+    assert res1["winner"]["latency_ms"] == 42.0
+    assert len([t for t in res1["tried"] if t["layer"] == "dpi"]) == 2
+    assert all(t["layer"] != "vpn" for t in res1["tried"])
+
+    # Scenario 2: direct + all DPI fail, SmartDNS succeeds -> picks dns
+    def probe_2(dom: str, *, proxy_url: str | None = None, timeout: float = 3.0) -> dict[str, Any]:
+        # Step C runs after dpi candidates fail
+        st_chk = Storage(db_path)
+        try:
+            cur = next((d for d in st_chk.get_decisions(nk, active_only=False) if d.domain == dom), None)
+            if cur is not None and cur.layer == "dns":
+                return {"ok": True, "latency_ms": 55.0}
+        finally:
+            st_chk.close()
+        return {"ok": False, "error": "timeout"}
+
+    def fake_dns_roll(dom: str, net_k: str) -> Decision:
+        return Decision(network_key=net_k, domain=dom, protocol=Protocol.TLS, layer="dns", strategy_id="dns:comss_dns", ttfb_ms=30.0)
+
+    res2 = backend.find_best_bypass_for_domain("site2.example", probe_fn=probe_2, dns_roll_fn=fake_dns_roll)
+    assert res2["ok"] is True
+    assert res2["winner"]["layer"] == "dns"
+    assert res2["winner"]["strategy_id"] == "dns:comss_dns"
+
+    # Scenario 3: direct + DPI + DNS fail, VPN succeeds -> picks vpn
+    def probe_3(dom: str, *, proxy_url: str | None = None, timeout: float = 3.0) -> dict[str, Any]:
+        st_chk = Storage(db_path)
+        try:
+            cur = next((d for d in st_chk.get_decisions(nk, active_only=False) if d.domain == dom), None)
+            if cur is not None and cur.layer == "vpn":
+                return {"ok": True, "latency_ms": 88.0}
+        finally:
+            st_chk.close()
+        return {"ok": False, "error": "blocked"}
+
+    res3 = backend.find_best_bypass_for_domain("site3.example", probe_fn=probe_3, dns_roll_fn=fake_dns_roll)
+    assert res3["ok"] is True
+    assert res3["winner"]["layer"] == "vpn"
+    assert res3["winner"]["strategy_id"] == "vpn-select"

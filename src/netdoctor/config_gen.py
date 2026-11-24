@@ -605,7 +605,12 @@ def generate_winws2_config(
         for d in decisions
         if d.layer == "direct" and d.status == "active" and d.domain and d.domain.strip()
     }
-    catchall_excluded_domains = sorted(set(excluded_set) | vpn_hostnames | direct_domains)
+    dns_domains = {
+        d.domain.strip().lower()
+        for d in decisions
+        if d.layer == "dns" and d.status == "active" and d.domain and d.domain.strip()
+    }
+    catchall_excluded_domains = sorted(set(excluded_set) | vpn_hostnames | direct_domains | dns_domains)
     exclude_hostlist_path: Path | None = None
     if catchall_excluded_domains:
         exclude_hostlist_path = lists_path / "exclude_unlocker_domains.txt"
@@ -717,6 +722,15 @@ def generate_winws2_config(
             and not _uses_known_file_blob(s)
         ]
         if tls_candidates:
+            # Prefer clean split/disorder strategies without fake ClientHello first so catch-all
+            # doesn't trigger ERR_SSL_UNRECOGNIZED_NAME_ALERT on ordinary strict servers.
+            tls_candidates.sort(
+                key=lambda s: (
+                    0 if ("fake" not in s.family and "fake" not in s.args_template[0]) else 1,
+                    s.tier,
+                    s.id,
+                )
+            )
             if profile_count > 0:
                 args.append("--new")
             args.extend(

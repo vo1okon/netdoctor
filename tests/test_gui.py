@@ -720,6 +720,8 @@ def test_gui_minsize_layout_no_clipping_and_dns_alert(tmp_path: Path) -> None:
         app.override_layer_var.set("dns")
         app.on_domain_select()
         assert app.override_layer_var.get() == "dns"
+        assert hasattr(app, "on_find_best_bypass_selected")
+        assert "Подобрать лучший" in str(app.best_bypass_btn.cget("text"))
     finally:
         app.on_close()
 

@@ -3223,6 +3223,7 @@ class NetdoctorGuiApp(tk.Tk):
 
         self._domain_menu = tk.Menu(self, tearoff=0, bg=CARD_ALT, fg=FG, activebackground=SELECT_BG, activeforeground="#FFFFFF")
         self._domain_menu.add_command(label="▶ Проверить доступность сейчас", command=self.on_test_selected_domain)
+        self._domain_menu.add_command(label="⚡ Подобрать лучший обход (все слои)", command=self.on_find_best_bypass_selected)
         self._domain_menu.add_command(label="📌 Зафиксировать / Снять фиксацию", command=self.on_toggle_pin_selected)
         self._domain_menu.add_separator()
         self._domain_menu.add_command(label="Подобрать обход DPI", command=self.on_recheck_selected)
@@ -3533,6 +3534,18 @@ class NetdoctorGuiApp(tk.Tk):
         )
         sub_rule_lbl.pack(fill="x", padx=10, pady=(0, 3))
         self._bind_responsive_wrap(sub_rule_lbl, min_wrap=200, pad=20)
+
+        self.best_bypass_btn = self.make_button(
+            right,
+            "⚡ Подобрать лучший (все слои)",
+            self.on_find_best_bypass_selected,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=6,
+            pady=3,
+            tooltip="Принудительно проверит Direct → DPI (разные семейства) → SmartDNS → VPN и выберет лучший рабочий вариант.",
+        )
+        self.best_bypass_btn.pack(fill="x", padx=10, pady=(0, 3))
 
         auto_row = tk.Frame(right, bg=CARD_ALT)
         auto_row.pack(fill="x", padx=10, pady=(0, 4))
@@ -6316,6 +6329,39 @@ class NetdoctorGuiApp(tk.Tk):
             return
         domain = str(self.selected_row["domain"])
         self._diag_domains([domain], f"Автоподбор для {domain}")
+
+    def on_find_best_bypass_selected(self) -> None:
+        if not self.selected_row:
+            self.set_status("Сначала выберите сайт в таблице", WARN_TEXT)
+            return
+        domain = str(self.selected_row["domain"])
+
+        def done(res: dict[str, Any]) -> None:
+            rows = res.get("rows")
+            if isinstance(rows, list):
+                self.populate_domain_table(rows)
+            tried = res.get("tried") or []
+            tried_s = ", ".join(
+                f"{t.get('layer')}/{t.get('strategy_id') or '—'}:{'OK' if t.get('ok') else 'FAIL'}"
+                for t in tried
+            )
+            win = res.get("winner")
+            if win:
+                ms_s = f" ({float(win['latency_ms']):.0f}ms)" if win.get("latency_ms") is not None else ""
+                msg = f"Лучший обход для {domain}: {win['layer']}/{win.get('strategy_id') or '—'}{ms_s}"
+                self.log_console(f"{msg} [{tried_s}]")
+                self.set_status(msg, OK_TEXT)
+            else:
+                msg = f"Не удалось пробить {domain} ни одним слоем"
+                self.log_console(f"{msg} [{tried_s}]")
+                self.set_status(msg, WARN_TEXT)
+            self._after_change()
+
+        self.run_bg(
+            f"Поиск лучшего обхода для {domain}",
+            lambda: self.backend.find_best_bypass_for_domain(domain),
+            done,
+        )
 
     def on_pin(self) -> None:
         if not self.selected_row:

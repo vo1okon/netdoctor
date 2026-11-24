@@ -73,6 +73,7 @@ from netdoctor.probes import (
 )
 from netdoctor.selector import (
     DEFAULT_STRATEGIES,
+    _diverse_fallbacks,
     _ordered_pool,
     evaluate_domains_live_batch,
     live_winws2_strategy_evaluator,
@@ -2070,6 +2071,244 @@ class GuiBackend:
         self.trigger_apply_configs()
         self._reload_running_services(winws2=True, singbox=True)
         return self.get_domain_rows(net_key=net_key)
+
+    def find_best_bypass_for_domain(
+        self,
+        domain: str,
+        *,
+        timeout: float = 3.0,
+        probe_fn: Any | None = None,
+        dns_roll_fn: Any | None = None,
+    ) -> dict[str, Any]:
+        """Force-test across layers (Direct -> diverse DPI families -> SmartDNS -> VPN) and persist the best working rule."""
+        dom = (domain or "").strip().lower()
+        if not dom:
+            raise ValueError("Domain cannot be empty")
+
+        procs = self._collect_processes_state()
+        winws_running = bool((procs.get("winws2") or {}).get("running"))
+        sb_running = bool((procs.get("sing-box") or {}).get("running"))
+        is_adm = _is_admin()
+
+        storage = Storage(self.db_path)
+        try:
+            self._seed_default_strategies(storage)
+            net_key, _, _, _ = self._resolve_network_info(storage)
+            strategies = storage.get_strategies()
+            has_real_vpn = storage.has_usable_vpn()
+            stack_mode = storage.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
+            can_dns = stack_mode != "dpi_only"
+            existing = next(
+                (
+                    d
+                    for d in storage.get_decisions(net_key, active_only=False)
+                    if d.domain.lower() == dom and d.protocol == Protocol.TLS
+                ),
+                None,
+            )
+        finally:
+            storage.close()
+
+        def _test(proxy_url: str | None = None) -> dict[str, Any]:
+            if probe_fn is not None:
+                res = probe_fn(dom, proxy_url=proxy_url, timeout=timeout)
+                if inspect.isawaitable(res):
+                    return dict(_run_coro_sync(res))
+                return dict(res)
+            return dict(_run_coro_sync(probe_domain_connectivity(dom, proxy_url=proxy_url, timeout=timeout)))
+
+        def _save_and_apply(dec: Decision, *, reload_winws: bool = False, reload_sb: bool = False) -> None:
+            st = Storage(self.db_path)
+            try:
+                st.save_decision(dec)
+            finally:
+                st.close()
+            self.trigger_apply_configs()
+            if is_adm:
+                if reload_winws and winws_running:
+                    self.reload_winws2()
+                if reload_sb and sb_running:
+                    self.reload_singbox()
+
+        tried: list[dict[str, Any]] = []
+        winner: Decision | None = None
+        winner_ms: float | None = None
+
+        # Step A: Direct (skip only if already routed through non-direct bypass while stack is running)
+        if not winws_running or existing is None or existing.layer == "direct":
+            res_direct = _test(proxy_url=None)
+            tried.append(
+                {
+                    "layer": "direct",
+                    "strategy_id": None,
+                    "ok": bool(res_direct.get("ok")),
+                    "latency_ms": res_direct.get("latency_ms"),
+                    "error": res_direct.get("error", ""),
+                }
+            )
+            if res_direct.get("ok"):
+                winner_ms = res_direct.get("latency_ms")
+                winner = Decision(
+                    network_key=net_key,
+                    domain=dom,
+                    protocol=Protocol.TLS,
+                    layer="direct",
+                    strategy_id=None,
+                    ttfb_ms=winner_ms,
+                    status="active",
+                    consecutive_fails=0,
+                )
+
+        # Step B: Diverse DPI strategy families
+        tls_pool = [s for s in _ordered_pool(strategies, Protocol.TLS) if s.args_template]
+        if winner is None and tls_pool:
+            diverse_cands: list[Strategy] = []
+            seen_ids: set[str] = set()
+
+            def _pick_first(pred: Any) -> None:
+                for cand in tls_pool:
+                    if cand.id not in seen_ids and pred(cand):
+                        diverse_cands.append(cand)
+                        seen_ids.add(cand.id)
+                        return
+
+            _pick_first(lambda s: s.family == "multisplit" and "fake" not in " ".join(s.args_template).lower())
+            _pick_first(lambda s: s.family == "multidisorder" and "fake" not in " ".join(s.args_template).lower())
+            _pick_first(lambda s: "fakedsplit" in s.family)
+            _pick_first(lambda s: "hostfakesplit" in s.family)
+            for cand in tls_pool:
+                if len(diverse_cands) >= 4:
+                    break
+                if cand.id not in seen_ids:
+                    diverse_cands.append(cand)
+                    seen_ids.add(cand.id)
+
+            for strat in diverse_cands[:4]:
+                cand_dec = Decision(
+                    network_key=net_key,
+                    domain=dom,
+                    protocol=Protocol.TLS,
+                    layer="dpi",
+                    strategy_id=strat.id,
+                    fallback_strategies=_diverse_fallbacks(tls_pool, strat.id, strat.family),
+                    status="active",
+                    consecutive_fails=0,
+                )
+                if winws_running and is_adm:
+                    _save_and_apply(cand_dec, reload_winws=True)
+                    if probe_fn is None:
+                        time.sleep(0.25)
+                res_dpi = _test(proxy_url=None)
+                tried.append(
+                    {
+                        "layer": "dpi",
+                        "strategy_id": strat.id,
+                        "ok": bool(res_dpi.get("ok")),
+                        "latency_ms": res_dpi.get("latency_ms"),
+                        "error": res_dpi.get("error", ""),
+                    }
+                )
+                if res_dpi.get("ok"):
+                    winner_ms = res_dpi.get("latency_ms")
+                    cand_dec.ttfb_ms = winner_ms
+                    winner = cand_dec
+                    break
+
+        # Step C: SmartDNS (when stack is not dpi_only)
+        if winner is None and can_dns:
+            if dns_roll_fn is not None:
+                rolled = dns_roll_fn(dom, net_key)
+                dns_dec = _run_coro_sync(rolled) if inspect.isawaitable(rolled) else rolled
+            else:
+                st_dns = Storage(self.db_path)
+                try:
+                    dns_dec = _run_coro_sync(
+                        self.orchestrator.dns.roll_dns_for_domain(
+                            dom,
+                            network_key=net_key,
+                            storage=st_dns,
+                            timeout=min(timeout, 2.0),
+                        )
+                    )
+                finally:
+                    st_dns.close()
+
+            if (
+                isinstance(dns_dec, Decision)
+                and dns_dec.layer == "dns"
+                and (dns_dec.ttfb_ms is not None or dns_roll_fn is not None)
+            ):
+                _save_and_apply(dns_dec, reload_winws=True, reload_sb=True)
+                res_dns = _test(proxy_url="http://127.0.0.1:2080" if sb_running else None)
+                tried.append(
+                    {
+                        "layer": "dns",
+                        "strategy_id": dns_dec.strategy_id,
+                        "ok": bool(res_dns.get("ok")),
+                        "latency_ms": res_dns.get("latency_ms"),
+                        "error": res_dns.get("error", ""),
+                    }
+                )
+                if res_dns.get("ok"):
+                    winner_ms = res_dns.get("latency_ms")
+                    dns_dec.ttfb_ms = winner_ms if winner_ms is not None else dns_dec.ttfb_ms
+                    winner = dns_dec
+
+        # Step D: VPN (only when usable VPN exists)
+        if winner is None and has_real_vpn:
+            vpn_dec = Decision(
+                network_key=net_key,
+                domain=dom,
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                status="active",
+                consecutive_fails=0,
+            )
+            _save_and_apply(vpn_dec, reload_winws=True, reload_sb=True)
+            res_vpn = _test(proxy_url="http://127.0.0.1:2080" if sb_running else None)
+            tried.append(
+                {
+                    "layer": "vpn",
+                    "strategy_id": "vpn-select",
+                    "ok": bool(res_vpn.get("ok")),
+                    "latency_ms": res_vpn.get("latency_ms"),
+                    "error": res_vpn.get("error", ""),
+                }
+            )
+            if res_vpn.get("ok"):
+                winner_ms = res_vpn.get("latency_ms")
+                vpn_dec.ttfb_ms = winner_ms
+                winner = vpn_dec
+
+        if winner is not None:
+            _save_and_apply(winner, reload_winws=True, reload_sb=(winner.layer in ("dns", "vpn")))
+        elif existing is not None:
+            _save_and_apply(existing, reload_winws=True, reload_sb=(existing.layer in ("dns", "vpn")))
+        elif tls_pool:
+            fb_strat = tls_pool[0]
+            fallback_dec = Decision(
+                network_key=net_key,
+                domain=dom,
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id=fb_strat.id,
+                fallback_strategies=_diverse_fallbacks(tls_pool, fb_strat.id, fb_strat.family),
+                status="degraded",
+            )
+            _save_and_apply(fallback_dec, reload_winws=True)
+
+        return {
+            "ok": winner is not None,
+            "domain": dom,
+            "winner": (
+                {"layer": winner.layer, "strategy_id": winner.strategy_id, "latency_ms": winner_ms}
+                if winner is not None
+                else None
+            ),
+            "tried": tried,
+            "rows": self.get_domain_rows(net_key=net_key),
+        }
 
     def trigger_apply_configs(self, iface: int | None = None) -> dict[str, Any]:
         """Generate winws2 preset, hostlist files, and sing-box config from current DB decisions."""
