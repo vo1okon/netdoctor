@@ -407,11 +407,13 @@ def _is_rdns_ptr_hostname(domain: str | None) -> bool:
 
 
 def _is_telemetry_noise_domain(domain: str | None) -> bool:
-    """Return True for OS telemetry / CRL / OCSP / NCSI / rDNS PTR domains that should stay direct unless failing."""
+    """Return True for OS telemetry / CRL / OCSP / NCSI / rDNS PTR / DNS-infra domains."""
     low = (domain or "").strip().lower().rstrip(".")
     if not low or low == "—":
         return False
     if _is_rdns_ptr_hostname(low):
+        return True
+    if is_dns_infra_domain(low):
         return True
     if low.startswith(("ocsp.", "crl.")):
         return True
@@ -740,6 +742,63 @@ BUILTIN_DNS_CATALOG: list[dict[str, Any]] = [
     _dns("comss_east", "Comss DNS (East)", "212.109.221.20", "Нейросети и игры, резерв East", "ai_bypass", ["DoH"], "https://dns.comss.one/dns-query"),
     _dns("comss_west", "Comss DNS (West)", "141.133.183.77", "Нейросети и игры, резерв West", "ai_bypass", ["DoH"], "https://dns.comss.one/dns-query"),
 ]
+
+_DNS_INFRA_EXPLICIT: tuple[str, ...] = (
+    "dns.google",
+    "dns.google.com",
+    "cloudflare-dns.com",
+    "one.one.one.one",
+    "quad9.net",
+    "adguard-dns.com",
+    "dns.adguard.com",
+    "dns.yandex.net",
+    "doh.opendns.com",
+    "dns.nextdns.io",
+    "dns.comss.one",
+    "dns.malw.link",
+    "dns.bezmezhau.com",
+    "bezmezhau.com",
+    "dns.dns-ai.ru",
+    "dns-ai.ru",
+    "doh.libredns.gr",
+    "dnsforge.de",
+    "dnsdoh.art",
+    "wikimedia-dns.org",
+    "rethinkdns.com",
+    "joindns4.eu",
+    "cleanbrowsing.org",
+    "controld.com",
+    "doh.dns.sb",
+    "dns.gcorelabs.com",
+    "odvr.nic.cz",
+    "canadianshield.cira.ca",
+    "doh.ffmuc.net",
+    "dns.alidns.com",
+    "doh.pub",
+)
+
+
+def _build_dns_infra_domains() -> frozenset[str]:
+    hosts: set[str] = set(_DNS_INFRA_EXPLICIT)
+    for item in BUILTIN_DNS_CATALOG:
+        doh_url = str(item.get("doh_url") or "").strip()
+        if not doh_url:
+            continue
+        parsed_host = (urllib.parse.urlparse(doh_url).hostname or "").strip().lower().rstrip(".")
+        if parsed_host and not _is_ip_literal(parsed_host):
+            hosts.add(parsed_host)
+    return frozenset(hosts)
+
+
+_DNS_INFRA_DOMAINS: frozenset[str] = _build_dns_infra_domains()
+
+
+def is_dns_infra_domain(domain: str | None) -> bool:
+    """Return True for DoH/DNS resolver endpoints that must never be bypassed through themselves."""
+    low = (domain or "").strip().lower().rstrip(".")
+    if not low or low == "—":
+        return False
+    return any(low == h or low.endswith("." + h) for h in _DNS_INFRA_DOMAINS)
 
 
 SERVICE_PRESETS: dict[str, dict[str, Any]] = {

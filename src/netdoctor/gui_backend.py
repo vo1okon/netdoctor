@@ -50,6 +50,7 @@ from netdoctor.orchestrators import (
     _is_external_ip,
     _parse_clash_conn_age_sec,
     build_unlocker_protection_context,
+    is_dns_infra_domain,
 )
 from netdoctor.presets import (
     DEFAULT_EXTERNAL_ZAPRET_DIRS,
@@ -2442,6 +2443,18 @@ class GuiBackend:
                 self._seed_default_strategies(storage)
                 strategies = {s.id: s for s in storage.get_strategies()}
                 net_key, _, _, _ = self._resolve_network_info(storage)
+                stale_dns_infra = [
+                    d
+                    for d in storage.get_decisions(net_key, active_only=False)
+                    if is_dns_infra_domain(d.domain) and not getattr(d, "pinned", False)
+                ]
+                if stale_dns_infra:
+                    with storage.conn:
+                        for d in stale_dns_infra:
+                            storage.conn.execute(
+                                "DELETE FROM decisions WHERE network_key = ? AND domain = ? AND protocol = ?",
+                                (net_key, d.domain, d.protocol.value),
+                            )
                 decisions = storage.get_decisions(net_key, active_only=True)
                 vpn_nodes = [VpnNode(**n) for n in storage.get_all_subscription_nodes()]
                 game_filter = storage.get_setting("game_filter", "0") == "1"

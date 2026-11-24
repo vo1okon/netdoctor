@@ -2404,3 +2404,87 @@ def test_auto_heal_tests_clean_direct_first_for_new_and_broken_dpi_domains(
         st_b.close()
 
 
+def test_dns_infra_domains_ignored_by_noise_filter_and_purged_on_apply(tmp_path: Path) -> None:
+    from netdoctor.orchestrators import _is_telemetry_noise_domain, is_dns_infra_domain
+
+    for dns_dom in (
+        "dns.bezmezhau.com",
+        "dns.dns-ai.ru",
+        "doh.libredns.gr",
+        "dnsforge.de",
+        "dns9.quad9.net",
+        "dns.google.com",
+    ):
+        assert is_dns_infra_domain(dns_dom) is True
+        assert _is_telemetry_noise_domain(dns_dom) is True
+
+    for normal_dom in ("account.ubisoft.com", "youtube.com"):
+        assert is_dns_infra_domain(normal_dom) is False
+        assert _is_telemetry_noise_domain(normal_dom) is False
+
+    db_path = tmp_path / "purge_dns_infra.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    st = Storage(db_path)
+    try:
+        nk = st.upsert_network(NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP"))
+        st.upsert_strategies(DEFAULT_STRATEGIES)
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="dns.bezmezhau.com",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="dns.google.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_alt1_199_fake_fakedsplit",
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="dnsforge.de",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                pinned=True,
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="youtube.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_multisplit_pos2",
+            )
+        )
+    finally:
+        st.close()
+
+    backend.trigger_apply_configs()
+
+    st_after = Storage(db_path)
+    try:
+        remaining = {d.domain for d in st_after.get_decisions(nk, active_only=False)}
+    finally:
+        st_after.close()
+
+    assert "dns.bezmezhau.com" not in remaining
+    assert "dns.google.com" not in remaining
+    assert "dnsforge.de" in remaining
+    assert "youtube.com" in remaining
+
+
