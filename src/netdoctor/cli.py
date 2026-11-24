@@ -14,6 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from netdoctor import __version__
 from netdoctor.classifier import classify_probes
 from netdoctor.config_gen import (
     detect_physical_egress_iface,
@@ -44,14 +45,31 @@ from netdoctor.supervisor import (
     ProcessSupervisor,
     _is_admin,
     fetch_all_bins,
+    get_outdated_pinned_artifacts,
+    get_pinned_binary_versions,
     inspect_supervisor_state,
     stop_persisted_supervisor,
     verify_binaries,
 )
-from netdoctor.vpn import fetch_subscription, refresh_all_subscriptions
+from netdoctor.updater import apply_app_update, check_for_updates
+from netdoctor.vpn import fetch_subscription, has_usable_vpn_nodes, refresh_all_subscriptions
 
 app = typer.Typer(help="netdoctor: adaptive censorship circumvention orchestrator")
 console = Console()
+
+
+@app.callback(invoke_without_command=True)
+def main_callback(
+    ctx: typer.Context,
+    version: bool = typer.Option(False, "--version", "-V", is_eager=True, help="Show netdoctor version and exit"),
+) -> None:
+    """Root CLI callback supporting `--version`."""
+    if version:
+        typer.echo(f"netdoctor {__version__}")
+        raise typer.Exit(code=0)
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(code=0)
 
 
 @app.command("diag")
@@ -104,6 +122,7 @@ def cmd_diag(
         try:
             net_key = storage.upsert_network(net)
             storage.upsert_strategies(DEFAULT_STRATEGIES)
+            vpn_available = storage.has_usable_vpn()
 
             probes_list = await asyncio.gather(
                 *(run_domain_probes(target_dom, timeout=timeout) for target_dom in target_domains)
@@ -131,6 +150,7 @@ def cmd_diag(
                         protocol=Protocol.TLS,
                         evaluator=eval_fn,
                         early_stop=True,
+                        vpn_available=vpn_available,
                     )
                 }
             else:
@@ -139,6 +159,7 @@ def cmd_diag(
                     network_key=net_key,
                     candidates=DEFAULT_STRATEGIES,
                     use_live_eval=can_live_eval,
+                    vpn_available=vpn_available,
                 )
 
             quic_tasks = []
@@ -161,6 +182,7 @@ def cmd_diag(
                             protocol=Protocol.QUIC,
                             evaluator=eval_fn if len(target_domains) == 1 else None,
                             early_stop=True,
+                            vpn_available=vpn_available,
                         )
                     )
 
@@ -307,6 +329,7 @@ def cmd_apply(
         raw_nodes = storage.get_all_subscription_nodes()
         vpn_nodes = [VpnNode(**n) for n in raw_nodes]
         game_filter = storage.get_setting("game_filter", "0") == "1"
+        stack_mode = storage.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
         dns_orch = DnsLayerOrchestrator()
         active_dns = dns_orch.get_active_dns(storage)
         dns_catalog_map = {s["id"]: s for s in dns_orch.get_all_dns_servers(storage)}
@@ -376,9 +399,16 @@ def cmd_apply(
     doh_path = (parsed_doh.path or "/dns-query") if parsed_doh else "/dns-query"
     doh_tls_sni = parsed_doh.hostname if (parsed_doh and parsed_doh.hostname) else None
 
+    has_real_vpn = stack_mode != "dpi_only" and has_usable_vpn_nodes(vpn_nodes)
+    singbox_decisions = (
+        decisions
+        if has_real_vpn
+        else [d for d in decisions if not (d.layer == "vpn" and not getattr(d, "pinned", False))]
+    )
+
     singbox_file = cfg_path / "sing-box.json"
     generate_singbox_config(
-        decisions=decisions,
+        decisions=singbox_decisions,
         vpn_nodes=vpn_nodes,
         output_path=singbox_file,
         doh_server=str(active_dns.get("ip") or doh_tls_sni or "1.1.1.1"),
@@ -587,6 +617,71 @@ def cmd_fetch_bins(
     if not report["ok"]:
         console.print("[red]One or more dependencies failed verification.[/red]")
         raise typer.Exit(code=1)
+
+
+@app.command("update")
+def cmd_update(
+    check: bool = typer.Option(False, "--check", help="Only check for application and pinned binary updates"),
+    force: bool = typer.Option(False, "--force", help="Force update check and apply even if version matches"),
+    db_path: str = typer.Option("netdoctor.db", "--db", help="Path to SQLite database"),
+    bin_dir: str = typer.Option("bin", "--bin-dir", help="Directory containing external binaries"),
+    lists_dir: str = typer.Option("lists", "--lists-dir", help="Directory containing domain and IP lists"),
+) -> None:
+    """Check for netdoctor updates via GitHub Releases and apply 1-click update + binary sync."""
+    storage = Storage(db_path)
+    try:
+        info = asyncio.run(check_for_updates(storage=storage, force=force or not check))
+        console.print(f"[bold]netdoctor[/bold] v{info.get('current_version')} (mode={info.get('install_mode')})")
+        if info.get("ok"):
+            if info.get("update_available"):
+                console.print(
+                    f"[yellow]Доступно обновление: v{info['latest_version']} ({info['release_url']})[/yellow]"
+                )
+            else:
+                console.print(f"[green]Установлена актуальная версия (latest: v{info.get('latest_version')}).[/green]")
+        else:
+            console.print(f"[red]Ошибка проверки обновлений: {info.get('error')}[/red]")
+
+        pinned = get_pinned_binary_versions()
+        outdated = get_outdated_pinned_artifacts(Path(bin_dir))
+        bin_table = Table(title="Pinned Binary Versions")
+        bin_table.add_column("Component")
+        bin_table.add_column("Pinned Tag")
+        bin_table.add_column("Local Status")
+        for comp, tag in pinned.items():
+            if comp in outdated:
+                inst = outdated[comp].get("installed") or "unknown"
+                status = f"[yellow]outdated ({inst})[/yellow]"
+            else:
+                status = "[green]aligned[/green]"
+            bin_table.add_row(comp, tag, status)
+        console.print(bin_table)
+
+        if check:
+            if not info.get("ok"):
+                raise typer.Exit(code=1)
+            return
+
+        if info.get("update_available") or force:
+            res = asyncio.run(
+                apply_app_update(
+                    bin_dir=Path(bin_dir),
+                    lists_dir=Path(lists_dir),
+                    storage=storage,
+                    download_url=info.get("download_url") or None,
+                    target_version=info.get("latest_version") or None,
+                )
+            )
+            if not res.get("ok"):
+                console.print(f"[red]Ошибка обновления: {res.get('error')}[/red]")
+                raise typer.Exit(code=1)
+            console.print(f"[green]{res.get('detail', 'Обновление завершено')}[/green]")
+        elif not info.get("ok"):
+            raise typer.Exit(code=1)
+        else:
+            console.print("[green]Уже установлена актуальная версия.[/green]")
+    finally:
+        storage.close()
 
 
 @app.command("status")

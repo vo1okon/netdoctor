@@ -58,16 +58,32 @@ if "%VENV_OK%"=="0" (
     ) else (
         echo [1/4] Создание виртуального окружения ^(.venv^)...
     )
-    "%PY_EXE%" -m venv .venv
+    "%PY_EXE%" -m venv --system-site-packages .venv
     if errorlevel 1 goto :fail
 ) else (
     echo [1/4] Виртуальное окружение .venv уже готово — пропуск.
 )
 
-echo [2/4] Установка Python-зависимостей...
-".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install -e .
-if errorlevel 1 goto :fail
+set "DEPS_OK=0"
+if exist ".venv\Scripts\netdoctor.exe" if exist ".venv\Scripts\netdoctor-gui.exe" (
+    ".venv\Scripts\python.exe" -c "import importlib.metadata as m, pathlib, re, sys, tomllib; d=tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']; pkgs=[re.split(r'[<>=!~;\[\s]',x,1)[0] for x in d['dependencies']]+['h2','socksio']; sys.exit(0 if m.version('netdoctor')==d['version'] and all(m.version(p) for p in pkgs) else 1)" >nul 2>&1
+    if not errorlevel 1 set "DEPS_OK=1"
+)
+
+if "%DEPS_OK%"=="1" (
+    echo [2/4] Python-зависимости уже установлены — пропуск.
+) else (
+    echo [2/4] Установка Python-зависимостей...
+    ".venv\Scripts\python.exe" -c "import importlib.metadata as m, sys; sys.exit(0 if int(m.version('pip').split('.')[0]) >= 22 else 1)" >nul 2>&1
+    if errorlevel 1 ".venv\Scripts\python.exe" -m pip install --upgrade pip
+    ".venv\Scripts\python.exe" -c "import importlib.metadata as m, sys; sys.exit(0 if int(m.version('setuptools').split('.')[0]) >= 68 else 1)" >nul 2>&1
+    if not errorlevel 1 (
+        ".venv\Scripts\python.exe" -m pip install -e . --no-build-isolation
+    ) else (
+        ".venv\Scripts\python.exe" -m pip install -e .
+    )
+    if errorlevel 1 goto :fail
+)
 
 echo.
 echo [3/4] Скачивание и проверка внешних компонентов ^(bin/^)...

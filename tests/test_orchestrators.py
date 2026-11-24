@@ -16,6 +16,7 @@ import pytest
 
 import netdoctor.gui_backend as backend_mod
 import netdoctor.orchestrators as orch_mod
+from netdoctor.classifier import classify_probes
 from netdoctor.gui import NetdoctorGuiApp
 from netdoctor.gui_backend import GuiBackend
 from netdoctor.models import (
@@ -1523,5 +1524,65 @@ def test_auto_heal_self_probe_guard_and_singbox_log_edge_cases(
         dec = next(d for d in st.get_decisions(net_key) if d.domain == "discord.com")
         assert dec.layer == "dpi"
         assert dec.strategy_id == "tls_multisplit_pos2"
+    finally:
+        st.close()
+
+
+def test_realtime_ip_map_ignores_shared_cdn_and_stub_verdict_ips(tmp_path: Path) -> None:
+    db_path = tmp_path / "cdn_ip_map.db"
+    _seed_db(db_path)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    st = Storage(db_path)
+    try:
+        net = NetworkFingerprint(asn=12389, kind=NetworkKind.HOME)
+        net_key = st.upsert_network(net)
+
+        def _save(domain: str, doh_ips: list[str], sys_ips: list[str], target_ip: str, sys_status: str = "ok") -> None:
+            probes = ProbesSummary(
+                dns=DnsProbeResult(system=sys_status, doh="ok", system_ips=sys_ips, doh_ips=doh_ips),
+                tcp=TcpProbeResult(result="ok", target_ip=target_ip),
+                tls=TlsProbeResult(real_sni="ok", neutral_sni="ok"),
+                stall=StallProbeResult(result="ok"),
+                quic=QuicProbeResult(result="timeout"),
+            )
+            st.save_verdict(net_key, classify_probes(domain, probes, net), protocol=Protocol.TLS)
+
+        # Shared Cloudflare IPs + ISP stub IP (143.20.64.55) from historical rutracker verdict
+        _save("rutracker.org", ["104.21.32.39", "172.67.182.196"], ["143.20.64.55"], "172.67.182.196")
+        # Ambiguous non-CDN IP shared across 2 distinct domains
+        _save("alpha.example", ["203.0.113.10"], ["203.0.113.10"], "203.0.113.10")
+        _save("beta.example", ["203.0.113.10"], ["203.0.113.10"], "203.0.113.10")
+        # Unique dedicated non-CDN IP
+        _save("unique.example", ["203.0.113.55"], ["203.0.113.55"], "203.0.113.55")
+
+        mon = RealtimeConnectionMonitor()
+
+        class _LiveClash:
+            def __init__(self, active: bool) -> None:
+                self.active = active
+
+            def get_connections_sync(self) -> dict[str, Any]:
+                if not self.active:
+                    return {"connections": []}
+                return {
+                    "connections": [
+                        {"metadata": {"host": "example.com", "destinationIP": "104.21.32.39"}},
+                    ]
+                }
+
+        # Tick 1: Live Clash attributes 104.21.32.39 -> example.com; stub & ambiguous IPs ignored; unique IP kept
+        mon.update_ip_map_from_storage_and_logs(st, logs_dir, clash_client=_LiveClash(True))  # type: ignore[arg-type]
+        assert "172.67.182.196" not in mon.ip_to_domain
+        assert "143.20.64.55" not in mon.ip_to_domain
+        assert "203.0.113.10" not in mon.ip_to_domain
+        assert mon.ip_to_domain["203.0.113.55"] == "unique.example"
+        assert mon.ip_to_domain["104.21.32.39"] == "example.com"
+
+        # Tick 2: Once Clash flow disappears, shared CDN IP is purged and never falls back to rutracker.org
+        mon.update_ip_map_from_storage_and_logs(st, logs_dir, clash_client=_LiveClash(False))  # type: ignore[arg-type]
+        assert "104.21.32.39" not in mon.ip_to_domain
+        assert mon.ip_to_domain["203.0.113.55"] == "unique.example"
     finally:
         st.close()

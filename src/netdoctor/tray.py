@@ -477,6 +477,8 @@ def build_autostart_command(
     lists_dir: str | Path = "lists",
     logs_dir: str | Path = "logs",
     bin_dir: str | Path = "bin",
+    *,
+    auto_start_protection: bool = True,
 ) -> str:
     """Build a safely quoted Task Scheduler command line launching the minimized GUI (kept <= 261 chars for schtasks /TR)."""
     base_dir = Path(working_dir).expanduser().resolve()
@@ -498,10 +500,10 @@ def build_autostart_command(
             "netdoctor.cli",
             "gui",
             "--minimized",
-            "--auto-start",
-            "--db",
-            _quote_win_path(fmt(resolved_db)),
         ]
+        if auto_start_protection:
+            p.append("--auto-start")
+        p.extend(["--db", _quote_win_path(fmt(resolved_db))])
         for flag, val, def_name in (
             ("--configs-dir", resolved_configs, "configs"),
             ("--lists-dir", resolved_lists, "lists"),
@@ -607,6 +609,7 @@ def set_autostart_enabled(
                 return {
                     "ok": True,
                     "enabled": True,
+                    "auto_start_protection": bool(path_kwargs.get("auto_start_protection", True)),
                     "task_name": task_name,
                     "run_level": run_level,
                     "command": cmd,

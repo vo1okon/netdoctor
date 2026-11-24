@@ -972,3 +972,257 @@ def test_subprocess_calls_use_create_no_window(
     flush_res = backend.flush_windows_dns_cache()
     assert flush_res["ok"] is True
     assert run_flags and (run_flags[0] & no_win) == no_win
+
+
+def test_autostart_command_and_backend_auto_start_protection_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from netdoctor.tray import build_autostart_command
+
+    db_path = tmp_path / "autostart.db"
+    cmd_with_prot = build_autostart_command(tmp_path, db_path=db_path, auto_start_protection=True)
+    cmd_app_only = build_autostart_command(tmp_path, db_path=db_path, auto_start_protection=False)
+    assert "--minimized" in cmd_with_prot and "--auto-start" in cmd_with_prot
+    assert "--minimized" in cmd_app_only and "--auto-start" not in cmd_app_only
+
+    recorded_calls: list[dict[str, Any]] = []
+    autostart_active = {"enabled": False}
+
+    def fake_set_autostart(**kwargs: Any) -> dict[str, Any]:
+        recorded_calls.append(dict(kwargs))
+        autostart_active["enabled"] = bool(kwargs.get("enabled"))
+        return {
+            "ok": True,
+            "enabled": autostart_active["enabled"],
+            "auto_start_protection": bool(kwargs.get("auto_start_protection", True)),
+        }
+
+    monkeypatch.setattr(backend_mod, "tray_set_autostart_enabled", fake_set_autostart)
+    monkeypatch.setattr(
+        backend_mod,
+        "tray_get_autostart_status",
+        lambda: {"enabled": autostart_active["enabled"], "task_name": "NetdoctorAutostart"},
+    )
+
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+
+    assert backend.get_auto_start_protection() is False
+    # First-time autostart enable defaults auto_start_protection=True and uses db_path.parent as working_dir
+    res_on = backend.set_autostart(True)
+    assert res_on["ok"] is True
+    assert res_on["enabled"] is True
+    assert res_on["auto_start_protection"] is True
+    assert backend.get_auto_start_protection() is True
+    assert recorded_calls[-1]["working_dir"] == tmp_path.resolve()
+    assert recorded_calls[-1]["auto_start_protection"] is True
+
+    # Turning off auto_start_protection persists "0" and updates active scheduled task
+    res_prot_off = backend.set_auto_start_protection(False)
+    assert res_prot_off["ok"] is True
+    assert res_prot_off["auto_start_protection"] is False
+    assert res_prot_off["autostart_updated"] is True
+    assert recorded_calls[-1]["auto_start_protection"] is False
+    assert backend.get_autostart_status()["auto_start_protection"] is False
+    assert backend.get_status_snapshot()["auto_start_protection"] is False
+
+
+def test_gui_autostart_and_protection_controls_and_startup_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = GuiBackend(
+        db_path=tmp_path / "gui_as.db",
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    try:
+        app = NetdoctorGuiApp(backend=backend, auto_start=False, enable_tray=False)
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+
+    try:
+        assert app.autostart_var.get() is False
+        assert app.autostart_protection_var.get() is False
+
+        app.apply_snapshot({"auto_start_protection": True})
+        assert app.autostart_protection_var.get() is True
+
+        app._select_tab(app.tab_service)
+        app.update_idletasks()
+        app.update()
+        assert app.tab_service.winfo_reqheight() <= app.tab_service.winfo_height() + 5
+
+        start_calls: list[str] = []
+        monkeypatch.setattr(gui_mod, "_is_admin", lambda: True)
+        monkeypatch.setattr(app, "on_start", lambda: start_calls.append("start"))
+        monkeypatch.setattr(backend, "_collect_processes_state", lambda: {"winws2": {"running": False}})
+
+        # Disabled -> does not trigger start
+        backend.set_auto_start_protection(False)
+        app._auto_start_stack = False
+        app._maybe_auto_start_protection()
+        assert start_calls == []
+
+        # Enabled -> triggers start when winws2 is idle
+        backend.set_auto_start_protection(True)
+        app._maybe_auto_start_protection()
+        assert start_calls == ["start"]
+
+        # Already running -> skips duplicate start
+        monkeypatch.setattr(backend, "_collect_processes_state", lambda: {"winws2": {"running": True}})
+        app._maybe_auto_start_protection()
+        assert start_calls == ["start"]
+    finally:
+        app.on_close()
+
+
+def test_gui_redesign_widgets_tooltips_and_deduplication(tmp_path: Path) -> None:
+    assert gui_mod.lerp_hex("#000000", "#ffffff", 0.0) == "#000000"
+    assert gui_mod.lerp_hex("#000000", "#ffffff", 1.0) == "#ffffff"
+    assert gui_mod.lerp_hex("#000000", "#fe00fe", 0.5) == "#7f007f"
+    assert gui_mod.lerp_hex("invalid", "#123456", 0.5) == "#123456"
+
+    db_path = tmp_path / "redesign_ui.db"
+    _seed_sample_db(db_path)
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+
+    try:
+        app = NetdoctorGuiApp(backend=backend, auto_start=False, enable_tray=False)
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+
+    try:
+        app.geometry("1280x840+40+40")
+        app.attributes("-alpha", 0.0)
+        app.deiconify()
+        app.update_idletasks()
+        app.update()
+
+        # Hero power CTA must live inside tab_home (not duplicated in global header)
+        cur = app.autopilot_btn.master
+        ancestors = []
+        while cur is not None:
+            ancestors.append(cur)
+            cur = cur.master
+        assert app.tab_home in ancestors
+
+        # Tooltips attached across primary & secondary controls; singleton prevents stacking
+        assert len(app._tooltips) >= 25
+        distinct_tips: list[gui_mod.HoverTooltip] = []
+        seen_tip_keys: set[tuple[str, str | None]] = set()
+        for t in app._tooltips:
+            key = (t.text, t.title)
+            if key not in seen_tip_keys and t.text:
+                seen_tip_keys.add(key)
+                distinct_tips.append(t)
+            if len(distinct_tips) >= 2:
+                break
+        assert len(distinct_tips) == 2
+        tip1, tip2 = distinct_tips[0], distinct_tips[1]
+        tip1.show()
+        assert tip1._win is not None and gui_mod.HoverTooltip._active is tip1
+        tip2.show()
+        assert tip1._win is None and tip2._win is not None and gui_mod.HoverTooltip._active is tip2
+        tip2.hide()
+        assert gui_mod.HoverTooltip._active is None
+
+        # Zero legacy square tk.Checkbutton widgets remain (all replaced with AnimatedToggle sliders)
+        def _count_checkbuttons(w: tk.Misc) -> int:
+            cnt = 1 if isinstance(w, tk.Checkbutton) else 0
+            for ch in w.winfo_children():
+                cnt += _count_checkbuttons(ch)
+            return cnt
+
+        def _count_toggles(w: tk.Misc) -> int:
+            cnt = 1 if isinstance(w, gui_mod.AnimatedToggle) else 0
+            for ch in w.winfo_children():
+                cnt += _count_toggles(ch)
+            return cnt
+
+        assert _count_checkbuttons(app) == 0
+        assert _count_toggles(app) >= 9
+
+        # Startup activity animation & spinner tick run before initial snapshot and restore afterwards
+        assert app._initial_loaded is False
+        assert app.activity_bar._active is True
+        app._pulse_tick()
+        assert "ЗАГРУЗКА" in str(app.hero_state_pill.cget("text"))
+
+        # AnimatedToggle syncs cleanly with BooleanVar
+        calls: list[bool] = []
+        var = tk.BooleanVar(value=False)
+        tog = gui_mod.AnimatedToggle(app.tab_home, variable=var, command=lambda: calls.append(var.get()))
+        tog._on_click()
+        assert var.get() is True and calls == [True]
+        var.set(False)
+        assert tog._progress == 0.0
+        tog.destroy()
+
+        # LiveSparklineCanvas records samples & renders geometry
+        app.sparkline_canvas.push_sample(8, 5)
+        app.sparkline_canvas.push_sample(12, 9)
+        assert len(app.sparkline_canvas.find_all()) >= 6
+
+        # Home collapsible extra drawer toggles cleanly
+        assert app._extra_visible is False
+        app._toggle_home_extra()
+        assert app._extra_visible is True
+        assert bool(app._home_extra_frame.winfo_manager()) is True
+        app._toggle_home_extra()
+        assert app._extra_visible is False
+
+        # Pin vs Unpin buttons never share identical labels; no hardcoded dev path on Presets tab
+        app.apply_snapshot(backend.get_status_snapshot())
+        assert app._initial_loaded is True
+        assert app.activity_bar._active is False
+        app._power_transition = "starting"
+        app._pulse_tick()
+        assert "ЗАПУСК ЗАЩИТЫ" in str(app.autopilot_btn.cget("text"))
+        app._power_transition = None
+        app.apply_snapshot(backend.get_status_snapshot())
+        app.domain_tree.selection_set("discord.com|tls")
+        app.on_domain_select()
+        assert app.pin_btn.cget("text") != app.unpin_btn.cget("text")
+
+        def _collect_texts(root_w: tk.Misc) -> list[str]:
+            texts: list[str] = []
+            for ch in root_w.winfo_children():
+                try:
+                    t = str(ch.cget("text"))
+                    if t:
+                        texts.append(t)
+                except tk.TclError:
+                    pass
+                texts.extend(_collect_texts(ch))
+            return texts
+
+        presets_texts = " ".join(_collect_texts(app.tab_presets))
+        assert "C:\\vso\\Dev" not in presets_texts
+
+        # No duplicate button labels on Home, VPN, or Service tabs
+        for tab_widget in (app.tab_home, app.tab_vpn, app.tab_service):
+            btn_texts: list[str] = []
+
+            def _collect_buttons(w: tk.Misc) -> None:
+                for ch in w.winfo_children():
+                    if isinstance(ch, (tk.Button, gui_mod.RoundedButton)):
+                        btn_texts.append(str(ch.cget("text")))
+                    _collect_buttons(ch)
+
+            _collect_buttons(tab_widget)
+            assert len(btn_texts) == len(set(btn_texts)), f"Duplicate buttons in {tab_widget}: {btn_texts}"
+    finally:
+        app.on_close()

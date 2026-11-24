@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 import gc
 import json
+import math
 import os
 import queue
 import re
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 import traceback
 import webbrowser
 from datetime import datetime
@@ -19,6 +22,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
+from netdoctor import __version__
 from netdoctor.gui_backend import GuiBackend, elevate_gui
 from netdoctor.supervisor import _is_admin
 from netdoctor.vpn import is_auto_select_node, is_placeholder_node
@@ -30,54 +34,61 @@ from netdoctor.tray import (
 )
 
 # --------------------------------------------------------------------------------------
-# Design Tokens (Midnight Slate / Fluent Dark)
+# Design Tokens (ZAPRET UI — Soft Deep Obsidian Indigo, Electric Cyan & Periwinkle Lavender)
 # --------------------------------------------------------------------------------------
 
-BG = "#0B0F17"
-SIDEBAR_BG = "#0F1520"
-CARD = "#141C2B"
-CARD_ALT = "#192336"
-CARD_ACTIVE = "#182840"
-INFO_BG = "#112236"
-INPUT = "#1B2538"
-INPUT_HOVER = "#24314A"
-BORDER = "#24314A"
-BORDER_LIGHT = "#314263"
+BG = "#090A14"
+SIDEBAR_BG = "#0D0F1D"
+HEADER_BG = "#0B0D19"
+CARD = "#121528"
+CARD_ALT = "#171B32"
+CARD_ACTIVE = "#152238"
+INFO_BG = "#13263A"
+INPUT = "#181C34"
+INPUT_HOVER = "#212747"
+BORDER = "#252B4A"
+BORDER_LIGHT = "#353E6B"
+CYAN_BORDER = "#22B8CF"
 
-FG = "#F1F5F9"
-FG_SOFT = "#CBD5E1"
-MUTED = "#8A99B0"
-DIM = "#5E6E85"
+FG = "#F4F6FF"
+FG_SOFT = "#C9D1EC"
+MUTED = "#8590B3"
+DIM = "#566080"
 
-ACCENT = "#38BDF8"
-PRIMARY_BG = "#0284C7"
-PRIMARY_HOVER = "#0EA5E9"
-SELECT_BG = "#1E3A5F"
+ACCENT = "#38E2F7"
+LAVENDER = "#B69DF8"
+LAVENDER_HOVER = "#C9B6FA"
+LAVENDER_DARK = "#0D0F1E"
+PILL_ACTIVE_BG = "#32295E"
+PILL_ACTIVE_BORDER = "#8B74E8"
+PRIMARY_BG = "#352B66"
+PRIMARY_HOVER = "#453882"
+SELECT_BG = "#2C2654"
 
-OK = "#22C55E"
-OK_TEXT = "#4ADE80"
-OK_BG = "#112A20"
-OK_BTN = "#16A34A"
-OK_BTN_HOVER = "#22C55E"
+OK = "#22D3EE"
+OK_TEXT = "#38E2F7"
+OK_BG = "#102837"
+OK_BTN = "#1599B2"
+OK_BTN_HOVER = "#22B8CF"
 
 WARN = "#F59E0B"
 WARN_TEXT = "#FBBF24"
-WARN_BG = "#2A2010"
+WARN_BG = "#291F12"
 WARN_BTN = "#D97706"
 WARN_BTN_HOVER = "#F59E0B"
 
-ERR = "#EF4444"
-ERR_TEXT = "#F87171"
-ERR_BG = "#2D1519"
-ERR_BTN = "#DC2626"
-ERR_BTN_HOVER = "#EF4444"
+ERR = "#F43F5E"
+ERR_TEXT = "#FB7185"
+ERR_BG = "#281320"
+ERR_BTN = "#4C182B"
+ERR_BTN_HOVER = "#6D213C"
 
-PURPLE = "#A78BFA"
-PURPLE_BG = "#211A38"
+PURPLE = "#B69DF8"
+PURPLE_BG = "#221C3E"
 
 FONT_UI = ("Segoe UI", 10)
 FONT_UI_B = ("Segoe UI", 10, "bold")
-FONT_HERO = ("Segoe UI", 13, "bold")
+FONT_HERO = ("Segoe UI", 14, "bold")
 FONT_H2 = ("Segoe UI", 11, "bold")
 FONT_SMALL = ("Segoe UI", 9)
 FONT_SMALL_B = ("Segoe UI", 9, "bold")
@@ -89,68 +100,69 @@ FONT_MONO_S = ("Consolas", 9)
 LAYER_FILTERS = ("ALL", "dpi", "vpn", "dns", "direct")
 LAYER_FILTER_LABELS: dict[str, str] = {
     "ALL": "Все",
-    "dpi": "DPI",
-    "dns": "DNS",
-    "vpn": "VPN",
+    "dpi": "Обход DPI",
+    "dns": "Свой DNS",
+    "vpn": "Через VPN",
     "direct": "Напрямую",
 }
 OVERRIDE_LAYERS = ("dpi", "vpn", "dns", "direct")
 OVERRIDE_LAYER_HINTS: dict[str, str] = {
-    "dpi": "Быстрый обход через winws2 на полной скорости без VPN.",
-    "dns": "Направить сайт через выбранный персональный DNS-резолвер.",
-    "vpn": "Пустить сайт через защищённый VPN-туннель sing-box.",
-    "direct": "Открывать напрямую без обхода и без VPN.",
+    "dpi": "Быстрый обход блокировок на полной скорости интернета без VPN.",
+    "dns": "Открывать сайт через персональный защищённый DNS-сервер.",
+    "vpn": "Направить сайт через защищённый VPN-туннель (для блокировок по IP).",
+    "direct": "Открывать сайт напрямую без обхода и без VPN.",
 }
 
 LOG_FILES = ("winws2.log", "sing-box.log", "tg-ws-proxy.log")
-VPN_MODE_AUTO_LABEL = "Автовыбор (внутри VPN)"
+VPN_MODE_AUTO_LABEL = "Автовыбор лучшего сервера"
 VPN_MODE_PRIORITY_LABEL = "Приоритетный сервер"
-PROCESS_LEDS: tuple[tuple[str, str], ...] = (
-    ("winws2", "winws2.exe"),
-    ("sing-box", "sing-box.exe"),
-    ("tg-ws-proxy", "tg-ws-proxy"),
+PROCESS_LEDS: tuple[tuple[str, str, str], ...] = (
+    ("winws2", "DPI", "Модуль обхода блокировок (winws2.exe)"),
+    ("sing-box", "VPN", "Модуль точечного VPN и защищённого DNS (sing-box.exe)"),
+    ("tg-ws-proxy", "TG", "Локальный MTProto-прокси для Telegram Desktop (tg-ws-proxy)"),
 )
 
 DOMAIN_COLUMNS: tuple[tuple[str, str, int, str], ...] = (
     ("domain", "Сайт / Домен", 190, "w"),
     ("protocol", "Прот.", 62, "center"),
-    ("verdicts", "Причина блокировки", 135, "w"),
-    ("layer", "Слой", 64, "center"),
-    ("strategy", "Подобранная стратегия", 175, "w"),
-    ("test", "Тест", 88, "center"),
-    ("success", "Успех %", 92, "center"),
-    ("sockets", "Сокеты", 78, "center"),
-    ("fallback", "Запасные", 120, "w"),
-    ("ttfb", "Пинг (ms)", 74, "e"),
+    ("verdicts", "Причина блокировки", 145, "w"),
+    ("layer", "Способ", 68, "center"),
+    ("strategy", "Выбранное правило", 175, "w"),
+    ("test", "Проверка", 90, "center"),
+    ("success", "Стабильность", 95, "center"),
+    ("sockets", "Подкл.", 76, "center"),
+    ("fallback", "Резервные варианты", 125, "w"),
+    ("ttfb", "Отклик (мс)", 78, "e"),
     ("updated", "Обновлено", 108, "center"),
 )
 
 PRESET_COLUMNS: tuple[tuple[str, str, int, str], ...] = (
-    ("name", "Название пресета", 250, "w"),
+    ("name", "Название стратегии / пресета", 250, "w"),
     ("source", "Источник", 105, "center"),
     ("status", "Статус", 115, "center"),
-    ("success", "Успех %", 90, "center"),
+    ("success", "Стабильность", 95, "center"),
     ("description", "Описание", 300, "w"),
 )
 
 CONN_COLUMNS: tuple[tuple[str, str, int, str], ...] = (
     ("process", "Приложение", 145, "w"),
     ("domain", "Сайт / Домен", 205, "w"),
-    ("remote", "IP:Порт", 150, "w"),
+    ("remote", "Удалённый адрес", 150, "w"),
     ("protocol", "Протокол", 74, "center"),
-    ("socket", "Сокет", 95, "center"),
-    ("layer", "Слой", 72, "center"),
-    ("strategy", "Стратегия", 185, "w"),
-    ("health", "Состояние", 145, "center"),
+    ("socket", "Состояние сети", 105, "center"),
+    ("layer", "Маршрут", 76, "center"),
+    ("strategy", "Правило обхода", 185, "w"),
+    ("health", "Статус защиты", 145, "center"),
 )
 
-SERVICE_ACTIONS: tuple[tuple[str, str], ...] = (
-    ("layers", "Замерить задержку всех слоёв"),
-    ("reload", "Перезагрузить winws2 (Hot-Reload)"),
-    ("reload_sb", "Перезагрузить sing-box"),
-    ("reval", "Проверить решения (Канарейка)"),
-    ("gen", "Пересобрать конфиги"),
-    ("verify", "Проверить и докачать компоненты"),
+SERVICE_ACTIONS: tuple[tuple[str, str, str], ...] = (
+    ("layers", "Проверить задержку модулей", "Измеряет время отклика DNS, DPI и VPN-серверов."),
+    ("reload", "Перезапустить обход (winws2)", "Применяет новые правила DPI без остановки всей защиты."),
+    ("reload_sb", "Перезапустить VPN (sing-box)", "Обновляет конфигурацию VPN-туннеля и DNS."),
+    ("reval", "Проверить рабочие правила", "Тестирует уже сохранённые стратегии и переключает сбойные на резерв."),
+    ("gen", "Обновить файлы конфигов", "Пересобирает конфиги и списки доменов из базы данных."),
+    ("flush_dns", "Очистить DNS-кэш Windows", "Сбрасывает устаревшие системные записи DNS (ipconfig /flushdns)."),
+    ("verify", "Проверить и докачать файлы", "Проверяет целостность рабочих модулей обхода и скачивает недостающие."),
 )
 
 VERDICT_EXPLANATIONS: dict[str, str] = {
@@ -371,6 +383,769 @@ def format_probe_lines(probes: dict[str, Any]) -> list[tuple[str, str, str]]:
 
 
 # --------------------------------------------------------------------------------------
+# Animation Helpers & Custom Widgets (Tooltips, Animated Toggles, Sparkline Chart)
+# --------------------------------------------------------------------------------------
+
+
+def lerp_hex(c1: str, c2: str, t: float) -> str:
+    """Linearly interpolate between two ``#RRGGBB`` colors (clamped ``t`` in 0..1)."""
+    t = max(0.0, min(1.0, float(t)))
+    try:
+        s1 = c1.lstrip("#")
+        s2 = c2.lstrip("#")
+        r1, g1, b1 = int(s1[0:2], 16), int(s1[2:4], 16), int(s1[4:6], 16)
+        r2, g2, b2 = int(s2[0:2], 16), int(s2[2:4], 16), int(s2[4:6], 16)
+    except (ValueError, IndexError, TypeError):
+        return c2
+    r = round(r1 + (r2 - r1) * t)
+    g = round(g1 + (g2 - g1) * t)
+    b = round(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def draw_rounded_rect(
+    canvas: tk.Canvas,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    r: float,
+    **kwargs: Any,
+) -> int:
+    """Draw a smooth rounded rectangle on a Tk ``Canvas``."""
+    r = max(0.0, min(float(r), (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    pts = (
+        x1 + r, y1,
+        x1 + r, y1,
+        x2 - r, y1,
+        x2 - r, y1,
+        x2, y1,
+        x2, y1 + r,
+        x2, y1 + r,
+        x2, y2 - r,
+        x2, y2 - r,
+        x2, y2,
+        x2 - r, y2,
+        x2 - r, y2,
+        x1 + r, y2,
+        x1 + r, y2,
+        x1, y2,
+        x1, y2 - r,
+        x1, y2 - r,
+        x1, y1 + r,
+        x1, y1 + r,
+        x1, y1,
+    )
+    return canvas.create_polygon(pts, smooth=True, splinesteps=16, **kwargs)
+
+
+class HoverTooltip:
+    """Singleton floating rounded dark-indigo tooltip with delayed reveal and soft fade-in."""
+
+    _active: HoverTooltip | None = None
+    _pending: HoverTooltip | None = None
+
+    def __init__(self, widget: tk.Misc, text: str, title: str | None = None, delay_ms: int = 180) -> None:
+        self.widget = widget
+        self.text = text
+        self.title = title
+        self.delay_ms = delay_ms
+        self._after_id: str | None = None
+        self._fade_id: str | None = None
+        self._win: tk.Toplevel | None = None
+
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+        widget.bind("<ButtonPress>", self._on_leave, add="+")
+        widget.bind("<Destroy>", self._on_destroy, add="+")
+
+    def set_text(self, text: str, title: str | None = None) -> None:
+        self.text = text
+        if title is not None:
+            self.title = title
+
+    def _cancel_timers(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+        if self._fade_id is not None:
+            try:
+                self.widget.after_cancel(self._fade_id)
+            except tk.TclError:
+                pass
+            self._fade_id = None
+        if HoverTooltip._pending is self:
+            HoverTooltip._pending = None
+
+    def _on_enter(self, _event: Any = None) -> None:
+        if HoverTooltip._pending is not None and HoverTooltip._pending is not self:
+            HoverTooltip._pending._cancel_timers()
+        active = HoverTooltip._active
+        if active is not None and active._win is not None:
+            if active is self or (active.text == self.text and active.title == self.title):
+                return
+            active.hide()
+        self._cancel_timers()
+        try:
+            if not self.widget.winfo_viewable():
+                return
+            HoverTooltip._pending = self
+            self._after_id = self.widget.after(self.delay_ms, self.show)
+        except tk.TclError:
+            pass
+
+    def _on_leave(self, _event: Any = None) -> None:
+        self._cancel_timers()
+        self.hide()
+
+    def _on_destroy(self, _event: Any = None) -> None:
+        self._cancel_timers()
+        self.hide()
+
+    def show(self) -> None:
+        if HoverTooltip._pending is self:
+            HoverTooltip._pending = None
+        if HoverTooltip._active is not None and HoverTooltip._active is not self:
+            HoverTooltip._active.hide()
+        if self._win is not None or not self.text:
+            return
+        try:
+            if not self.widget.winfo_exists() or not self.widget.winfo_viewable():
+                return
+            win = tk.Toplevel(self.widget)
+            win.wm_overrideredirect(True)
+            win.attributes("-topmost", True)
+            trans_col = "#010102"
+            use_trans = sys.platform == "win32"
+            if use_trans:
+                try:
+                    win.configure(bg=trans_col)
+                    win.attributes("-transparentcolor", trans_col)
+                except tk.TclError:
+                    use_trans = False
+                    win.configure(bg=CARD_ALT)
+            else:
+                win.configure(bg=CARD_ALT)
+            try:
+                win.attributes("-alpha", 0.0)
+            except tk.TclError:
+                pass
+
+            canvas = tk.Canvas(
+                win,
+                bg=trans_col if use_trans else CARD_ALT,
+                highlightthickness=0,
+                bd=0,
+            )
+            canvas.pack()
+
+            inner = tk.Frame(canvas, bg=CARD_ALT, padx=11, pady=7)
+            if self.title:
+                tk.Label(
+                    inner, text=self.title, bg=CARD_ALT, fg=ACCENT, font=FONT_SMALL_B, anchor="w", justify="left"
+                ).pack(fill="x", pady=(0, 2))
+            tk.Label(
+                inner,
+                text=self.text,
+                bg=CARD_ALT,
+                fg=FG_SOFT,
+                font=FONT_SMALL,
+                anchor="w",
+                justify="left",
+                wraplength=290,
+            ).pack(fill="x")
+            inner.update_idletasks()
+            iw = max(80, inner.winfo_reqwidth() + 4)
+            ih = max(28, inner.winfo_reqheight() + 4)
+            canvas.configure(width=iw, height=ih)
+            draw_rounded_rect(canvas, 1, 1, iw - 1, ih - 1, 10, fill=CARD_ALT, outline=PILL_ACTIVE_BORDER, width=1)
+            canvas.create_window(iw // 2, ih // 2, window=inner, anchor="center")
+            win.update_idletasks()
+
+            rx = self.widget.winfo_rootx() + min(18, max(4, self.widget.winfo_width() // 4))
+            ry = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            tw = win.winfo_reqwidth()
+            th = win.winfo_reqheight()
+            if rx + tw > sw - 12:
+                rx = max(8, sw - tw - 12)
+            if ry + th > sh - 12:
+                ry = max(8, self.widget.winfo_rooty() - th - 6)
+            win.wm_geometry(f"+{rx}+{ry}")
+            self._win = win
+            HoverTooltip._active = self
+            self._fade_step(0)
+        except tk.TclError:
+            self.hide()
+
+    def _fade_step(self, step: int) -> None:
+        if self._win is None:
+            return
+        try:
+            alpha = min(0.97, 0.25 + step * 0.24)
+            self._win.attributes("-alpha", alpha)
+            if alpha < 0.96:
+                self._fade_id = self.widget.after(22, lambda: self._fade_step(step + 1))
+        except tk.TclError:
+            self.hide()
+
+    def hide(self) -> None:
+        self._cancel_timers()
+        if HoverTooltip._active is self:
+            HoverTooltip._active = None
+        if HoverTooltip._pending is self:
+            HoverTooltip._pending = None
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except tk.TclError:
+                pass
+            self._win = None
+
+
+class AnimatedToggle(tk.Canvas):
+    """Smooth animated capsule toggle switch synced with a ``tk.BooleanVar``."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        variable: tk.BooleanVar,
+        command: Callable[[], Any] | None = None,
+        bg: str = CARD,
+        width: int = 42,
+        height: int = 20,
+    ) -> None:
+        self._tog_w = int(width)
+        self._tog_h = int(height)
+        super().__init__(
+            parent,
+            width=self._tog_w,
+            height=self._tog_h,
+            bg=bg,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.variable = variable
+        self.command = command
+        self._progress = 1.0 if bool(variable.get()) else 0.0
+        self._anim_id: str | None = None
+        self._trace_id: str | None = None
+
+        self._draw(self._progress)
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Destroy>", self._on_destroy)
+        self._trace_id = self.variable.trace_add("write", self._on_var_changed)
+
+    def _draw(self, t: float) -> None:
+        self.delete("all")
+        t = max(0.0, min(1.0, t))
+        track_col = lerp_hex("#232846", "#3E3275", t)
+        border_col = lerp_hex(BORDER_LIGHT, LAVENDER, t)
+        thumb_col = lerp_hex("#8590B3", LAVENDER, t)
+
+        pad = 2
+        r = (self._tog_h - pad * 2) / 2.0
+        x0, y0, x1, y1 = pad, pad, self._tog_w - pad, self._tog_h - pad
+        draw_rounded_rect(self, x0, y0, x1, y1, r, fill=track_col, outline=border_col, width=1)
+
+        cx = (x0 + r) + ((x1 - r) - (x0 + r)) * t
+        cy = self._tog_h / 2.0
+        tr = max(3.5, r - 2.3)
+        self.create_oval(cx - tr, cy - tr, cx + tr, cy + tr, fill=thumb_col, outline="")
+
+    def _on_click(self, _event: Any = None) -> None:
+        self.variable.set(not bool(self.variable.get()))
+        if self.command is not None:
+            self.command()
+
+    def _on_var_changed(self, *_args: Any) -> None:
+        target = 1.0 if bool(self.variable.get()) else 0.0
+        self._animate_to(target)
+
+    def _animate_to(self, target: float) -> None:
+        if self._anim_id is not None:
+            try:
+                self.after_cancel(self._anim_id)
+            except tk.TclError:
+                pass
+            self._anim_id = None
+        try:
+            viewable = bool(self.winfo_viewable())
+        except tk.TclError:
+            return
+        if not viewable:
+            self._progress = target
+            self._draw(target)
+            return
+        start = self._progress
+        steps = 6
+
+        def _step(idx: int) -> None:
+            try:
+                if not self.winfo_exists():
+                    return
+                frac = idx / steps
+                eased = 1.0 - (1.0 - frac) ** 2
+                self._progress = start + (target - start) * eased
+                self._draw(self._progress)
+                if idx < steps:
+                    self._anim_id = self.after(18, lambda: _step(idx + 1))
+                else:
+                    self._anim_id = None
+            except tk.TclError:
+                self._anim_id = None
+
+        _step(1)
+
+    def _on_destroy(self, _event: Any = None) -> None:
+        if self._anim_id is not None:
+            try:
+                self.after_cancel(self._anim_id)
+            except tk.TclError:
+                pass
+            self._anim_id = None
+        if self._trace_id is not None:
+            try:
+                self.variable.trace_remove("write", self._trace_id)
+            except tk.TclError:
+                pass
+            self._trace_id = None
+
+
+class RoundedButton(tk.Canvas):
+    """Soft-corner animated button rendered on Tk ``Canvas`` with ``tk.Button``-compatible API."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command: Callable[[], Any],
+        palette: tuple[str, str, str, str, str],
+        *,
+        width: int | None = None,
+        font: tuple[Any, ...] = FONT_UI_B,
+        padx: int = 12,
+        pady: int = 6,
+        radius: int = 10,
+        anchor: str = "center",
+    ) -> None:
+        try:
+            parent_bg = str(parent.cget("bg"))
+        except tk.TclError:
+            parent_bg = BG
+        self._parent_bg = parent_bg
+        self._text = text
+        self._command = command
+        self._font = font
+        self._padx = padx
+        self._pady = pady
+        self._radius = radius
+        self._anchor = anchor
+        self._width_chars = width
+        self._netdoc_palette = palette
+        self._cur_bg, self._cur_fg, _hov, self._cur_brd, _bhov = palette
+        self._pressed = False
+        self._hovered = False
+        self._tween_id: str | None = None
+
+        self._measure()
+        super().__init__(
+            parent,
+            width=self._req_w,
+            height=self._req_h,
+            bg=self._parent_bg,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self._redraw()
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Destroy>", self._on_destroy)
+
+    def _measure(self) -> None:
+        try:
+            fnt = tkfont.Font(font=self._font)
+            tw = fnt.measure(self._text or " ")
+            lh = fnt.metrics("linespace")
+            ch = max(7, fnt.measure("0"))
+        except tk.TclError:
+            tw = max(24, len(self._text) * 8)
+            lh = 16
+            ch = 8
+        if self._width_chars:
+            self._req_w = max(tw + self._padx * 2 + 4, self._width_chars * ch + self._padx * 2)
+        else:
+            self._req_w = tw + self._padx * 2 + 6
+        self._req_h = max(24 if self._pady >= 2 else 22, lh + self._pady * 2 + 2)
+
+    def _redraw(self) -> None:
+        try:
+            w = self.winfo_width()
+            h = self.winfo_height()
+        except tk.TclError:
+            return
+        if w <= 1:
+            w = self._req_w
+        if h <= 1:
+            h = self._req_h
+        self.delete("all")
+        fill = lerp_hex(self._cur_bg, "#FFFFFF", 0.08) if self._pressed else self._cur_bg
+        draw_rounded_rect(self, 1, 1, w - 1, h - 1, min(self._radius, (h - 2) / 2.0), fill=fill, outline=self._cur_brd, width=1)
+        if self._anchor == "w":
+            tx = self._padx + 3
+            anc = "w"
+        else:
+            tx = w / 2.0
+            anc = "center"
+        ty = h / 2.0 + (1 if self._pressed else 0)
+        self.create_text(tx, ty, text=self._text, fill=self._cur_fg, font=self._font, anchor=anc)
+
+    def _tween_to(self, target_bg: str, target_brd: str) -> None:
+        if self._tween_id is not None:
+            try:
+                self.after_cancel(self._tween_id)
+            except tk.TclError:
+                pass
+            self._tween_id = None
+        try:
+            viewable = bool(self.winfo_viewable())
+        except tk.TclError:
+            return
+        if not viewable:
+            self._cur_bg = target_bg
+            self._cur_brd = target_brd
+            self._redraw()
+            return
+        s_bg, s_brd = self._cur_bg, self._cur_brd
+        steps = 4
+
+        def _step(idx: int) -> None:
+            try:
+                if not self.winfo_exists():
+                    return
+                frac = idx / steps
+                self._cur_bg = lerp_hex(s_bg, target_bg, frac)
+                self._cur_brd = lerp_hex(s_brd, target_brd, frac)
+                self._redraw()
+                if idx < steps:
+                    self._tween_id = self.after(16, lambda: _step(idx + 1))
+                else:
+                    self._tween_id = None
+            except tk.TclError:
+                self._tween_id = None
+
+        _step(1)
+
+    def _on_enter(self, _e: Any = None) -> None:
+        self._hovered = True
+        self._tween_to(self._netdoc_palette[2], self._netdoc_palette[4])
+
+    def _on_leave(self, _e: Any = None) -> None:
+        self._hovered = False
+        self._pressed = False
+        self._tween_to(self._netdoc_palette[0], self._netdoc_palette[3])
+
+    def _on_press(self, _e: Any = None) -> None:
+        self._pressed = True
+        self._redraw()
+
+    def _on_release(self, event: Any = None) -> None:
+        was_pressed = self._pressed
+        self._pressed = False
+        self._redraw()
+        if not was_pressed:
+            return
+        if event is not None:
+            try:
+                if not (0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height()):
+                    return
+            except tk.TclError:
+                pass
+        if self._command is not None:
+            self._command()
+
+    def invoke(self) -> Any:
+        if self._command is not None:
+            return self._command()
+        return None
+
+    def cget(self, key: str) -> Any:
+        if key == "text":
+            return self._text
+        if key in ("bg", "background"):
+            return self._cur_bg
+        if key in ("fg", "foreground"):
+            return self._cur_fg
+        if key == "anchor":
+            return self._anchor
+        return super().cget(key)
+
+    def configure(self, cnf: dict[str, Any] | None = None, **kw: Any) -> Any:  # type: ignore[override]
+        opts = dict(cnf or {})
+        opts.update(kw)
+        recalc = False
+        if "text" in opts:
+            self._text = str(opts.pop("text"))
+            recalc = True
+        if "font" in opts:
+            self._font = opts.pop("font")
+            recalc = True
+        if "anchor" in opts:
+            self._anchor = str(opts.pop("anchor"))
+        if "bg" in opts:
+            self._cur_bg = str(opts.pop("bg"))
+        if "fg" in opts:
+            self._cur_fg = str(opts.pop("fg"))
+        if "highlightbackground" in opts:
+            self._cur_brd = str(opts.pop("highlightbackground"))
+        opts.pop("activebackground", None)
+        opts.pop("activeforeground", None)
+        if recalc:
+            self._measure()
+            opts.setdefault("width", self._req_w)
+            opts.setdefault("height", self._req_h)
+        res = super().configure(**opts) if opts else None
+        self._redraw()
+        return res
+
+    config = configure
+
+    def _on_destroy(self, _e: Any = None) -> None:
+        if self._tween_id is not None:
+            try:
+                self.after_cancel(self._tween_id)
+            except tk.TclError:
+                pass
+            self._tween_id = None
+
+
+class RoundedCard(tk.Canvas):
+    """Soft rounded surface card hosting a ``self.body`` frame with dynamic border glow."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        bg: str = CARD,
+        outer_bg: str | None = None,
+        border: str = BORDER,
+        radius: int = 14,
+        pad: int = 2,
+        border_width: int = 1,
+    ) -> None:
+        if outer_bg is None:
+            try:
+                outer_bg = str(parent.cget("bg"))
+            except tk.TclError:
+                outer_bg = BG
+        self._card_bg = bg
+        self._border = border
+        self._radius = radius
+        self._pad = pad
+        self._bw = border_width
+        self._last_req = (0, 0)
+        super().__init__(parent, bg=outer_bg, highlightthickness=0, bd=0)
+        self.body = tk.Frame(self, bg=bg)
+        self._win_id = self.create_window(pad, pad, window=self.body, anchor="nw")
+        self.body.bind("<Configure>", self._on_body_cfg)
+        self.bind("<Configure>", self._on_canvas_cfg)
+
+    def _on_body_cfg(self, _e: Any = None) -> None:
+        try:
+            rh = max(20, self.body.winfo_reqheight() + self._pad * 2)
+            rw = max(40, self.body.winfo_reqwidth() + self._pad * 2)
+            if (rw, rh) != self._last_req:
+                self._last_req = (rw, rh)
+                super().configure(width=rw, height=rh)
+            self._redraw()
+        except tk.TclError:
+            pass
+
+    def _on_canvas_cfg(self, e: Any) -> None:
+        try:
+            w = max(24, int(getattr(e, "width", 0)) - self._pad * 2)
+            self.itemconfigure(self._win_id, width=w)
+            self._redraw()
+        except tk.TclError:
+            pass
+
+    def _redraw(self) -> None:
+        try:
+            w = max(self._last_req[0], self.winfo_width())
+            h = max(self._last_req[1], self.winfo_height())
+            if w <= 4 or h <= 4:
+                return
+            self.delete("card_bg")
+            tid = draw_rounded_rect(
+                self,
+                1,
+                1,
+                w - 1,
+                h - 1,
+                self._radius,
+                fill=self._card_bg,
+                outline=self._border,
+                width=self._bw,
+                tags=("card_bg",),
+            )
+            self.tag_lower(tid)
+        except tk.TclError:
+            pass
+
+    def set_border(self, color: str) -> None:
+        if color != self._border:
+            self._border = color
+            self._redraw()
+
+    def cget(self, key: str) -> Any:
+        if key == "highlightbackground":
+            return self._border
+        if key in ("bg", "background"):
+            return self._card_bg
+        return super().cget(key)
+
+    def configure(self, cnf: dict[str, Any] | None = None, **kw: Any) -> Any:  # type: ignore[override]
+        opts = dict(cnf or {})
+        opts.update(kw)
+        need_redraw = False
+        if "highlightbackground" in opts:
+            self._border = str(opts.pop("highlightbackground"))
+            need_redraw = True
+        if "bg" in opts or "background" in opts:
+            bg_val = str(opts.pop("bg", opts.pop("background", self._card_bg)))
+            self._card_bg = bg_val
+            try:
+                self.body.configure(bg=bg_val)
+            except tk.TclError:
+                pass
+            need_redraw = True
+        if "outer_bg" in opts:
+            opts["bg"] = str(opts.pop("outer_bg"))
+        res = super().configure(**opts) if opts else None
+        if need_redraw:
+            self._redraw()
+        return res
+
+    config = configure
+
+    config = configure
+
+
+class ActivityBar(tk.Canvas):
+    """Thin sweeping cyan-lavender progress beam under header showing live background activity."""
+
+    def __init__(self, parent: tk.Misc, bg: str = BG) -> None:
+        super().__init__(parent, height=3, bg=bg, highlightthickness=0, bd=0)
+        self._active = False
+        self._pos = 0.0
+        self.bind("<Configure>", lambda _e: self.redraw())
+
+    def set_active(self, active: bool) -> None:
+        if self._active != active:
+            self._active = active
+            self.redraw()
+
+    def step(self) -> None:
+        if self._active:
+            self._pos = (self._pos + 0.045) % 1.35
+            self.redraw()
+
+    def redraw(self) -> None:
+        try:
+            w = max(120, int(self.winfo_width()))
+        except tk.TclError:
+            return
+        self.delete("all")
+        if not self._active:
+            self.create_line(0, 1, w, 1, fill=BORDER, width=1)
+            return
+        self.create_line(0, 1, w, 1, fill="#151932", width=1)
+        beam_w = max(80, int(w * 0.24))
+        x0 = (self._pos - 0.24) * w
+        x1 = x0 + beam_w
+        mid = (x0 + x1) / 2.0
+        self.create_rectangle(x0, 0, mid, 3, fill=LAVENDER, outline="")
+        self.create_rectangle(mid, 0, x1, 3, fill=ACCENT, outline="")
+
+
+class LiveSparklineCanvas(tk.Canvas):
+    """Real-time dual-line connection activity chart inspired by the Traffic Monitor reference."""
+
+    def __init__(self, parent: tk.Misc, height: int = 92, bg: str = CARD) -> None:
+        super().__init__(parent, height=height, bg=bg, highlightthickness=0, bd=0)
+        self._bg = bg
+        self._total_hist: deque[int] = deque([0] * 32, maxlen=36)
+        self._prot_hist: deque[int] = deque([0] * 32, maxlen=36)
+        self._pulse = 0.5
+        self.bind("<Configure>", lambda _e: self.redraw())
+
+    def push_sample(self, total: int, protected: int) -> None:
+        self._total_hist.append(max(0, int(total)))
+        self._prot_hist.append(max(0, int(protected)))
+        self.redraw()
+
+    def set_pulse(self, phase: float) -> None:
+        self._pulse = 0.5 + 0.5 * math.sin(phase)
+        self.redraw()
+
+    def redraw(self) -> None:
+        try:
+            w = max(240, int(self.winfo_width()))
+            h = max(64, int(self.winfo_height()))
+        except tk.TclError:
+            return
+        self.delete("all")
+        pad_x, pad_top, pad_bot = 12, 10, 12
+        plot_w = max(40, w - pad_x * 2 - 22)
+        plot_h = max(24, h - pad_top - pad_bot)
+
+        # Horizontal grid rules
+        for i in range(4):
+            y = pad_top + plot_h * (i / 3.0)
+            self.create_line(pad_x, y, pad_x + plot_w, y, fill="#1B203B", width=1)
+
+        max_val = max(4, max(self._total_hist, default=0), max(self._prot_hist, default=0))
+        n = len(self._total_hist)
+        if n < 2:
+            return
+
+        def _pts(series: deque[int]) -> list[float]:
+            coords: list[float] = []
+            for idx, val in enumerate(series):
+                x = pad_x + plot_w * (idx / max(1, n - 1))
+                y = pad_top + plot_h * (1.0 - min(1.0, val / max_val))
+                coords.extend((x, y))
+            return coords
+
+        tot_pts = _pts(self._total_hist)
+        prot_pts = _pts(self._prot_hist)
+
+        # Draw soft lavender total line and electric cyan protected line
+        self.create_line(*tot_pts, fill=LAVENDER, width=2, smooth=True)
+        self.create_line(*prot_pts, fill=ACCENT, width=2, smooth=True)
+
+        # Right-side glowing level markers (matching Reference 2 right edge bars)
+        bx = pad_x + plot_w + 10
+        tot_y = tot_pts[-1]
+        prot_y = prot_pts[-1]
+        tot_glow = lerp_hex("#8B74E8", LAVENDER_HOVER, self._pulse)
+        prot_glow = lerp_hex("#22B8CF", ACCENT, self._pulse)
+        self.create_rectangle(bx, tot_y, bx + 5, pad_top + plot_h, fill=tot_glow, outline="")
+        self.create_rectangle(bx + 7, prot_y, bx + 12, pad_top + plot_h, fill=prot_glow, outline="")
+        self.create_oval(tot_pts[-2] - 3, tot_y - 3, tot_pts[-2] + 3, tot_y + 3, fill=tot_glow, outline="")
+        self.create_oval(prot_pts[-2] - 3, prot_y - 3, prot_pts[-2] + 3, prot_y + 3, fill=prot_glow, outline="")
+
+
+# --------------------------------------------------------------------------------------
 # Main application
 # --------------------------------------------------------------------------------------
 
@@ -438,7 +1213,7 @@ class NetdoctorGuiApp(tk.Tk):
             logs_dir=logs_dir,
             bin_dir=bin_dir,
         )
-        self.title("ZAPRET // NETDOCTOR")
+        self.title(f"ZAPRET // NETDOCTOR v{__version__}")
         self.geometry("1280x840")
         self.minsize(1040, 700)
         self.configure(bg=BG)
@@ -468,6 +1243,8 @@ class NetdoctorGuiApp(tk.Tk):
         self._vpn_nodes_by_iid: dict[str, dict[str, Any]] = {}
         self._vpn_policy: dict[str, Any] = {"mode": "auto", "priority_node": "", "priorities": {}}
         self._vpn_mode_syncing: bool = False
+        self._preset_cb_syncing: bool = False
+        self._stack_mode_syncing: bool = False
         self.zapret_presets: list[dict[str, Any]] = []
         self.presets_by_iid: dict[str, dict[str, Any]] = {}
         self.selected_preset: dict[str, Any] | None = None
@@ -488,23 +1265,44 @@ class NetdoctorGuiApp(tk.Tk):
         self._sort_state: tuple[str, bool] = ("domain", False)
         self._sock_counts: dict[str, int] = {}
         self._last_preset_err_shown: str = ""
+        self._last_update_info: dict[str, Any] = {}
         self._post_queue: queue.Queue[tuple[Callable[..., Any], tuple[Any, ...]]] = queue.Queue()
         self._active_bg_labels: set[str] = set()
         self._tray: NetdoctorTrayIcon | None = None
         self._icon_image: tk.PhotoImage | None = None
         self._guide_visible = True
+        self._extra_visible = False
+        self._tooltips: list[HoverTooltip] = []
+        self._anim_jobs: dict[int, str] = {}
+        self._pulse_job: str | None = None
+        self._fade_job: str | None = None
+        self._pulse_phase: float = 0.0
+        self._initial_loaded: bool = False
+        self._power_transition: str | None = None
+        self._spinner_idx: int = 0
 
         self.minimize_to_tray_var = tk.BooleanVar(value=True)
         self.autostart_var = tk.BooleanVar(value=False)
+        self.autostart_protection_var = tk.BooleanVar(value=False)
         self.byedpi_var = tk.BooleanVar(value=False)
         self.debug_log_var = tk.BooleanVar(value=False)
         self.dpi_only_var = tk.BooleanVar(value=False)
         self.tun_stack_var = tk.StringVar(value="gvisor")
+        self._auto_start_stack = bool(auto_start_stack)
+        self._minimized = bool(minimized)
+        self._auto_start_enabled = bool(auto_start)
+
+        if auto_start and not minimized:
+            try:
+                self.attributes("-alpha", 0.0)
+            except tk.TclError:
+                pass
 
         self._apply_window_chrome(enable_dark=auto_start and not minimized)
         self._build_style()
         self._build_statusbar()
         self._build_shell()
+        self._progress_update()
 
         use_tray = enable_tray if enable_tray is not None else auto_start
         if use_tray:
@@ -530,6 +1328,8 @@ class NetdoctorGuiApp(tk.Tk):
         if auto_start:
             if minimized:
                 self.withdraw()
+            else:
+                self._start_entrance_fade()
             self.refresh_async()
             self.load_catalog_async()
             self.load_zapret_presets_async()
@@ -540,9 +1340,11 @@ class NetdoctorGuiApp(tk.Tk):
             self.after(self.SNAPSHOT_INTERVAL_MS, self._snapshot_tick)
             self.after(self.LOG_INTERVAL_MS, self._log_tick)
             self.after(self.REALTIME_INTERVAL_MS, self._realtime_tick)
+            self._pulse_job = self.after(70, self._pulse_tick)
             self._ensure_deps_on_startup()
-            if auto_start_stack:
-                self.after(350, self.on_start)
+            self.after(2500, self._check_updates_on_startup)
+            delay_ms = 1500 if (minimized and auto_start_stack) else 350
+            self.after(delay_ms, self._maybe_auto_start_protection)
 
     # ---------------------------------------------------------------- window chrome & lifecycle
 
@@ -761,8 +1563,53 @@ class NetdoctorGuiApp(tk.Tk):
 
         return None
 
+    def _start_entrance_fade(self) -> None:
+        if self._closed or self._exiting:
+            return
+        steps = 6
+
+        def _step(idx: int) -> None:
+            if self._closed:
+                return
+            try:
+                alpha = min(1.0, idx / steps)
+                self.attributes("-alpha", alpha)
+                if idx < steps:
+                    self._fade_job = self.after(28, lambda: _step(idx + 1))
+                else:
+                    self._fade_job = None
+            except tk.TclError:
+                self._fade_job = None
+
+        self._fade_job = self.after(15, lambda: _step(1))
+
     def on_close(self) -> None:
         self._closed = True
+        if self._fade_job is not None:
+            try:
+                self.after_cancel(self._fade_job)
+            except tk.TclError:
+                pass
+            self._fade_job = None
+        if self._pulse_job is not None:
+            try:
+                self.after_cancel(self._pulse_job)
+            except tk.TclError:
+                pass
+            self._pulse_job = None
+        for job_id in list(self._anim_jobs.values()):
+            try:
+                self.after_cancel(job_id)
+            except tk.TclError:
+                pass
+        self._anim_jobs.clear()
+        for tip in list(self._tooltips):
+            tip.hide()
+        self._tooltips.clear()
+        if HoverTooltip._pending is not None:
+            HoverTooltip._pending._cancel_timers()
+        if HoverTooltip._active is not None:
+            HoverTooltip._active.hide()
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -866,6 +1713,9 @@ class NetdoctorGuiApp(tk.Tk):
                 pass
 
     def _progress_update(self) -> None:
+        is_busy = self._busy > 0 or not self._initial_loaded or self._power_transition is not None
+        if hasattr(self, "activity_bar"):
+            self.activity_bar.set_active(is_busy)
         if self._busy > 0:
             if not self.progress.winfo_manager():
                 self.progress.pack(side="right", padx=12, pady=5)
@@ -998,12 +1848,132 @@ class NetdoctorGuiApp(tk.Tk):
         palettes: dict[str, tuple[str, str, str, str, str]] = {
             "neutral": (INPUT, FG, INPUT_HOVER, BORDER, BORDER_LIGHT),
             "ghost": (CARD, FG_SOFT, CARD_ALT, BORDER, BORDER_LIGHT),
-            "primary": (PRIMARY_BG, "#FFFFFF", PRIMARY_HOVER, "#0369A1", ACCENT),
-            "success": (OK_BTN, "#FFFFFF", OK_BTN_HOVER, "#15803D", OK_TEXT),
-            "danger": (ERR_BTN, "#FFFFFF", ERR_BTN_HOVER, "#B91C1C", ERR_TEXT),
+            "primary": (PILL_ACTIVE_BG, "#FFFFFF", PRIMARY_HOVER, PILL_ACTIVE_BORDER, LAVENDER),
+            "pill_active": (PILL_ACTIVE_BG, "#FFFFFF", "#3F3475", PILL_ACTIVE_BORDER, LAVENDER),
+            "hero": (LAVENDER, LAVENDER_DARK, LAVENDER_HOVER, "#9F82F6", "#DDD0FE"),
+            "hero_active": ("#A78BFA", LAVENDER_DARK, "#C4B5FD", CYAN_BORDER, ACCENT),
+            "cyan_ghost": ("#10192E", ACCENT, "#162440", "#1E425E", ACCENT),
+            "success": (OK_BTN, "#FFFFFF", OK_BTN_HOVER, "#0E7490", ACCENT),
+            "danger": (ERR_BTN, ERR_TEXT, ERR_BTN_HOVER, "#7F2642", ERR),
             "warn": (WARN_BTN, "#FFFFFF", WARN_BTN_HOVER, "#B45309", WARN_TEXT),
         }
         return palettes.get(kind, palettes["neutral"])
+
+    def attach_tooltip(self, widget: tk.Misc, text: str, title: str | None = None) -> HoverTooltip:
+        tip = HoverTooltip(widget, text, title=title)
+        self._tooltips.append(tip)
+        return tip
+
+    def make_info_icon(
+        self,
+        parent: tk.Misc,
+        tooltip_text: str,
+        title: str | None = None,
+        bg: str = CARD,
+    ) -> tk.Label:
+        badge = tk.Label(
+            parent,
+            text="ⓘ",
+            bg=bg,
+            fg=MUTED,
+            font=FONT_SMALL_B,
+            cursor="question_arrow",
+            padx=3,
+        )
+        badge.bind("<Enter>", lambda _e, b=badge: b.configure(fg=ACCENT), add="+")
+        badge.bind("<Leave>", lambda _e, b=badge: b.configure(fg=MUTED), add="+")
+        self.attach_tooltip(badge, tooltip_text, title=title)
+        return badge
+
+    def _animate_widget_bg(
+        self,
+        widget: tk.Widget,
+        target_bg: str,
+        target_border: str | None = None,
+        steps: int = 3,
+        interval_ms: int = 16,
+    ) -> None:
+        key = id(widget)
+        prev = self._anim_jobs.pop(key, None)
+        if prev is not None:
+            try:
+                self.after_cancel(prev)
+            except tk.TclError:
+                pass
+        try:
+            if self._closed or not widget.winfo_viewable():
+                widget.configure(bg=target_bg)
+                if target_border is not None:
+                    widget.configure(highlightbackground=target_border)
+                return
+            start_bg = str(widget.cget("bg"))
+            start_brd = str(widget.cget("highlightbackground")) if target_border is not None else ""
+        except tk.TclError:
+            return
+
+        def _step(idx: int) -> None:
+            if self._closed:
+                return
+            try:
+                if not widget.winfo_exists():
+                    self._anim_jobs.pop(key, None)
+                    return
+                frac = idx / max(1, steps)
+                widget.configure(bg=lerp_hex(start_bg, target_bg, frac))
+                if target_border is not None:
+                    widget.configure(highlightbackground=lerp_hex(start_brd, target_border, frac))
+                if idx < steps:
+                    self._anim_jobs[key] = self.after(interval_ms, lambda: _step(idx + 1))
+                else:
+                    self._anim_jobs.pop(key, None)
+            except tk.TclError:
+                self._anim_jobs.pop(key, None)
+
+        _step(1)
+
+    def _pulse_tick(self) -> None:
+        if self._closed or self._exiting:
+            return
+        self._pulse_phase = (self._pulse_phase + 0.16) % (2.0 * math.pi)
+        self._spinner_idx = (self._spinner_idx + 1) % 8
+        spin = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧")[self._spinner_idx]
+        dots = "." * ((self._spinner_idx // 2) % 4)
+        try:
+            hidden = self._is_window_hidden()
+            if not hidden:
+                if hasattr(self, "activity_bar"):
+                    self.activity_bar.set_active(
+                        self._busy > 0 or self._refreshing or not self._initial_loaded or self._power_transition is not None
+                    )
+                    self.activity_bar.step()
+
+                if not self._initial_loaded:
+                    if hasattr(self, "hero_state_pill"):
+                        self.hero_state_pill.configure(text=f"{spin} ЗАГРУЗКА{dots}", fg=ACCENT, bg=INFO_BG)
+                    if hasattr(self, "network_label"):
+                        self.network_label.configure(text=f"Сеть: определение{dots}")
+                elif self._power_transition == "starting" and hasattr(self, "autopilot_btn"):
+                    self.autopilot_btn.configure(text=f"{spin} ЗАПУСК ЗАЩИТЫ{dots}")
+                elif self._power_transition == "stopping" and hasattr(self, "autopilot_btn"):
+                    self.autopilot_btn.configure(text=f"{spin} ОСТАНОВКА{dots}")
+
+                if self.last_snapshot.get("running"):
+                    wave = 0.5 + 0.5 * math.sin(self._pulse_phase)
+                    glow_col = lerp_hex("#1B8CA3", ACCENT, wave)
+                    if hasattr(self, "hero_state_pill"):
+                        self.hero_state_pill.configure(fg=glow_col)
+                    if hasattr(self, "_home_zapret_card"):
+                        self._home_zapret_card.configure(highlightbackground=lerp_hex("#1B5A70", CYAN_BORDER, wave))
+                    for key, (canvas, oval, _lbl) in self.leds.items():
+                        running = bool(((self.last_snapshot.get("processes") or {}).get(key) or {}).get("running"))
+                        if running:
+                            canvas.itemconfigure(oval, fill=glow_col)
+                if self.radar_enabled and hasattr(self, "sparkline_canvas"):
+                    self.sparkline_canvas.set_pulse(self._pulse_phase)
+        except tk.TclError:
+            pass
+        if self._auto_start_enabled:
+            self._pulse_job = self.after(70, self._pulse_tick)
 
     def make_button(
         self,
@@ -1015,34 +1985,61 @@ class NetdoctorGuiApp(tk.Tk):
         font: tuple[Any, ...] = FONT_UI_B,
         padx: int = 12,
         pady: int = 6,
-    ) -> tk.Button:
-        bg, fg, hover, border, border_hover = self._button_palette(kind)
-        btn = tk.Button(
+        radius: int | None = None,
+        tooltip: str | None = None,
+    ) -> RoundedButton:
+        pal = self._button_palette(kind)
+        if radius is None:
+            radius = 12 if kind in ("hero", "hero_active") else (11 if kind in ("pill_active", "primary") else 9)
+        btn = RoundedButton(
             parent,
             text=text,
             command=command,
-            bg=bg,
-            fg=fg,
-            activebackground=hover,
-            activeforeground=fg,
-            relief="flat",
-            bd=0,
+            palette=pal,
+            width=width,
+            font=font,
             padx=padx,
             pady=pady,
-            font=font,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground=border,
+            radius=radius,
         )
-        btn._netdoc_palette = (bg, fg, hover, border, border_hover)  # type: ignore[attr-defined]
-        if width:
-            btn.configure(width=width)
-        btn.bind("<Enter>", lambda _e, b=btn: b.configure(bg=b._netdoc_palette[2], highlightbackground=b._netdoc_palette[4]))  # type: ignore[attr-defined]
-        btn.bind("<Leave>", lambda _e, b=btn: b.configure(bg=b._netdoc_palette[0], highlightbackground=b._netdoc_palette[3]))  # type: ignore[attr-defined]
+        if tooltip:
+            self.attach_tooltip(btn, tooltip)
         return btn
 
+    def make_toggle_row(
+        self,
+        parent: tk.Misc,
+        text: str,
+        variable: tk.BooleanVar,
+        command: Callable[[], Any] | None = None,
+        *,
+        bg: str = CARD,
+        font: tuple[Any, ...] = FONT_SMALL,
+        fg: str = FG_SOFT,
+        tooltip: str | None = None,
+        slider_width: int = 38,
+        slider_height: int = 18,
+    ) -> tk.Frame:
+        """Create a soft slider-switch row replacing legacy square checkboxes."""
+        row = tk.Frame(parent, bg=bg, cursor="hand2")
+        lbl = tk.Label(row, text=text, bg=bg, fg=fg, font=font, anchor="w", justify="left", cursor="hand2")
+        lbl.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        tog = AnimatedToggle(row, variable=variable, command=command, bg=bg, width=slider_width, height=slider_height)
+        tog.pack(side="right")
+
+        def _toggle_from_label(_e: Any = None) -> None:
+            tog._on_click()
+
+        lbl.bind("<Button-1>", _toggle_from_label)
+        lbl.bind("<Enter>", lambda _e: lbl.configure(fg=FG), add="+")
+        lbl.bind("<Leave>", lambda _e: lbl.configure(fg=fg), add="+")
+        if tooltip:
+            for w in (row, lbl, tog):
+                self.attach_tooltip(w, tooltip)
+        return row
+
     @classmethod
-    def _restyle_button(cls, btn: tk.Button, text: str, kind: str) -> None:
+    def _restyle_button(cls, btn: Any, text: str, kind: str) -> None:
         bg, fg, hover, border, border_hover = cls._button_palette(kind)
         btn._netdoc_palette = (bg, fg, hover, border, border_hover)  # type: ignore[attr-defined]
         btn.configure(
@@ -1190,128 +2187,166 @@ class NetdoctorGuiApp(tk.Tk):
         self._build_notebook(right_col)
 
     def _build_sidebar(self, parent: tk.Misc) -> None:
-        sidebar = tk.Frame(parent, bg=SIDEBAR_BG, width=232)
+        sidebar = tk.Frame(parent, bg=SIDEBAR_BG, width=78)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
         # Subtle vertical divider on the right edge of sidebar
         tk.Frame(parent, bg=BORDER, width=1).pack(side="left", fill="y")
 
-        # Brand block
+        # Minimal top emblem
         brand = tk.Frame(sidebar, bg=SIDEBAR_BG)
-        brand.pack(fill="x", padx=16, pady=(16, 12))
-        title_row = tk.Frame(brand, bg=SIDEBAR_BG)
-        title_row.pack(fill="x")
-        tk.Label(title_row, text="NETDOCTOR", bg=SIDEBAR_BG, fg=FG, font=FONT_TITLE).pack(side="left")
-        tk.Label(
-            title_row,
-            text=" ZAPRET v2 ",
-            bg=INFO_BG,
-            fg=ACCENT,
-            font=FONT_MICRO,
-            padx=5,
-            pady=2,
-        ).pack(side="left", padx=(8, 0))
-
-        self.priv_label = tk.Label(
+        brand.pack(fill="x", pady=(12, 8))
+        emblem = tk.Label(
             brand,
-            text="Проверка прав…",
-            bg=INPUT,
-            fg=MUTED,
-            font=FONT_MICRO,
-            anchor="w",
-            padx=8,
-            pady=3,
+            text="◈",
+            bg=SIDEBAR_BG,
+            fg=ACCENT,
+            font=("Segoe UI", 18, "bold"),
+            anchor="center",
         )
-        self.priv_label.pack(anchor="w", pady=(8, 0))
+        emblem.pack()
+        self.attach_tooltip(emblem, f"ZAPRET // NETDOCTOR v{__version__}\nАдаптивный обход блокировок")
 
-        tk.Frame(sidebar, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=16, pady=(4, 10))
+        tk.Frame(sidebar, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(2, 8))
 
-        tk.Label(sidebar, text="НАВИГАЦИЯ", bg=SIDEBAR_BG, fg=DIM, font=FONT_MICRO, anchor="w").pack(
-            fill="x", padx=18, pady=(0, 6)
-        )
         self._nav_container = tk.Frame(sidebar, bg=SIDEBAR_BG)
-        self._nav_container.pack(fill="x", padx=10)
+        self._nav_container.pack(fill="x", padx=6)
 
-        # Bottom pinned process stack card
+        # Bottom compact service status LEDs
         stack_card = tk.Frame(sidebar, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        stack_card.pack(side="bottom", fill="x", padx=12, pady=12)
-        tk.Label(stack_card, text="СЛУЖБЫ ОБХОДА", bg=CARD, fg=DIM, font=FONT_MICRO, anchor="w").pack(
-            fill="x", padx=10, pady=(8, 4)
+        stack_card.pack(side="bottom", fill="x", padx=8, pady=10)
+        tk.Label(stack_card, text="МОДУЛИ", bg=CARD, fg=DIM, font=("Segoe UI", 7, "bold"), anchor="center").pack(
+            fill="x", pady=(5, 2)
         )
 
         self.leds: dict[str, tuple[tk.Canvas, int, tk.Label]] = {}
-        for key, title in PROCESS_LEDS:
+        for key, title, tip_text in PROCESS_LEDS:
             row = tk.Frame(stack_card, bg=CARD)
-            row.pack(fill="x", padx=10, pady=2)
-            canvas = tk.Canvas(row, width=12, height=12, bg=CARD, highlightthickness=0)
-            canvas.pack(side="left", padx=(0, 6), pady=2)
-            oval = canvas.create_oval(2, 2, 10, 10, fill=ERR, outline="")
-            lbl = tk.Label(row, text=title, bg=CARD, fg=MUTED, font=FONT_MONO_S, anchor="w")
+            row.pack(fill="x", padx=8, pady=1)
+            canvas = tk.Canvas(row, width=10, height=10, bg=CARD, highlightthickness=0)
+            canvas.pack(side="left", padx=(0, 5), pady=2)
+            oval = canvas.create_oval(1, 1, 9, 9, fill=ERR, outline="")
+            lbl = tk.Label(row, text=title, bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w")
             lbl.pack(side="left", fill="x", expand=True)
             self.leds[key] = (canvas, oval, lbl)
-        tk.Frame(stack_card, bg=CARD, height=6).pack()
+            for w in (row, canvas, lbl):
+                self.attach_tooltip(w, tip_text)
+        tk.Frame(stack_card, bg=CARD, height=4).pack()
 
     def _build_header(self, parent: tk.Misc) -> None:
-        banner = tk.Frame(parent, bg=CARD)
+        banner = tk.Frame(parent, bg=HEADER_BG)
         banner.pack(fill="x")
-        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
+        self.activity_bar = ActivityBar(parent, bg=BG)
+        self.activity_bar.pack(fill="x")
 
-        inner = tk.Frame(banner, bg=CARD)
-        inner.pack(fill="x", padx=18, pady=10)
+        inner = tk.Frame(banner, bg=HEADER_BG)
+        inner.pack(fill="x", padx=16, pady=8)
 
-        # Right: Single unambiguous primary action cluster (packed first so left gets remaining width cleanly)
-        ctrl = tk.Frame(inner, bg=CARD)
+        # Right: Metadata readouts + conditional badges + single Refresh icon
+        ctrl = tk.Frame(inner, bg=HEADER_BG)
         ctrl.pack(side="right", padx=(14, 0))
-        self.make_button(ctrl, "↻", self.refresh_async, kind="ghost", width=3, pady=8).pack(side="right", padx=(6, 0))
-        self.autopilot_btn = self.make_button(
+
+        refresh_btn = self.make_button(
             ctrl,
-            "Включить защиту",
-            self.on_toggle_autopilot,
-            "success",
-            font=FONT_UI_B,
-            padx=18,
-            pady=8,
+            "↻",
+            self.refresh_async,
+            kind="ghost",
+            width=3,
+            pady=5,
+            tooltip="Обновить состояние сети и всех служб (F5)",
         )
-        self.autopilot_btn.pack(side="right")
-        self._priv_btn_slot = tk.Frame(ctrl, bg=CARD)
+        refresh_btn.pack(side="right", padx=(8, 0))
+
+        meta_box = tk.Frame(ctrl, bg=HEADER_BG)
+        meta_box.pack(side="right", padx=(8, 4))
+
+        ver_col = tk.Frame(meta_box, bg=HEADER_BG)
+        ver_col.pack(side="left", padx=(0, 12))
+        tk.Label(ver_col, text="ВЕРСИЯ", bg=HEADER_BG, fg=DIM, font=("Segoe UI", 7, "bold"), anchor="e").pack(anchor="e")
+        tk.Label(ver_col, text=f"v{__version__}", bg=HEADER_BG, fg=LAVENDER, font=FONT_SMALL_B, anchor="e").pack(anchor="e")
+
+        priv_col = tk.Frame(meta_box, bg=HEADER_BG)
+        priv_col.pack(side="left")
+        tk.Label(priv_col, text="ДОСТУП", bg=HEADER_BG, fg=DIM, font=("Segoe UI", 7, "bold"), anchor="e").pack(anchor="e")
+        self.priv_label = tk.Label(
+            priv_col,
+            text="Проверка…",
+            bg=INPUT,
+            fg=MUTED,
+            font=FONT_MICRO,
+            anchor="e",
+            padx=6,
+            pady=1,
+        )
+        self.priv_label.pack(anchor="e")
+        self.attach_tooltip(
+            self.priv_label,
+            "Права администратора необходимы для запуска драйвера обхода блокировок и VPN-туннеля.",
+        )
+
+        self._priv_btn_slot = tk.Frame(ctrl, bg=HEADER_BG)
         self._priv_btn_slot.pack(side="right")
         self.priv_btn = self.make_button(
             self._priv_btn_slot,
-            "Запустить от Admin",
+            "Права Admin",
             self.on_elevate,
             "warn",
-            pady=8,
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=5,
+            tooltip="Перезапустить программу с правами администратора (UAC) для полноценной работы защиты.",
         )
-        self._pending_btn_slot = tk.Frame(ctrl, bg=CARD)
+        self._pending_btn_slot = tk.Frame(ctrl, bg=HEADER_BG)
         self._pending_btn_slot.pack(side="right")
         self.apply_pending_btn = self.make_button(
             self._pending_btn_slot,
-            "Применить правила",
+            "Применить изменения",
             self.on_force_apply_pending,
-            "ghost",
-            padx=12,
-            pady=8,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=5,
+            tooltip="Применить отложенные изменения правил прямо сейчас.",
+        )
+        self._update_btn_slot = tk.Frame(ctrl, bg=HEADER_BG)
+        self._update_btn_slot.pack(side="right")
+        self.update_badge_btn = self.make_button(
+            self._update_btn_slot,
+            "↑ Обновление",
+            lambda: self._select_tab(self.tab_service),
+            "primary",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=5,
+            tooltip="Доступна новая версия NetDoctor — нажмите чтобы перейти к обновлению.",
         )
 
-        # Left: Hero status pill + network metadata on row 1, conditional bypass banner, clean wrapped hint
-        left = tk.Frame(inner, bg=CARD)
+        # Left: App Title + live status pill + network fingerprint
+        left = tk.Frame(inner, bg=HEADER_BG)
         left.pack(side="left", fill="x", expand=True)
 
-        status_row = tk.Frame(left, bg=CARD)
-        status_row.pack(fill="x", anchor="w")
+        brand_row = tk.Frame(left, bg=HEADER_BG)
+        brand_row.pack(fill="x", anchor="w")
+        tk.Label(brand_row, text="NETDOCTOR", bg=HEADER_BG, fg=LAVENDER, font=FONT_TITLE).pack(side="left")
+        tk.Label(brand_row, text="  adaptive bypass", bg=HEADER_BG, fg=DIM, font=FONT_SMALL).pack(side="left", pady=(2, 0))
+
+        status_row = tk.Frame(left, bg=HEADER_BG)
+        status_row.pack(fill="x", anchor="w", pady=(3, 0))
         self.hero_state_pill = tk.Label(
             status_row,
-            text="● Остановлена",
+            text="● ОСТАНОВЛЕНО",
             bg=INPUT,
             fg=MUTED,
-            font=FONT_SMALL_B,
-            padx=9,
-            pady=3,
+            font=FONT_MICRO,
+            padx=8,
+            pady=2,
         )
         self.hero_state_pill.pack(side="left", padx=(0, 10))
+        self.attach_tooltip(self.hero_state_pill, "Текущее состояние системы обхода блокировок и активный режим.")
+
         self.network_label = tk.Label(
-            status_row, text="Сеть: определение…", bg=CARD, fg=MUTED, font=FONT_SMALL, anchor="w", justify="left"
+            status_row, text="Сеть: определение…", bg=HEADER_BG, fg=MUTED, font=FONT_SMALL, anchor="w", justify="left"
         )
         self.network_label.pack(side="left", fill="x", expand=True)
         self._bind_responsive_wrap(self.network_label, min_wrap=150, pad=8)
@@ -1329,21 +2364,9 @@ class NetdoctorGuiApp(tk.Tk):
         )
         self._bind_responsive_wrap(self.bypass_label, min_wrap=220, pad=16)
 
-        self.hint_label = tk.Label(
-            left,
-            text="Нажмите «Включить защиту» — программа подберёт обход и начнёт следить за связью.",
-            bg=CARD,
-            fg=FG_SOFT,
-            font=FONT_SMALL,
-            anchor="w",
-            justify="left",
-        )
-        self.hint_label.pack(fill="x", anchor="w", pady=(5, 0))
-        self._bind_responsive_wrap(self.hint_label, min_wrap=240, pad=16)
-
     def _build_notebook(self, parent: tk.Misc) -> None:
         wrap = tk.Frame(parent, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=16, pady=(10, 10))
+        wrap.pack(fill="both", expand=True, padx=14, pady=(8, 8))
 
         self.notebook = ttk.Notebook(wrap, style="NavHidden.TNotebook")
         self.notebook.pack(fill="both", expand=True)
@@ -1358,22 +2381,22 @@ class NetdoctorGuiApp(tk.Tk):
         self.tab_realtime = self.tab_domains
 
         self.notebook.add(self.tab_home, text="Главная")
-        self.notebook.add(self.tab_domains, text="Домены и Трафик")
-        self.notebook.add(self.tab_presets, text="Пресеты Zapret")
+        self.notebook.add(self.tab_domains, text="Монитор и Сайты")
+        self.notebook.add(self.tab_presets, text="Стратегии Zapret")
         self.notebook.add(self.tab_dns, text="DNS и Нейросети")
-        self.notebook.add(self.tab_vpn, text="VPN Подписки")
-        self.notebook.add(self.tab_service, text="Сервис и Конфиги")
+        self.notebook.add(self.tab_vpn, text="VPN и Журналы")
+        self.notebook.add(self.tab_service, text="Настройки")
 
-        nav_defs: tuple[tuple[ttk.Frame, str, str, str], ...] = (
-            (self.tab_home, "⌂", "Главная", ""),
-            (self.tab_domains, "◈", "Домены и трафик", "0/0"),
-            (self.tab_presets, "✦", "Пресеты Zapret", "0"),
-            (self.tab_dns, "◉", "DNS и нейросети", "36"),
-            (self.tab_vpn, "⊕", "VPN и журналы", "0"),
-            (self.tab_service, "⚙", "Сервис и конфиги", ""),
+        nav_defs: tuple[tuple[ttk.Frame, str, str, str, str], ...] = (
+            (self.tab_home, "⌂", "Главная", "", "Главная — включение защиты и основные переключатели"),
+            (self.tab_domains, "📊", "Монитор", "0/0", "Монитор трафика и сайты — живые подключения и правила"),
+            (self.tab_presets, "⚡", "Пресеты", "0", "Стратегии Zapret — готовые и свои пресеты обхода"),
+            (self.tab_dns, "◉", "DNS", "36", "DNS и нейросети — быстрые защищённые DNS и доступ к ИИ"),
+            (self.tab_vpn, "☁", "VPN", "0", "VPN и журналы — точечный туннель и логи работы служб"),
+            (self.tab_service, "⚙", "Система", "", "Настройки и система — автозапуск, исключения и конфиги"),
         )
-        for tab, icon, title, badge in nav_defs:
-            self._add_nav_item(tab, icon, title, badge)
+        for tab, icon, title, badge, tip_text in nav_defs:
+            self._add_nav_item(tab, icon, title, badge, tooltip=tip_text)
 
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._sync_sidebar_selection())
 
@@ -1385,37 +2408,51 @@ class NetdoctorGuiApp(tk.Tk):
         self._build_service_tab()
         self._sync_sidebar_selection()
 
-    def _add_nav_item(self, tab: ttk.Frame, icon: str, title: str, badge_text: str) -> None:
+    def _add_nav_item(
+        self,
+        tab: ttk.Frame,
+        icon: str,
+        title: str,
+        badge_text: str,
+        *,
+        tooltip: str = "",
+    ) -> None:
         tab_key = str(tab)
         row = tk.Frame(self._nav_container, bg=SIDEBAR_BG, cursor="hand2")
-        row.pack(fill="x", pady=2)
+        row.pack(fill="x", pady=4)
 
         indicator = tk.Frame(row, bg=SIDEBAR_BG, width=3)
-        indicator.pack(side="left", fill="y")
+        indicator.pack(side="left", fill="y", padx=(0, 3))
 
-        icon_lbl = tk.Label(row, text=icon, bg=SIDEBAR_BG, fg=MUTED, font=FONT_UI_B, width=2, anchor="center", pady=8)
-        icon_lbl.pack(side="left", padx=(6, 4))
+        box = tk.Frame(row, bg=SIDEBAR_BG)
+        box.pack(side="left", fill="both", expand=True, padx=(0, 4))
 
-        text_lbl = tk.Label(row, text=title, bg=SIDEBAR_BG, fg=FG_SOFT, font=FONT_UI, anchor="w", pady=8)
-        text_lbl.pack(side="left", fill="x", expand=True)
+        icon_lbl = tk.Label(box, text=icon, bg=SIDEBAR_BG, fg=MUTED, font=("Segoe UI", 14, "bold"), anchor="center", pady=4)
+        icon_lbl.pack(fill="x")
+
+        # Keep text_lbl hidden from rail to keep compact icon-rail look while preserving 5-tuple contract
+        text_lbl = tk.Label(row, text=title, bg=SIDEBAR_BG, fg=FG_SOFT, font=FONT_MICRO)
 
         badge_lbl = tk.Label(
-            row,
+            box,
             text=badge_text,
             bg=INPUT if badge_text else SIDEBAR_BG,
             fg=MUTED,
-            font=FONT_MICRO,
-            padx=6 if badge_text else 0,
-            pady=1,
+            font=("Segoe UI", 7, "bold"),
+            padx=5 if badge_text else 0,
+            pady=0,
         )
-        badge_lbl.pack(side="right", padx=(4, 8))
+        if badge_text:
+            badge_lbl.pack(pady=(0, 3))
 
         self._nav_items[tab_key] = (row, indicator, icon_lbl, text_lbl, badge_lbl)
 
-        for w in (row, indicator, icon_lbl, text_lbl, badge_lbl):
+        for w in (row, indicator, box, icon_lbl, text_lbl, badge_lbl):
             w.bind("<Button-1>", lambda _e, t=tab: self._select_tab(t))
             w.bind("<Enter>", lambda _e, k=tab_key: self._hover_nav_item(k, True))
             w.bind("<Leave>", lambda _e, k=tab_key: self._hover_nav_item(k, False))
+            if tooltip:
+                self.attach_tooltip(w, tooltip)
 
     def _select_tab(self, tab: ttk.Frame) -> None:
         self.notebook.select(tab)
@@ -1444,6 +2481,7 @@ class NetdoctorGuiApp(tk.Tk):
         try:
             row.configure(bg=bg)
             indicator.configure(bg=bg)
+            icon_lbl.master.configure(bg=bg)
             icon_lbl.configure(bg=bg, fg=ACCENT if entering else MUTED)
             text_lbl.configure(bg=bg, fg=fg)
             if not badge_lbl.cget("text"):
@@ -1458,10 +2496,11 @@ class NetdoctorGuiApp(tk.Tk):
             active_key = ""
         for tab_key, (row, indicator, icon_lbl, text_lbl, badge_lbl) in self._nav_items.items():
             active = tab_key == active_key
-            bg = CARD_ALT if active else SIDEBAR_BG
+            bg = PILL_ACTIVE_BG if active else SIDEBAR_BG
             try:
                 row.configure(bg=bg)
                 indicator.configure(bg=ACCENT if active else bg)
+                icon_lbl.master.configure(bg=bg)
                 icon_lbl.configure(bg=bg, fg=ACCENT if active else MUTED)
                 text_lbl.configure(bg=bg, fg=FG if active else FG_SOFT, font=FONT_UI_B if active else FONT_UI)
                 has_badge = bool(badge_lbl.cget("text"))
@@ -1478,7 +2517,11 @@ class NetdoctorGuiApp(tk.Tk):
             return
         _row, _ind, _ic, _tx, badge_lbl = item
         try:
-            badge_lbl.configure(text=text, padx=6 if text else 0)
+            badge_lbl.configure(text=text, padx=5 if text else 0)
+            if text and not badge_lbl.winfo_manager():
+                badge_lbl.pack(pady=(0, 3))
+            elif not text and badge_lbl.winfo_manager():
+                badge_lbl.pack_forget()
             self._sync_sidebar_selection()
         except tk.TclError:
             pass
@@ -1487,57 +2530,82 @@ class NetdoctorGuiApp(tk.Tk):
 
     def _build_home_tab(self) -> None:
         tab = self.tab_home
-        hdr = tk.Frame(tab, bg=BG)
-        hdr.pack(fill="x", pady=(2, 5))
-        tk.Label(hdr, text="Панель управления", bg=BG, fg=FG, font=FONT_HERO, anchor="w").pack(side="left")
+
+        # Main reference-inspired dark container
+        surface = tk.Frame(tab, bg=SIDEBAR_BG, highlightthickness=1, highlightbackground=BORDER)
+        surface.pack(fill="both", expand=True)
+
+        hero = tk.Frame(surface, bg=SIDEBAR_BG)
+        hero.pack(fill="x", padx=18, pady=(5, 3))
         tk.Label(
-            hdr,
-            text="— включите защиту или настройте нужный сервис в один клик",
-            bg=BG,
+            hero,
+            text="СПОСОБ ПОДКЛЮЧЕНИЯ",
+            bg=SIDEBAR_BG,
+            fg=ACCENT,
+            font=("Segoe UI", 14, "bold"),
+            anchor="center",
+        ).pack(fill="x")
+        self.hint_label = tk.Label(
+            hero,
+            text="Выберите режим обхода и включите защиту одним нажатием",
+            bg=SIDEBAR_BG,
             fg=MUTED,
             font=FONT_SMALL,
-            anchor="w",
-        ).pack(side="left", padx=(8, 0), pady=(3, 0))
+            anchor="center",
+            justify="center",
+        )
+        self.hint_label.pack(fill="x", pady=(1, 0))
+        self._bind_responsive_wrap(self.hint_label, min_wrap=280, pad=36)
 
-        # Compact, dismissible 1-row quick-start bar (right label packed first so left text wraps safely)
-        self._home_guide_frame = tk.Frame(tab, bg=INFO_BG, highlightthickness=1, highlightbackground="#1E3A5F")
-        self._home_guide_frame.pack(fill="x", pady=(0, 4))
+        # Compact, dismissible 1-row quick-start bar
+        self._home_guide_frame = RoundedCard(
+            surface, bg=INFO_BG, outer_bg=SIDEBAR_BG, border="#1E425E", radius=11, pad=2
+        )
+        self._home_guide_frame.pack(fill="x", padx=16, pady=(0, 3))
+        guide_body = self._home_guide_frame.body
         hide_lbl = tk.Label(
-            self._home_guide_frame,
+            guide_body,
             text="Скрыть ✕",
             bg=INFO_BG,
             fg=ACCENT,
             font=FONT_SMALL_B,
             cursor="hand2",
             padx=10,
-            pady=3,
+            pady=1,
         )
         hide_lbl.pack(side="right")
         hide_lbl.bind("<Button-1>", lambda _e: self._toggle_home_guide())
         guide_lbl = tk.Label(
-            self._home_guide_frame,
-            text="1. Выберите рабочий пресет Zapret2 (или Авто-оркестратор)  →  2. Включите защиту  →  3. Нажмите «Проверить сейчас»",
+            guide_body,
+            text="1. Выберите стратегию (или Автоподбор)  →  2. Нажмите «ВКЛЮЧИТЬ ЗАЩИТУ»  →  3. Проверьте доступность сервисов",
             bg=INFO_BG,
             fg=FG_SOFT,
             font=FONT_SMALL,
             anchor="w",
             justify="left",
         )
-        guide_lbl.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=3)
-        self._bind_responsive_wrap(guide_lbl, min_wrap=260, pad=16)
+        guide_lbl.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=1)
+        self._bind_responsive_wrap(guide_lbl, min_wrap=260, pad=24)
 
-        # Conditional DoH / DNS alert banner (shown dynamically on Dashboard when active DNS fails TLS)
-        self._home_alert_frame = tk.Frame(tab, bg=WARN_BG, highlightthickness=1, highlightbackground=WARN)
-        alert_btns = tk.Frame(self._home_alert_frame, bg=WARN_BG)
-        alert_btns.pack(side="right", padx=8, pady=3)
+        # Conditional DoH / DNS alert banner (shown only when active DNS fails TLS)
+        self._home_alert_frame = RoundedCard(
+            surface, bg=WARN_BG, outer_bg=SIDEBAR_BG, border=WARN, radius=11, pad=2
+        )
+        alert_body = self._home_alert_frame.body
+        alert_btns = tk.Frame(alert_body, bg=WARN_BG)
+        alert_btns.pack(side="right", padx=8, pady=2)
         self.make_button(
-            alert_btns, "Открыть DNS →", lambda: self._select_tab(self.tab_dns), "neutral", font=FONT_MICRO, padx=8, pady=2
-        ).pack(side="right", padx=(4, 0))
-        self.make_button(
-            alert_btns, "Включить Comss DNS", lambda: self.on_select_dns("comss_dns"), "warn", font=FONT_MICRO, padx=8, pady=2
+            alert_btns,
+            "Включить рабочий DNS",
+            lambda: self.on_select_dns("comss_dns"),
+            "warn",
+            font=FONT_MICRO,
+            padx=8,
+            pady=1,
+            tooltip="Переключиться на рабочий защищённый DNS Comss без ошибки сертификата.",
         ).pack(side="right")
         self._home_alert_lbl = tk.Label(
-            self._home_alert_frame,
+            alert_body,
             text="",
             bg=WARN_BG,
             fg=WARN_TEXT,
@@ -1545,176 +2613,101 @@ class NetdoctorGuiApp(tk.Tk):
             anchor="w",
             justify="left",
         )
-        self._home_alert_lbl.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=3)
-        self._bind_responsive_wrap(self._home_alert_lbl, min_wrap=220, pad=16)
+        self._home_alert_lbl.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=2)
+        self._bind_responsive_wrap(self._home_alert_lbl, min_wrap=220, pad=24)
 
-        # Section 1: 4 Protection Layers
-        self._home_section1_lbl = tk.Label(
-            tab, text="Слои защиты (нажмите карточку для перехода)", bg=BG, fg=FG, font=FONT_H2
-        )
-        self._home_section1_lbl.pack(anchor="w", pady=(0, 3))
-        grid = tk.Frame(tab, bg=BG)
-        grid.pack(fill="x", pady=(0, 5))
-        for col in range(4):
-            grid.columnconfigure(col, weight=1, uniform="home_cards")
+        # Two equal primary connection cards (anchored via _home_section1_lbl for alert insertion)
+        hero_grid = tk.Frame(surface, bg=SIDEBAR_BG)
+        self._home_section1_lbl = hero_grid
+        hero_grid.pack(fill="x", padx=16, pady=(2, 4))
+        hero_grid.columnconfigure(0, weight=1, uniform="hero_cards")
+        hero_grid.columnconfigure(1, weight=1, uniform="hero_cards")
 
-        def _make_card(
-            col: int, title: str, color: str, desc: str, target_tab: ttk.Frame
-        ) -> tuple[tk.Label, tk.Label]:
-            card = tk.Frame(grid, bg=CARD, highlightthickness=1, highlightbackground=BORDER, cursor="hand2")
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 4, 0 if col == 3 else 4))
+        # ---- Left Card: ZAPRET (Primary Protection Toggle & Strategy) ----
+        left_card_wrap = RoundedCard(hero_grid, bg=CARD, outer_bg=SIDEBAR_BG, border=BORDER, radius=16, pad=3)
+        left_card_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self._home_zapret_card = left_card_wrap
+        left_card = left_card_wrap.body
 
-            stripe = tk.Frame(card, bg=color, height=3)
-            stripe.pack(fill="x")
-
-            top_r = tk.Frame(card, bg=CARD)
-            top_r.pack(fill="x", padx=9, pady=(5, 1))
-            go_lbl = tk.Label(top_r, text="→", bg=CARD, fg=DIM, font=FONT_SMALL_B)
-            go_lbl.pack(side="right")
-            hdr = tk.Label(top_r, text=title, bg=CARD, fg=color, font=FONT_SMALL_B, anchor="w")
-            hdr.pack(side="left", fill="x", expand=True)
-
-            val = tk.Label(card, text="—", bg=CARD, fg=FG, font=FONT_SMALL_B, anchor="w", justify="left", wraplength=150)
-            val.pack(fill="x", padx=9, pady=(0, 1))
-            self._bind_responsive_wrap(val, min_wrap=125, pad=18)
-
-            sub = tk.Label(
-                card, text="—", bg=CARD, fg=ACCENT, font=FONT_MICRO, anchor="w", justify="left", wraplength=150
-            )
-            sub.pack(fill="x", padx=9, pady=(0, 1))
-            self._bind_responsive_wrap(sub, min_wrap=125, pad=18)
-
-            note = tk.Label(card, text=desc, bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w", wraplength=150, justify="left")
-            note.pack(fill="x", padx=9, pady=(0, 5))
-            self._bind_responsive_wrap(note, min_wrap=125, pad=18)
-
-            inner_widgets: list[tk.Misc] = [top_r, hdr, go_lbl, val, sub, note]
-            self._bind_card_hover(card, inner_widgets, CARD, CARD_ALT, BORDER, color)
-            for w in [card, stripe, *inner_widgets]:
-                w.bind("<Button-1>", lambda _e, t=target_tab: self._select_tab(t))
-            return val, sub
-
-        self.card_dns_val, self.card_dns_sub = _make_card(
-            0,
-            "Слой 1 • DNS",
-            PURPLE,
-            "DNS-обход и персональные DNS",
-            self.tab_dns,
-        )
-        self.card_dpi_val, self.card_dpi_sub = _make_card(
-            1,
-            "Слой 2–3 • DPI",
-            ACCENT,
-            "Пресет Zapret2 или автоподбор",
-            self.tab_presets,
-        )
-        self.card_vpn_val, self.card_vpn_sub = _make_card(
-            2,
-            "Слой 4 • VPN и TG",
-            WARN,
-            "Точечный туннель и MTProto",
-            self.tab_vpn,
-        )
-        self.card_rt_val, self.card_rt_sub = _make_card(
-            3,
-            "Трафик и тесты",
-            OK_TEXT,
-            "Живые сокеты и % успеха",
-            self.tab_domains,
-        )
-
-        # Section 2: Active Zapret2 Preset Selector (replaces redundant quick-service cards on Home)
-        preset_card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        preset_card.pack(fill="x", pady=(0, 5))
-
-        p_top = tk.Frame(preset_card, bg=CARD)
-        p_top.pack(fill="x", padx=12, pady=(6, 2))
+        lc_head = tk.Frame(left_card, bg=CARD)
+        lc_head.pack(fill="x", padx=14, pady=(5, 1))
+        tk.Label(lc_head, text="⚡", bg=CARD, fg=ACCENT, font=("Segoe UI", 12, "bold")).pack(side="left", padx=(0, 6))
+        tk.Label(lc_head, text="ZAPRET", bg=CARD, fg=FG, font=FONT_H2).pack(side="left")
+        self.make_info_icon(
+            lc_head,
+            "Ускоряет YouTube, Discord и сайты на полной скорости интернета без изменения вашего IP-адреса.",
+            title="Обход блокировок (DPI)",
+            bg=CARD,
+        ).pack(side="left", padx=(4, 0))
         self.home_preset_mode_pill = tk.Label(
-            p_top,
-            text="● Авто-оркестратор",
+            lc_head,
+            text="● Автоподбор",
             bg=INFO_BG,
             fg=ACCENT,
             font=FONT_MICRO,
             padx=7,
-            pady=2,
+            pady=1,
         )
         self.home_preset_mode_pill.pack(side="right")
-        tk.Label(
-            p_top,
-            text="Режим Zapret2 (рабочий пресет или авто-оркестратор)",
-            bg=CARD,
-            fg=FG,
-            font=FONT_SMALL_B,
-            anchor="w",
-        ).pack(side="left", fill="x", expand=True)
 
-        p_row = tk.Frame(preset_card, bg=CARD)
-        p_row.pack(fill="x", padx=12, pady=(2, 7))
-        self.make_button(
-            p_row,
-            "Все пресеты →",
-            lambda: self._select_tab(self.tab_presets),
-            "ghost",
-            font=FONT_SMALL,
-            padx=8,
-            pady=3,
-        ).pack(side="right", padx=(4, 0))
-        self.make_button(
-            p_row,
-            "+ Свой пресет",
-            self._open_add_preset_focus,
-            "neutral",
-            font=FONT_SMALL_B,
-            padx=8,
-            pady=3,
-        ).pack(side="right", padx=(4, 0))
-        self.make_button(
-            p_row,
-            "Применить",
-            self.on_apply_home_preset,
-            "primary",
-            font=FONT_SMALL_B,
-            padx=10,
-            pady=3,
-        ).pack(side="right", padx=(6, 0))
+        lc_sub = tk.Frame(left_card, bg=CARD)
+        lc_sub.pack(fill="x", padx=14, pady=(0, 3))
+        self._home_zapret_pill = tk.Label(
+            lc_sub,
+            text="● ОТКЛЮЧЕНО",
+            bg=INPUT,
+            fg=MUTED,
+            font=FONT_MICRO,
+            padx=7,
+            pady=1,
+        )
+        self._home_zapret_pill.pack(side="left")
+        tk.Label(lc_sub, text="  Обход блокировок сайтов", bg=CARD, fg=DIM, font=FONT_MICRO).pack(side="left")
+
+        tk.Label(left_card, text="СТРАТЕГИЯ ОБХОДА", bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w").pack(
+            fill="x", padx=14, pady=(1, 2)
+        )
         self.home_preset_var = tk.StringVar(value="Авто-оркестратор (подбор по доменам)")
         self.home_preset_cb = ttk.Combobox(
-            p_row,
+            left_card,
             textvariable=self.home_preset_var,
             state="readonly",
             values=["Авто-оркестратор (подбор по доменам)"],
         )
-        self.home_preset_cb.pack(side="left", fill="x", expand=True)
+        self.home_preset_cb.pack(fill="x", padx=14, pady=(0, 5))
+        self.home_preset_cb.bind("<<ComboboxSelected>>", self._on_home_preset_selected)
+        self.attach_tooltip(
+            self.home_preset_cb,
+            "Выберите автоматический подбор для каждого сайта или готовую стратегию — режим применится сразу.",
+        )
 
-        # Section 3: Live Connectivity Test Strip (YouTube, Discord, Telegram, Overall %)
-        test_card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        test_card.pack(fill="x", pady=(0, 5))
+        self.autopilot_btn = self.make_button(
+            left_card,
+            "ВКЛЮЧИТЬ ЗАЩИТУ  ⏻",
+            self.on_toggle_autopilot,
+            "hero",
+            font=("Segoe UI", 11, "bold"),
+            padx=14,
+            pady=5,
+            radius=13,
+            tooltip="Запускает или полностью останавливает систему обхода блокировок.",
+        )
+        self.autopilot_btn.pack(fill="x", padx=14, pady=(0, 4))
 
-        t_row = tk.Frame(test_card, bg=CARD)
-        t_row.pack(fill="x", padx=12, pady=7)
         self.make_button(
-            t_row,
-            "Подробно →",
-            lambda: self._open_domains_subview("domains"),
-            "ghost",
-            font=FONT_SMALL,
-            padx=8,
-            pady=3,
-        ).pack(side="right", padx=(4, 0))
-        self.make_button(
-            t_row,
-            "▶ Проверить сейчас",
+            left_card,
+            "ПРОВЕРИТЬ ДОСТУПНОСТЬ  ↗",
             lambda: self.on_run_connectivity_tests(include_picked=False),
-            "success",
+            "cyan_ghost",
             font=FONT_SMALL_B,
             padx=10,
             pady=3,
-        ).pack(side="right", padx=(6, 0))
+            radius=10,
+            tooltip="Быстрая проверка открытия YouTube, Discord и Telegram прямо сейчас.",
+        ).pack(fill="x", padx=14, pady=(0, 4))
 
-        pills_wrap = tk.Frame(t_row, bg=CARD)
-        pills_wrap.pack(side="left", fill="x", expand=True)
-        tk.Label(pills_wrap, text="Тест:", bg=CARD, fg=MUTED, font=FONT_SMALL_B).pack(side="left", padx=(0, 6))
-
+        pills_wrap = tk.Frame(left_card, bg=CARD)
+        pills_wrap.pack(fill="x", padx=14, pady=(0, 5))
         self._home_service_pills: dict[str, tk.Label] = {}
         for sg_key, sg_title in (("youtube", "YouTube"), ("discord", "Discord"), ("telegram", "Telegram")):
             lbl = tk.Label(
@@ -1722,90 +2715,256 @@ class NetdoctorGuiApp(tk.Tk):
                 text=f"● {sg_title}: —",
                 bg=INPUT,
                 fg=MUTED,
-                font=FONT_SMALL_B,
-                padx=8,
-                pady=2,
+                font=FONT_MICRO,
+                padx=6,
+                pady=1,
             )
-            lbl.pack(side="left", padx=(0, 5))
+            lbl.pack(side="left", padx=(0, 4))
             self._home_service_pills[sg_key] = lbl
-
         self.home_test_rate_pill = tk.Label(
             pills_wrap,
             text="Успех: —",
             bg=INFO_BG,
             fg=ACCENT,
-            font=FONT_SMALL_B,
-            padx=8,
-            pady=2,
+            font=FONT_MICRO,
+            padx=6,
+            pady=1,
         )
-        self.home_test_rate_pill.pack(side="left", padx=(2, 0))
+        self.home_test_rate_pill.pack(side="right")
 
-        # Section 3: Unified Tools & Unlocker Guard Card (right controls packed first to avoid squashing)
-        tools_card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        tools_card.pack(fill="x", pady=(2, 0))
+        # ---- Right Card: VPN & Telegram Routing ----
+        right_card_wrap = RoundedCard(hero_grid, bg=CARD, outer_bg=SIDEBAR_BG, border=BORDER, radius=16, pad=3)
+        right_card_wrap.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self._home_vpn_card = right_card_wrap
+        right_card = right_card_wrap.body
 
-        helpers = tk.Frame(tools_card, bg=CARD)
-        helpers.pack(fill="x", padx=12, pady=4)
-        self.make_button(
-            helpers,
-            "Очистить DNS-кэш",
-            self.on_flush_dns,
-            "neutral",
-            font=FONT_SMALL_B,
-            padx=9,
-            pady=3,
-        ).pack(side="right", padx=(6, 0))
+        rc_head = tk.Frame(right_card, bg=CARD)
+        rc_head.pack(fill="x", padx=14, pady=(5, 1))
+        tk.Label(rc_head, text="☁", bg=CARD, fg="#FB923C", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(0, 6))
+        tk.Label(rc_head, text="VPN И TELEGRAM", bg=CARD, fg=FG, font=FONT_H2).pack(side="left")
+        self.make_info_icon(
+            rc_head,
+            "Точечный VPN подключается только к сайтам, заблокированным по IP. Встроенный прокси ускоряет Telegram.",
+            title="Дополнительное подключение",
+            bg=CARD,
+        ).pack(side="left", padx=(4, 0))
+        self._home_vpn_state_pill = tk.Label(
+            rc_head,
+            text="● РЕЗЕРВ",
+            bg=INPUT,
+            fg=MUTED,
+            font=FONT_MICRO,
+            padx=7,
+            pady=1,
+        )
+        self._home_vpn_state_pill.pack(side="right")
+
+        rc_sub = tk.Frame(right_card, bg=CARD)
+        rc_sub.pack(fill="x", padx=14, pady=(0, 3))
+        tk.Label(rc_sub, text="Гибридная маршрутизация и MTProto-прокси", bg=CARD, fg=DIM, font=FONT_MICRO).pack(side="left")
+
+        tk.Label(right_card, text="РЕЖИМ МАРШРУТИЗАЦИИ", bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w").pack(
+            fill="x", padx=14, pady=(1, 2)
+        )
+        self._stack_mode_labels = (
+            "Гибридный (Обход DPI + точечный VPN)",
+            "Только обход DPI (без VPN-туннеля)",
+        )
+        self.home_stack_mode_var = tk.StringVar(value=self._stack_mode_labels[0])
+        self.home_stack_mode_cb = ttk.Combobox(
+            right_card,
+            textvariable=self.home_stack_mode_var,
+            state="readonly",
+            values=self._stack_mode_labels,
+        )
+        self.home_stack_mode_cb.pack(fill="x", padx=14, pady=(0, 5))
+        self.home_stack_mode_cb.bind("<<ComboboxSelected>>", self._on_home_stack_mode_selected)
+        self.attach_tooltip(
+            self.home_stack_mode_cb,
+            "Гибридный режим включает точечный VPN только для заблокированных по IP сайтов. Без VPN работает только Zapret + Telegram.",
+        )
+
+        # Split 2-cell quick control strip (Reference 1 style)
+        split_box_wrap = RoundedCard(right_card, bg=INPUT, outer_bg=CARD, border=BORDER, radius=11, pad=2)
+        split_box_wrap.pack(fill="x", padx=14, pady=(0, 5))
+        split_box = split_box_wrap.body
+        split_box.columnconfigure(0, weight=1, uniform="rc_split")
+        split_box.columnconfigure(1, weight=0)
+        split_box.columnconfigure(2, weight=1, uniform="rc_split")
+
+        cell_l = tk.Frame(split_box, bg=INPUT)
+        cell_l.grid(row=0, column=0, sticky="nsew", padx=8, pady=3)
+        bd_lbl = tk.Label(cell_l, text="Резерв ByeDPI", bg=INPUT, fg=FG_SOFT, font=FONT_SMALL_B)
+        bd_lbl.pack(side="left")
+        self.make_info_icon(
+            cell_l,
+            "Запускает дополнительный локальный SOCKS5-прокси ByeDPI (ciadpi.exe) как запасной путь.",
+            bg=INPUT,
+        ).pack(side="left", padx=(2, 4))
+        self._home_byedpi_toggle = AnimatedToggle(cell_l, variable=self.byedpi_var, command=self.on_toggle_byedpi, bg=INPUT)
+        self._home_byedpi_toggle.pack(side="right")
+        self.attach_tooltip(self._home_byedpi_toggle, "Включить или выключить резервный SOCKS5-прокси ByeDPI.")
+
+        tk.Frame(split_box, bg=BORDER, width=1).grid(row=0, column=1, sticky="ns", pady=3)
+
+        cell_r = tk.Frame(split_box, bg=INPUT)
+        cell_r.grid(row=0, column=2, sticky="nsew", padx=8, pady=2)
         self.tg_proxy_btn = self.make_button(
-            helpers,
-            "✈ Telegram прокси",
+            cell_r,
+            "✈ Прокси Telegram",
             self.on_connect_telegram_proxy,
             "ghost",
             font=FONT_SMALL_B,
             padx=8,
-            pady=3,
+            pady=2,
+            radius=9,
+            tooltip="В один клик подключает Telegram Desktop к локальному MTProto-прокси и копирует ссылку.",
         )
-        self.tg_proxy_btn.pack(side="right", padx=(4, 0))
-        self.radar_btn = self.make_button(
-            helpers,
-            "Live-Радар: ВКЛ",
-            self.on_toggle_radar,
-            "primary",
-            font=FONT_SMALL_B,
-            padx=10,
-            pady=3,
-        )
-        self.radar_btn.pack(side="right", padx=(4, 0))
-        self.game_filter_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            helpers,
-            text="Игровой фильтр (UDP 1024–65535)",
-            variable=self.game_filter_var,
-            command=self.on_toggle_game_filter,
-            bg=CARD,
-            fg=FG,
-            selectcolor=PRIMARY_BG,
-            activebackground=CARD,
-            activeforeground=ACCENT,
-            font=FONT_SMALL_B,
-            anchor="w",
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0,
-        ).pack(side="left", fill="x", expand=True)
+        self.tg_proxy_btn.pack(fill="x", expand=True)
 
-        tk.Frame(tools_card, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=12)
+        # Live VPN / TG readout inside card
+        vpn_info_wrap = RoundedCard(right_card, bg=CARD_ALT, outer_bg=CARD, border=BORDER, radius=11, pad=2)
+        vpn_info_wrap.pack(fill="x", padx=14, pady=(0, 5))
+        vpn_info = vpn_info_wrap.body
+        self.card_vpn_val = tk.Label(vpn_info, text="ГОТОВ • загрузка узлов…", bg=CARD_ALT, fg=FG, font=FONT_SMALL_B, anchor="w")
+        self.card_vpn_val.pack(fill="x", padx=10, pady=(3, 1))
+        self._bind_responsive_wrap(self.card_vpn_val, min_wrap=180, pad=20)
+        self.card_vpn_sub = tk.Label(vpn_info, text="—", bg=CARD_ALT, fg=MUTED, font=FONT_MICRO, anchor="w")
+        self.card_vpn_sub.pack(fill="x", padx=10, pady=(0, 3))
+        self._bind_responsive_wrap(self.card_vpn_sub, min_wrap=180, pad=20)
+
+        # ---- Bottom Row: Summary Tiles (DNS / Rules) & Game Filter Switch ----
+        bot_grid = tk.Frame(surface, bg=SIDEBAR_BG)
+        bot_grid.pack(fill="x", padx=16, pady=(0, 4))
+        bot_grid.columnconfigure(0, weight=1, uniform="home_bot")
+        bot_grid.columnconfigure(1, weight=1, uniform="home_bot")
+
+        # Left bottom card: DNS & Rules status tiles (click to jump)
+        rules_card_wrap = RoundedCard(bot_grid, bg=CARD, outer_bg=SIDEBAR_BG, border=BORDER, radius=15, pad=3)
+        rules_card_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        rules_card = rules_card_wrap.body
+        rc_top = tk.Frame(rules_card, bg=CARD)
+        rc_top.pack(fill="x", padx=12, pady=(4, 2))
+        tk.Label(rc_top, text="DNS И БАЗА САЙТОВ", bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w").pack(side="left")
+        self.make_info_icon(
+            rc_top,
+            "Быстрая сводка по активному DNS-серверу и количеству сайтов с подобранными правилами. Нажмите плитку для перехода.",
+            bg=CARD,
+        ).pack(side="left", padx=(4, 0))
+
+        tiles_row = tk.Frame(rules_card, bg=CARD)
+        tiles_row.pack(fill="x", padx=12, pady=(0, 4))
+        tiles_row.columnconfigure(0, weight=1, uniform="home_tiles")
+        tiles_row.columnconfigure(1, weight=1, uniform="home_tiles")
+
+        dns_tile_wrap = RoundedCard(tiles_row, bg=CARD_ALT, outer_bg=CARD, border=BORDER, radius=11, pad=2)
+        dns_tile_wrap.configure(cursor="hand2")
+        dns_tile_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        dns_tile = dns_tile_wrap.body
+        dns_tile.configure(cursor="hand2")
+        dns_hdr = tk.Label(dns_tile, text="◉ Активный DNS", bg=CARD_ALT, fg=LAVENDER, font=FONT_MICRO, anchor="w")
+        dns_hdr.pack(fill="x", padx=8, pady=(3, 1))
+        self.card_dns_val = tk.Label(dns_tile, text="—", bg=CARD_ALT, fg=FG, font=FONT_SMALL_B, anchor="w")
+        self.card_dns_val.pack(fill="x", padx=8)
+        self._bind_responsive_wrap(self.card_dns_val, min_wrap=120, pad=16)
+        self.card_dns_sub = tk.Label(dns_tile, text="—", bg=CARD_ALT, fg=MUTED, font=FONT_MICRO, anchor="w")
+        self.card_dns_sub.pack(fill="x", padx=8, pady=(0, 3))
+        self._bind_responsive_wrap(self.card_dns_sub, min_wrap=120, pad=16)
+        self._bind_card_hover(
+            dns_tile_wrap, [dns_tile, dns_hdr, self.card_dns_val, self.card_dns_sub], CARD_ALT, INPUT_HOVER, BORDER, LAVENDER
+        )
+        for w in (dns_tile_wrap, dns_tile, dns_hdr, self.card_dns_val, self.card_dns_sub):
+            w.bind("<Button-1>", lambda _e: self._select_tab(self.tab_dns))
+            self.attach_tooltip(w, "Нажмите, чтобы выбрать другой защищённый DNS или настроить DNS для нейросетей.")
+
+        dpi_tile_wrap = RoundedCard(tiles_row, bg=CARD_ALT, outer_bg=CARD, border=BORDER, radius=11, pad=2)
+        dpi_tile_wrap.configure(cursor="hand2")
+        dpi_tile_wrap.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        dpi_tile = dpi_tile_wrap.body
+        dpi_tile.configure(cursor="hand2")
+        dpi_hdr = tk.Label(dpi_tile, text="◈ Правила сайтов", bg=CARD_ALT, fg=ACCENT, font=FONT_MICRO, anchor="w")
+        dpi_hdr.pack(fill="x", padx=8, pady=(3, 1))
+        self.card_dpi_val = tk.Label(dpi_tile, text="—", bg=CARD_ALT, fg=FG, font=FONT_SMALL_B, anchor="w")
+        self.card_dpi_val.pack(fill="x", padx=8)
+        self._bind_responsive_wrap(self.card_dpi_val, min_wrap=120, pad=16)
+        self.card_dpi_sub = tk.Label(dpi_tile, text="—", bg=CARD_ALT, fg=MUTED, font=FONT_MICRO, anchor="w")
+        self.card_dpi_sub.pack(fill="x", padx=8, pady=(0, 3))
+        self._bind_responsive_wrap(self.card_dpi_sub, min_wrap=120, pad=16)
+        self._bind_card_hover(
+            dpi_tile_wrap, [dpi_tile, dpi_hdr, self.card_dpi_val, self.card_dpi_sub], CARD_ALT, INPUT_HOVER, BORDER, ACCENT
+        )
+        for w in (dpi_tile_wrap, dpi_tile, dpi_hdr, self.card_dpi_val, self.card_dpi_sub):
+            w.bind("<Button-1>", lambda _e: self._select_tab(self.tab_domains))
+            self.attach_tooltip(w, "Нажмите, чтобы открыть список сайтов, правила обхода и живой монитор подключений.")
+
+        # Right bottom card: Game Filter toggle (Reference 1 style)
+        game_card_wrap = RoundedCard(bot_grid, bg=CARD, outer_bg=SIDEBAR_BG, border=BORDER, radius=15, pad=3)
+        game_card_wrap.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        game_card = game_card_wrap.body
+        gc_top = tk.Frame(game_card, bg=CARD)
+        gc_top.pack(fill="x", padx=12, pady=(4, 2))
+        tk.Label(gc_top, text="ИГРОВОЙ ФИЛЬТР", bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w").pack(side="left")
+        self.make_info_icon(
+            gc_top,
+            "Расширяет обход блокировок на высокие порты (1024–65535) для работы голосовых каналов Discord и онлайн-игр.",
+            title="Голосовой трафик и игры",
+            bg=CARD,
+        ).pack(side="left", padx=(4, 0))
+        self.game_filter_var = tk.BooleanVar(value=False)
+        self._game_filter_toggle = AnimatedToggle(
+            gc_top, variable=self.game_filter_var, command=self.on_toggle_game_filter, bg=CARD
+        )
+        self._game_filter_toggle.pack(side="right")
+        self.attach_tooltip(self._game_filter_toggle, "Включить обход голосовых каналов Discord и онлайн-игр.")
+
+        chips_row = tk.Frame(game_card, bg=CARD)
+        chips_row.pack(fill="x", padx=12, pady=(0, 4))
+        chips_row.columnconfigure(0, weight=1, uniform="gf_chips")
+        chips_row.columnconfigure(1, weight=1, uniform="gf_chips")
+        self._gf_chip1 = tk.Label(
+            chips_row,
+            text="🎙 Голосовые каналы",
+            bg=CARD_ALT,
+            fg=MUTED,
+            font=FONT_SMALL,
+            pady=4,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+        )
+        self._gf_chip1.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self._gf_chip2 = tk.Label(
+            chips_row,
+            text="🎮 Игровой UDP / TCP",
+            bg=CARD_ALT,
+            fg=MUTED,
+            font=FONT_SMALL,
+            pady=4,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+        )
+        self._gf_chip2.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        self.game_filter_var.trace_add("write", lambda *_: self._sync_game_filter_chips())
+
+        # ---- Bottom Collapsible Strip (preserves tools_card == unlocker_status_label.master.master) ----
+        tools_card_wrap = RoundedCard(surface, bg=CARD, outer_bg=SIDEBAR_BG, border=BORDER, radius=14, pad=2)
+        tools_card_wrap.pack(fill="x", padx=16, pady=(0, 5))
+        tools_card = tools_card_wrap.body
 
         guard_strip = tk.Frame(tools_card, bg=CARD)
-        guard_strip.pack(fill="x", padx=12, pady=6)
-        self.make_button(
+        guard_strip.pack(fill="x", padx=12, pady=3)
+        self._extra_toggle_lbl = tk.Label(
             guard_strip,
-            "Настроить исключения →",
-            lambda: self._select_tab(self.tab_service),
-            "ghost",
-            font=FONT_SMALL,
-            padx=8,
-            pady=2,
-        ).pack(side="right", padx=(8, 0))
+            text="Детали трафика ⌄",
+            bg=CARD,
+            fg=LAVENDER,
+            font=FONT_SMALL_B,
+            cursor="hand2",
+            padx=6,
+        )
+        self._extra_toggle_lbl.pack(side="right", padx=(8, 0))
+        self._extra_toggle_lbl.bind("<Button-1>", lambda _e: self._toggle_home_extra())
+        self.attach_tooltip(self._extra_toggle_lbl, "Показать или скрыть сводку активных подключений ПК.")
+
         self.unlocker_status_label = tk.Label(
             guard_strip,
             text="Защита Antigravity Unlocker и файла hosts: проверяется…",
@@ -1819,22 +2978,96 @@ class NetdoctorGuiApp(tk.Tk):
         self.unlocker_status_label.pack(side="left", fill="x", expand=True)
         self._bind_responsive_wrap(self.unlocker_status_label, min_wrap=200, pad=16)
 
+        self._home_extra_frame = tk.Frame(tools_card, bg=CARD_ALT)
+        self.card_rt_val = tk.Label(self._home_extra_frame, text="—", bg=CARD_ALT, fg=FG_SOFT, font=FONT_SMALL_B, anchor="w")
+        self.card_rt_val.pack(side="left", padx=(12, 8), pady=4)
+        self.card_rt_sub = tk.Label(self._home_extra_frame, text="—", bg=CARD_ALT, fg=MUTED, font=FONT_SMALL, anchor="w")
+        self.card_rt_sub.pack(side="left", fill="x", expand=True, padx=(0, 12), pady=4)
+
     def _toggle_home_guide(self) -> None:
         if self._guide_visible:
             self._home_guide_frame.pack_forget()
             self._guide_visible = False
 
-    # ---------------------------------------------------------------- Tab 2: Домены, тесты и живой трафик (Unified)
+    def _toggle_home_extra(self) -> None:
+        if self._extra_visible:
+            self._home_extra_frame.pack_forget()
+            self._extra_visible = False
+            self._extra_toggle_lbl.configure(text="Детали трафика ⌄")
+        else:
+            self._home_extra_frame.pack(fill="x")
+            self._extra_visible = True
+            self._extra_toggle_lbl.configure(text="Скрыть детали ⌃")
+
+    def _sync_game_filter_chips(self) -> None:
+        if not hasattr(self, "_gf_chip1"):
+            return
+        active = bool(self.game_filter_var.get())
+        bg = PILL_ACTIVE_BG if active else CARD_ALT
+        fg = FG if active else MUTED
+        brd = PILL_ACTIVE_BORDER if active else BORDER
+        for chip in (self._gf_chip1, self._gf_chip2):
+            chip.configure(bg=bg, fg=fg, highlightbackground=brd)
+
+    def _on_home_preset_selected(self, _event: Any = None) -> None:
+        if self._preset_cb_syncing:
+            return
+        self.on_apply_home_preset()
+
+    def _on_home_stack_mode_selected(self, _event: Any = None) -> None:
+        if self._stack_mode_syncing:
+            return
+        want_dpi_only = self.home_stack_mode_var.get() == self._stack_mode_labels[1]
+        if bool(self.dpi_only_var.get()) != want_dpi_only:
+            self.dpi_only_var.set(want_dpi_only)
+            self.on_toggle_dpi_only()
+
+    # ---------------------------------------------------------------- Tab 2: Монитор трафика и сайты (Unified)
 
     def _build_domains_tab(self) -> None:
         tab = self.tab_domains
-        self._make_page_header(
-            tab,
-            "Домены, тесты и живой трафик",
-            "Подобранные стратегии, процент успеха тестов (YouTube / Discord / Telegram) и активные соединения ПК в одном окне.",
-        )
+        hdr = tk.Frame(tab, bg=BG)
+        hdr.pack(fill="x", pady=(2, 6))
 
-        # Unified view switcher + overall success summary + quick test actions
+        self.radar_btn = self.make_button(
+            hdr,
+            "⏹ Остановить мониторинг",
+            self.on_toggle_radar,
+            "danger",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=4,
+            tooltip="Включает или приостанавливает сканирование активных подключений ПК в реальном времени.",
+        )
+        self.radar_btn.pack(side="right", padx=(8, 0))
+
+        title_col = tk.Frame(hdr, bg=BG)
+        title_col.pack(side="left", fill="x", expand=True)
+        t_row = tk.Frame(title_col, bg=BG)
+        t_row.pack(fill="x")
+        tk.Label(t_row, text="МОНИТОР ТРАФИКА И САЙТЫ", bg=BG, fg=FG, font=FONT_HERO, anchor="w").pack(side="left")
+        tk.Label(
+            t_row,
+            text="  LIVE  ",
+            bg=PILL_ACTIVE_BG,
+            fg=LAVENDER,
+            font=FONT_MICRO,
+            padx=6,
+            pady=2,
+        ).pack(side="left", padx=(8, 0))
+        sub_lbl = tk.Label(
+            title_col,
+            text="Живая активность подключений, правила обхода для отдельных сайтов и проверка доступности.",
+            bg=BG,
+            fg=MUTED,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+        )
+        sub_lbl.pack(fill="x", anchor="w", pady=(2, 0))
+        self._bind_responsive_wrap(sub_lbl, min_wrap=260, pad=16)
+
+        # Unified view switcher + overall success summary + full-list test
         switch_bar = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         switch_bar.pack(fill="x", pady=(0, 6))
 
@@ -1843,48 +3076,42 @@ class NetdoctorGuiApp(tk.Tk):
 
         self.make_button(
             sw_row,
-            "▶ Тест всех доменов",
+            "▶ Проверить все сайты",
             lambda: self.on_run_connectivity_tests(include_picked=True),
-            "neutral",
+            "cyan_ghost",
             font=FONT_SMALL_B,
-            padx=9,
+            padx=10,
             pady=4,
-        ).pack(side="right", padx=(4, 0))
-        self.make_button(
-            sw_row,
-            "▶ Тест YT / DC / TG",
-            lambda: self.on_run_connectivity_tests(include_picked=False),
-            "success",
-            font=FONT_SMALL_B,
-            padx=9,
-            pady=4,
+            tooltip="Проверяет доступность всех сайтов из таблицы ниже (быстрый тест YT/DC/TG находится на Главной).",
         ).pack(side="right", padx=(6, 0))
 
         self._subtab_domains_btn = self.make_button(
             sw_row,
-            "Подобранные домены (0)",
+            "Правила для сайтов (0)",
             lambda: self._switch_domains_subview("domains"),
-            "primary",
+            "pill_active",
             font=FONT_SMALL_B,
             padx=10,
             pady=4,
+            tooltip="Список сайтов с индивидуальными правилами обхода и инспектором проверок.",
         )
         self._subtab_domains_btn.pack(side="left", padx=(0, 4))
 
         self._subtab_conns_btn = self.make_button(
             sw_row,
-            "Активные сокеты (0)",
+            "Активные подключения (0)",
             lambda: self._switch_domains_subview("connections"),
             "neutral",
             font=FONT_SMALL_B,
             padx=10,
             pady=4,
+            tooltip="График активности и текущие сетевые подключения программ на компьютере.",
         )
         self._subtab_conns_btn.pack(side="left", padx=(0, 10))
 
         self._domains_test_summary_lbl = tk.Label(
             sw_row,
-            text="Успех тестов: —  •  Подобрано: 0  •  Живых сокетов: 0",
+            text="Успех проверок: —  •  Сайтов: 0  •  Подключений: 0",
             bg=CARD,
             fg=FG_SOFT,
             font=FONT_SMALL_B,
@@ -1915,7 +3142,7 @@ class NetdoctorGuiApp(tk.Tk):
                 pill_box,
                 LAYER_FILTER_LABELS.get(lid, lid),
                 lambda c=lid: self._set_domain_layer_filter(c),
-                "primary" if lid == "ALL" else "neutral",
+                "pill_active" if lid == "ALL" else "neutral",
                 font=FONT_SMALL,
                 padx=8,
                 pady=3,
@@ -1929,7 +3156,14 @@ class NetdoctorGuiApp(tk.Tk):
         self.search_entry = self.make_entry(filt_top, self.search_var, 18)
         self.search_entry.pack(side="left", fill="x", expand=True, ipady=3)
         self.make_button(
-            filt_top, "✕", lambda: self.search_var.set(""), "ghost", font=FONT_SMALL, padx=6, pady=2
+            filt_top,
+            "✕",
+            lambda: self.search_var.set(""),
+            "ghost",
+            font=FONT_SMALL,
+            padx=6,
+            pady=2,
+            tooltip="Очистить строку поиска",
         ).pack(side="left", padx=(4, 0))
 
         tk.Frame(toolbar, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=12)
@@ -1937,15 +3171,30 @@ class NetdoctorGuiApp(tk.Tk):
         filt_bot = tk.Frame(toolbar, bg=CARD)
         filt_bot.pack(fill="x", padx=12, pady=(5, 7))
         self.make_button(
-            filt_bot, "Проверить базовый список", self.on_diag_all, "neutral", font=FONT_SMALL_B, padx=10, pady=3
+            filt_bot,
+            "Проверить популярные сайты",
+            self.on_diag_all,
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=3,
+            tooltip="Запускает полную диагностику и подбор обхода для базового списка популярных сервисов.",
         ).pack(side="right", padx=(8, 0))
         tk.Label(filt_bot, text="Добавить сайт:", bg=CARD, fg=ACCENT, font=FONT_SMALL_B).pack(side="left", padx=(0, 6))
         self.new_domain_var = tk.StringVar()
         entry = self.make_entry(filt_bot, self.new_domain_var, 22)
         entry.pack(side="left", fill="x", expand=True, ipady=3)
         entry.bind("<Return>", lambda _e: self.on_check_new_domain())
+        self.attach_tooltip(entry, "Введите адрес сайта (например chatgpt.com или youtube.com) и нажмите Enter.")
         self.make_button(
-            filt_bot, "Подобрать для сайта", self.on_check_new_domain, "primary", font=FONT_SMALL_B, padx=10, pady=3
+            filt_bot,
+            "Подобрать обход",
+            self.on_check_new_domain,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=3,
+            tooltip="Проверит, почему сайт не открывается, и автоматически подберёт рабочий способ обхода.",
         ).pack(side="left", padx=(8, 0))
 
         paned = ttk.PanedWindow(self._domains_subview, orient="vertical")
@@ -1974,32 +3223,76 @@ class NetdoctorGuiApp(tk.Tk):
 
         self._domain_menu = tk.Menu(self, tearoff=0, bg=CARD_ALT, fg=FG, activebackground=SELECT_BG, activeforeground="#FFFFFF")
         self._domain_menu.add_command(label="▶ Проверить доступность сейчас", command=self.on_test_selected_domain)
-        self._domain_menu.add_command(label="📌 Закрепить / Открепить правило", command=self.on_toggle_pin_selected)
+        self._domain_menu.add_command(label="📌 Зафиксировать / Снять фиксацию", command=self.on_toggle_pin_selected)
         self._domain_menu.add_separator()
-        self._domain_menu.add_command(label="Автоподбор DPI", command=self.on_recheck_selected)
+        self._domain_menu.add_command(label="Подобрать обход DPI", command=self.on_recheck_selected)
         self._domain_menu.add_command(label="Подобрать персональный DNS", command=self.on_roll_dns_selected)
-        self._domain_menu.add_command(label="Глубокий поиск blockcheck2", command=self.on_blockcheck2_selected)
+        self._domain_menu.add_command(label="Глубокий поиск стратегии (blockcheck2)", command=self.on_blockcheck2_selected)
         self._domain_menu.add_separator()
         self._domain_menu.add_command(label="Направить через VPN", command=lambda: self._quick_pin_selected("vpn", "vpn-select"))
-        self._domain_menu.add_command(label="Открывать напрямую (direct)", command=lambda: self._quick_pin_selected("direct", None))
-        self._domain_menu.add_command(label="Копировать домен", command=self._copy_selected_domain)
+        self._domain_menu.add_command(label="Открывать напрямую (без обхода)", command=lambda: self._quick_pin_selected("direct", None))
+        self._domain_menu.add_command(label="Копировать адрес сайта", command=self._copy_selected_domain)
 
-        # ---- Sub-view 2: Active PC Sockets (formerly separate Live Connections tab) ----
+        # ---- Sub-view 2: Live Activity Chart & Active PC Connections ----
         self._conns_subview = tk.Frame(self._domains_view_container, bg=BG)
         self._build_conns_subview(self._conns_subview)
 
     def _build_conns_subview(self, parent: tk.Frame) -> None:
-        bar = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        bar.pack(fill="x", pady=(0, 6))
+        # Reference 2: 3 Metric Cards + Live Activity Sparkline
+        metrics = tk.Frame(parent, bg=BG)
+        metrics.pack(fill="x", pady=(0, 6))
+        for col in range(3):
+            metrics.columnconfigure(col, weight=1, uniform="rt_metrics")
+
+        def _metric_card(col: int, title: str, fg_col: str, note: str) -> tk.Label:
+            wrap = RoundedCard(metrics, bg=CARD, outer_bg=BG, border=BORDER, radius=13, pad=2)
+            wrap.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 4, 0 if col == 2 else 4))
+            c = wrap.body
+            tk.Label(c, text=title, bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w").pack(fill="x", padx=12, pady=(5, 1))
+            val = tk.Label(c, text="0", bg=CARD, fg=fg_col, font=("Segoe UI", 16, "bold"), anchor="w")
+            val.pack(fill="x", padx=12)
+            tk.Label(c, text=note, bg=CARD, fg=DIM, font=FONT_MICRO, anchor="w").pack(fill="x", padx=12, pady=(0, 5))
+            return val
+
+        self._rt_metric_total = _metric_card(0, "ПОДКЛЮЧЕНИЯ", FG, "Всего активных соединений")
+        self._rt_metric_prot = _metric_card(1, "ПОД ЗАЩИТОЙ", ACCENT, "Обрабатываются обходом")
+        self._rt_metric_fix = _metric_card(2, "ТРЕБУЮТ ВНИМАНИЯ", LAVENDER, "Зависшие или без правила")
+
+        chart_wrap = RoundedCard(parent, bg=CARD, outer_bg=BG, border=BORDER, radius=13, pad=2)
+        chart_wrap.pack(fill="x", pady=(0, 6))
+        chart_card = chart_wrap.body
+        ch_hdr = tk.Frame(chart_card, bg=CARD)
+        ch_hdr.pack(fill="x", padx=12, pady=(5, 0))
+        tk.Label(ch_hdr, text="АКТИВНОСТЬ В РЕАЛЬНОМ ВРЕМЕНИ", bg=CARD, fg=MUTED, font=FONT_MICRO).pack(side="left")
+        tk.Label(ch_hdr, text="● ВСЕГО", bg=CARD, fg=LAVENDER, font=FONT_MICRO).pack(side="right", padx=(8, 0))
+        tk.Label(ch_hdr, text="● ПОД ЗАЩИТОЙ", bg=CARD, fg=ACCENT, font=FONT_MICRO).pack(side="right")
+        self.sparkline_canvas = LiveSparklineCanvas(chart_card, height=74, bg=CARD)
+        self.sparkline_canvas.pack(fill="x", padx=6, pady=(2, 4))
+
+        bar_wrap = RoundedCard(parent, bg=CARD, outer_bg=BG, border=BORDER, radius=13, pad=2)
+        bar_wrap.pack(fill="x", pady=(0, 6))
+        bar = bar_wrap.body
 
         top_r = tk.Frame(bar, bg=CARD)
-        top_r.pack(fill="x", padx=12, pady=(7, 5))
+        top_r.pack(fill="x", padx=12, pady=(5, 4))
 
-        self.make_button(top_r, "Сканировать сейчас", self.refresh_realtime_async, "neutral", font=FONT_SMALL_B, pady=3).pack(
-            side="right", padx=(6, 0)
-        )
         self.make_button(
-            top_r, "Починить выбранное", self.on_heal_selected_connection, "primary", font=FONT_SMALL_B, pady=3
+            top_r,
+            "Обновить список",
+            self.refresh_realtime_async,
+            "neutral",
+            font=FONT_SMALL_B,
+            pady=3,
+            tooltip="Немедленно просканировать текущие сетевые подключения программ.",
+        ).pack(side="right", padx=(6, 0))
+        self.make_button(
+            top_r,
+            "Подобрать обход",
+            self.on_heal_selected_connection,
+            "primary",
+            font=FONT_SMALL_B,
+            pady=3,
+            tooltip="Найти рабочую стратегию обхода для выбранного в таблице подключения.",
         ).pack(side="right", padx=(8, 0))
         self._rt_summary_lbl = tk.Label(
             top_r,
@@ -2014,17 +3307,17 @@ class NetdoctorGuiApp(tk.Tk):
         tk.Frame(bar, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=12)
 
         bot_r = tk.Frame(bar, bg=CARD)
-        bot_r.pack(fill="x", padx=12, pady=(5, 7))
+        bot_r.pack(fill="x", padx=12, pady=(4, 5))
 
         pill_wrap = tk.Frame(bot_r, bg=CARD)
         pill_wrap.pack(side="right", padx=(8, 0))
         self._conn_filter_buttons.clear()
-        for fid, flabel in (("ALL", "Все"), ("needs_fix", "Нужна починка"), ("protected", "Под защитой")):
+        for fid, flabel in (("ALL", "Все"), ("needs_fix", "Требуют обхода"), ("protected", "Под защитой")):
             btn = self.make_button(
                 pill_wrap,
                 flabel,
                 lambda f=fid: self._set_conn_health_filter(f),
-                "primary" if fid == "ALL" else "neutral",
+                "pill_active" if fid == "ALL" else "neutral",
                 font=FONT_SMALL,
                 padx=8,
                 pady=3,
@@ -2033,28 +3326,25 @@ class NetdoctorGuiApp(tk.Tk):
             self._conn_filter_buttons[fid] = btn
 
         self.auto_heal_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
+        ah_row = self.make_toggle_row(
             bot_r,
-            text="Автоподбор стратегий для новых/зависших сокетов (откл. при фикс. пресете)",
-            variable=self.auto_heal_var,
+            "Автоматически подбирать обход для новых зависших подключений",
+            self.auto_heal_var,
             bg=CARD,
-            fg=FG,
-            selectcolor=PRIMARY_BG,
-            activebackground=CARD,
-            activeforeground=ACCENT,
             font=FONT_SMALL_B,
-            anchor="w",
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0,
-        ).pack(side="left", fill="x", expand=True)
+            fg=FG,
+            slider_width=36,
+            slider_height=18,
+            tooltip="В режиме Автоподбора программа автоматически подбирает стратегию, если соединение зависло. При фиксированном пресете не вмешивается.",
+        )
+        ah_row.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         paned = ttk.PanedWindow(parent, orient="vertical")
         paned.pack(fill="both", expand=True)
 
         conn_wrap = tk.Frame(paned, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         cols = tuple(c[0] for c in CONN_COLUMNS)
-        self.conn_tree = self.make_tree(conn_wrap, cols, height=10)
+        self.conn_tree = self.make_tree(conn_wrap, cols, height=8)
         for cid, title, width, anchor in CONN_COLUMNS:
             self.conn_tree.heading(cid, text=title)
             self.conn_tree.column(cid, width=width, anchor=anchor, stretch=cid in ("domain", "strategy"))  # type: ignore[arg-type]
@@ -2068,22 +3358,22 @@ class NetdoctorGuiApp(tk.Tk):
         paned.add(conn_wrap, weight=3)
 
         self._conn_menu = tk.Menu(self, tearoff=0, bg=CARD_ALT, fg=FG, activebackground=SELECT_BG, activeforeground="#FFFFFF")
-        self._conn_menu.add_command(label="Починить выбранное (автоподбор)", command=self.on_heal_selected_connection)
-        self._conn_menu.add_command(label="Показать в «Подобранных доменах»", command=self._open_selected_conn_domain)
-        self._conn_menu.add_command(label="Копировать домен", command=self._copy_selected_conn_domain)
+        self._conn_menu.add_command(label="Подобрать обход для этого сайта", command=self.on_heal_selected_connection)
+        self._conn_menu.add_command(label="Показать в таблице сайтов", command=self._open_selected_conn_domain)
+        self._conn_menu.add_command(label="Копировать адрес сайта", command=self._copy_selected_conn_domain)
 
         feed_panel = tk.Frame(paned, bg=BG)
         tk.Label(
             feed_panel,
-            text="Журнал автоподбора в реальном времени",
+            text="Журнал подключений и автоподбора",
             bg=BG,
             fg=ACCENT,
             font=FONT_SMALL_B,
             anchor="w",
-        ).pack(fill="x", pady=(6, 4))
+        ).pack(fill="x", pady=(4, 3))
         feed_box = tk.Frame(feed_panel, bg=SIDEBAR_BG, highlightthickness=1, highlightbackground=BORDER)
         feed_box.pack(fill="both", expand=True)
-        self.realtime_feed = self.make_text(feed_box, height=5, wrap="word")
+        self.realtime_feed = self.make_text(feed_box, height=4, wrap="word")
         self.realtime_feed.tag_configure("ok", foreground=OK_TEXT)
         self.realtime_feed.tag_configure("muted", foreground=MUTED)
         self._scrolled(feed_box, self.realtime_feed)
@@ -2095,11 +3385,11 @@ class NetdoctorGuiApp(tk.Tk):
             self._domains_subview.pack_forget()
             self._conns_subview.pack(fill="both", expand=True)
             self._restyle_button(self._subtab_domains_btn, self._subtab_domains_btn.cget("text"), "neutral")
-            self._restyle_button(self._subtab_conns_btn, self._subtab_conns_btn.cget("text"), "primary")
+            self._restyle_button(self._subtab_conns_btn, self._subtab_conns_btn.cget("text"), "pill_active")
         else:
             self._conns_subview.pack_forget()
             self._domains_subview.pack(fill="both", expand=True)
-            self._restyle_button(self._subtab_domains_btn, self._subtab_domains_btn.cget("text"), "primary")
+            self._restyle_button(self._subtab_domains_btn, self._subtab_domains_btn.cget("text"), "pill_active")
             self._restyle_button(self._subtab_conns_btn, self._subtab_conns_btn.cget("text"), "neutral")
 
     def _open_domains_subview(self, mode: str) -> None:
@@ -2113,7 +3403,7 @@ class NetdoctorGuiApp(tk.Tk):
     def _sync_domain_filter_pills(self) -> None:
         cur = self.layer_filter_var.get() or "ALL"
         for lid, btn in self._domain_filter_buttons.items():
-            self._restyle_button(btn, LAYER_FILTER_LABELS.get(lid, lid), "primary" if lid == cur else "neutral")
+            self._restyle_button(btn, LAYER_FILTER_LABELS.get(lid, lid), "pill_active" if lid == cur else "neutral")
 
     def _on_domain_context_menu(self, event: Any) -> None:
         iid = self.domain_tree.identify_row(event.y)
@@ -2151,7 +3441,7 @@ class NetdoctorGuiApp(tk.Tk):
         left = tk.Frame(panel, bg=CARD)
         left.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=8)
         self.inspector_title = tk.Label(
-            left, text="Выберите сайт в таблице выше, чтобы увидеть результаты проб", bg=CARD, fg=ACCENT, font=FONT_UI_B, anchor="w"
+            left, text="Выберите сайт в таблице выше, чтобы увидеть результаты проверок", bg=CARD, fg=ACCENT, font=FONT_UI_B, anchor="w"
         )
         self.inspector_title.pack(fill="x")
         box = tk.Frame(left, bg=SIDEBAR_BG, highlightthickness=1, highlightbackground=BORDER)
@@ -2166,8 +3456,8 @@ class NetdoctorGuiApp(tk.Tk):
         self.inspector.configure(state="normal")
         self.inspector.insert(
             "1.0",
-            "Выберите любой сайт в таблице выше — здесь появятся результаты DNS/TCP/TLS/QUIC проб, "
-            "подобранная стратегия и параметры обхода.\n",
+            "Выберите любой сайт в таблице выше — здесь появятся причины блокировки, "
+            "подобранная стратегия и история проверок.\n",
             "muted",
         )
         self.inspector.configure(state="disabled")
@@ -2221,12 +3511,12 @@ class NetdoctorGuiApp(tk.Tk):
         right.bind("<Configure>", _on_rule_frame_cfg)
         self.rule_canvas.bind("<Configure>", _on_rule_canvas_cfg)
 
-        tk.Label(right, text="Управление правилом", bg=CARD_ALT, fg=FG, font=FONT_UI_B, anchor="w").pack(
+        tk.Label(right, text="Настройка правила", bg=CARD_ALT, fg=FG, font=FONT_UI_B, anchor="w").pack(
             fill="x", padx=10, pady=(5, 0)
         )
         sub_rule_lbl = tk.Label(
             right,
-            text="Запустите автоподбор или задайте слой вручную:",
+            text="Запустите автоподбор или задайте способ обхода вручную:",
             bg=CARD_ALT,
             fg=MUTED,
             font=FONT_SMALL,
@@ -2238,19 +3528,40 @@ class NetdoctorGuiApp(tk.Tk):
 
         auto_row = tk.Frame(right, bg=CARD_ALT)
         auto_row.pack(fill="x", padx=10, pady=(0, 4))
-        self.make_button(auto_row, "▶ Тест", self.on_test_selected_domain, "success", font=FONT_SMALL_B, padx=5, pady=2).pack(
-            side="left", fill="x", expand=True, padx=(0, 3)
-        )
-        self.make_button(auto_row, "Авто DPI", self.on_recheck_selected, "primary", font=FONT_SMALL_B, padx=5, pady=2).pack(
-            side="left", fill="x", expand=True, padx=(0, 3)
-        )
-        self.make_button(auto_row, "Авто DNS", self.on_roll_dns_selected, "neutral", font=FONT_SMALL_B, padx=5, pady=2).pack(
-            side="left", fill="x", expand=True
-        )
+        self.make_button(
+            auto_row,
+            "▶ Проверить",
+            self.on_test_selected_domain,
+            "success",
+            font=FONT_SMALL_B,
+            padx=5,
+            pady=2,
+            tooltip="Проверить доступность выбранного сайта прямо сейчас.",
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.make_button(
+            auto_row,
+            "Подбор DPI",
+            self.on_recheck_selected,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=5,
+            pady=2,
+            tooltip="Автоматически подобрать рабочую стратегию DPI для этого сайта.",
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.make_button(
+            auto_row,
+            "Подбор DNS",
+            self.on_roll_dns_selected,
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=5,
+            pady=2,
+            tooltip="Найти отдельный рабочий DNS-сервер специально для этого сайта.",
+        ).pack(side="left", fill="x", expand=True)
 
         tk.Frame(right, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=10, pady=(0, 3))
 
-        tk.Label(right, text="Ручной выбор слоя и стратегии:", bg=CARD_ALT, fg=FG_SOFT, font=FONT_SMALL_B, anchor="w").pack(
+        tk.Label(right, text="Способ обхода и правило вручную:", bg=CARD_ALT, fg=FG_SOFT, font=FONT_SMALL_B, anchor="w").pack(
             fill="x", padx=10
         )
         self.override_layer_var = tk.StringVar(value="dpi")
@@ -2259,6 +3570,7 @@ class NetdoctorGuiApp(tk.Tk):
         )
         self.override_layer_cb.pack(fill="x", padx=10, pady=(2, 1))
         self.override_layer_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_override_layer_changed())
+        self.attach_tooltip(self.override_layer_cb, "Выберите способ обхода: dpi (быстрый), dns, vpn или direct (напрямую).")
 
         self._override_layer_hint_lbl = tk.Label(
             right,
@@ -2280,11 +3592,25 @@ class NetdoctorGuiApp(tk.Tk):
         pin_row = tk.Frame(right, bg=CARD_ALT)
         pin_row.pack(fill="x", padx=10, pady=(0, 6))
         self.pin_btn = self.make_button(
-            pin_row, "📌 Закрепить (Pin)", self.on_pin, "primary", font=FONT_SMALL_B, padx=8, pady=3
+            pin_row,
+            "Сохранить правило",
+            self.on_pin,
+            "hero",
+            font=FONT_SMALL_B,
+            padx=8,
+            pady=3,
+            tooltip="Применить выбранный выше способ и стратегию и закрепить за сайтом.",
         )
         self.pin_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
         self.unpin_btn = self.make_button(
-            pin_row, "Открепить", self.on_toggle_pin_selected, "neutral", font=FONT_SMALL, padx=8, pady=3
+            pin_row,
+            "Снять фиксацию",
+            self.on_toggle_pin_selected,
+            "neutral",
+            font=FONT_SMALL,
+            padx=8,
+            pady=3,
+            tooltip="Разрешить или запретить программе автоматически менять правило при сбоях.",
         )
         self.unpin_btn.pack(side="left")
 
@@ -2318,14 +3644,14 @@ class NetdoctorGuiApp(tk.Tk):
         for child in widget.winfo_children():
             self._bind_rule_mousewheel(child)
 
-    # ---------------------------------------------------------------- Tab 3: Пресеты Zapret2
+    # ---------------------------------------------------------------- Tab 3: Стратегии обхода (Zapret)
 
     def _build_presets_tab(self) -> None:
         tab = self.tab_presets
         self._make_page_header(
             tab,
-            "Пресеты Zapret2 (готовые и свои рабочие)",
-            "Выберите готовый пресет из Zapret2 (C:\\vso\\Dev) или добавьте свой рабочий — при активном пресете оркестратор не тратит ресурсы на перебор.",
+            "Стратегии и пресеты Zapret",
+            "Выберите готовый пресет обхода или добавьте свой рабочий (.txt / .bat). Пока выбран пресет, автоподбор на паузе.",
         )
 
         # Active mode bar + quick import actions
@@ -2335,18 +3661,39 @@ class NetdoctorGuiApp(tk.Tk):
         r1 = tk.Frame(top_card, bg=CARD)
         r1.pack(fill="x", padx=12, pady=(7, 5))
         self.make_button(
-            r1, "Импорт из C:\\vso\\Dev", self.on_import_presets_dir, "neutral", font=FONT_SMALL_B, padx=9, pady=4
+            r1,
+            "Импорт из папки…",
+            self.on_import_presets_dir,
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=9,
+            pady=4,
+            tooltip="Загрузить все файлы пресетов (.txt / .bat) из выбранной папки на диске.",
         ).pack(side="right", padx=(4, 0))
         self.make_button(
-            r1, "Импорт файла (.txt/.bat)", self.on_import_preset_file, "neutral", font=FONT_SMALL_B, padx=9, pady=4
+            r1,
+            "Загрузить файл…",
+            self.on_import_preset_file,
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=9,
+            pady=4,
+            tooltip="Импортировать один файл пресета (.txt, .bat или .cmd) и сразу включить его.",
         ).pack(side="right", padx=(4, 0))
         self.make_button(
-            r1, "Включить Авто-оркестратор", lambda: self.on_select_zapret_preset("auto"), "ghost", font=FONT_SMALL_B, padx=9, pady=4
+            r1,
+            "Режим автоподбора",
+            lambda: self.on_select_zapret_preset("auto"),
+            "cyan_ghost",
+            font=FONT_SMALL_B,
+            padx=9,
+            pady=4,
+            tooltip="Отключить фиксированный пресет и вернуть автоматический подбор правил для каждого сайта.",
         ).pack(side="right", padx=(6, 0))
 
         self.presets_active_lbl = tk.Label(
             r1,
-            text="Активный режим: Авто-оркестратор (подбор по доменам)",
+            text="Активный режим: Автоподбор (для каждого сайта отдельно)",
             bg=CARD,
             fg=ACCENT,
             font=FONT_UI_B,
@@ -2367,7 +3714,7 @@ class NetdoctorGuiApp(tk.Tk):
                 pill_wrap,
                 pf_lbl,
                 lambda f=pf_id: self._set_preset_filter(f),
-                "primary" if pf_id == "ALL" else "neutral",
+                "pill_active" if pf_id == "ALL" else "neutral",
                 font=FONT_SMALL,
                 padx=8,
                 pady=3,
@@ -2388,16 +3735,44 @@ class NetdoctorGuiApp(tk.Tk):
         act_bar = tk.Frame(top_pane, bg=BG)
         act_bar.pack(fill="x", pady=(0, 4))
         self.make_button(
-            act_bar, "✔ Активировать выбранный", self.on_activate_selected_preset, "success", font=FONT_SMALL_B, padx=10, pady=4
+            act_bar,
+            "✔ Включить выбранный",
+            self.on_activate_selected_preset,
+            "hero",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=4,
+            tooltip="Активировать выбранный в таблице пресет для всего трафика.",
         ).pack(side="left", padx=(0, 6))
         self.make_button(
-            act_bar, "▶ Тест пресета (YT/DC/TG)", self.on_test_selected_preset, "primary", font=FONT_SMALL_B, padx=10, pady=4
+            act_bar,
+            "▶ Проверить пресет",
+            self.on_test_selected_preset,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=4,
+            tooltip="Временнно применит выбранный пресет и измерит доступность YouTube, Discord и Telegram.",
         ).pack(side="left", padx=(0, 6))
         self.make_button(
-            act_bar, "В редактор ↓", self.on_load_selected_preset_to_editor, "neutral", font=FONT_SMALL, padx=8, pady=4
+            act_bar,
+            "Изменить в редакторе ↓",
+            self.on_load_selected_preset_to_editor,
+            "neutral",
+            font=FONT_SMALL,
+            padx=8,
+            pady=4,
+            tooltip="Скопировать параметры выбранного пресета в редактор ниже для доработки.",
         ).pack(side="left", padx=(0, 6))
         self.make_button(
-            act_bar, "Удалить свой", self.on_delete_selected_preset, "danger", font=FONT_SMALL, padx=8, pady=4
+            act_bar,
+            "Удалить свой",
+            self.on_delete_selected_preset,
+            "danger",
+            font=FONT_SMALL,
+            padx=8,
+            pady=4,
+            tooltip="Удалить выбранный пользовательский пресет (встроенные удалить нельзя).",
         ).pack(side="right")
 
         tree_wrap = tk.Frame(top_pane, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
@@ -2422,25 +3797,29 @@ class NetdoctorGuiApp(tk.Tk):
         ed_hdr.pack(fill="x", padx=12, pady=(7, 4))
         self.user_preset_activate_var = tk.BooleanVar(value=True)
         self.make_button(
-            ed_hdr, "+ Сохранить рабочий пресет", self.on_add_user_preset, "primary", font=FONT_SMALL_B, padx=10, pady=4
-        ).pack(side="right")
-        tk.Checkbutton(
             ed_hdr,
-            text="Активировать сразу",
-            variable=self.user_preset_activate_var,
+            "+ Сохранить свой пресет",
+            self.on_add_user_preset,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=4,
+            tooltip="Сохраняет текст параметров из поля ниже в вашу библиотеку пресетов.",
+        ).pack(side="right")
+        self.make_toggle_row(
+            ed_hdr,
+            "Включить сразу",
+            self.user_preset_activate_var,
             bg=CARD,
-            fg=FG_SOFT,
-            selectcolor=PRIMARY_BG,
-            activebackground=CARD,
-            activeforeground=ACCENT,
             font=FONT_SMALL,
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0,
-        ).pack(side="right", padx=(0, 10))
+            fg=FG_SOFT,
+            slider_width=34,
+            slider_height=16,
+            tooltip="Активировать новый пресет сразу после сохранения.",
+        ).pack(side="right", padx=(4, 10))
         tk.Label(
             ed_hdr,
-            text="Добавить свой рабочий пресет (текст winws2, .bat или --lua-desync=...)",
+            text="Добавить свой рабочий пресет (аргументы winws2 или .bat)",
             bg=CARD,
             fg=OK_TEXT,
             font=FONT_UI_B,
@@ -2453,7 +3832,7 @@ class NetdoctorGuiApp(tk.Tk):
         self.user_preset_name_var = tk.StringVar()
         self.user_preset_name_entry = self.make_entry(meta_r, self.user_preset_name_var, 22)
         self.user_preset_name_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), ipady=2)
-        tk.Label(meta_r, text="Описание:", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(0, 5))
+        tk.Label(meta_r, text="Заметка:", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(0, 5))
         self.user_preset_desc_var = tk.StringVar()
         self.make_entry(meta_r, self.user_preset_desc_var, 24).pack(side="left", fill="x", expand=True, ipady=2)
 
@@ -2478,7 +3857,7 @@ class NetdoctorGuiApp(tk.Tk):
         self._scrolled(txt_wrap, self.user_preset_text, horizontal=True)
         paned.add(ed_card, weight=2)
 
-    # ---------------------------------------------------------------- Tab 3: DNS и Нейросети
+    # ---------------------------------------------------------------- Tab 4: DNS и Нейросети
 
     def _build_dns_tab(self) -> None:
         tab = self.tab_dns
@@ -2499,7 +3878,7 @@ class NetdoctorGuiApp(tk.Tk):
         tk.Label(hdr_left, text="DNS и нейросети", bg=BG, fg=FG, font=FONT_HERO, anchor="w").pack(anchor="w")
         sub_lbl = tk.Label(
             hdr_left,
-            text="Выберите общий DNS по умолчанию или назначьте персональный DNS для нейросетей.",
+            text="Выберите общий защищённый DNS по умолчанию или назначьте персональный DNS для ChatGPT, Claude и других сервисов.",
             bg=BG,
             fg=MUTED,
             font=FONT_SMALL,
@@ -2514,21 +3893,23 @@ class NetdoctorGuiApp(tk.Tk):
         bar.pack(fill="x", pady=(0, 8))
         self.make_button(
             bar,
-            "Лучший DNS",
-            lambda: self.on_auto_select_dns("uncommon"),
-            "neutral",
+            "Выбрать самый быстрый",
+            lambda: self.on_auto_select_dns("uncommon" if self.dns_category_filter == "ALL" else self.dns_category_filter),
+            "cyan_ghost",
             font=FONT_SMALL_B,
-            padx=8,
+            padx=9,
             pady=3,
+            tooltip="Измеряет задержку серверов в выбранной категории и автоматически включает самый быстрый рабочий DNS.",
         ).pack(side="right", padx=(4, 0))
         self.make_button(
             bar,
-            "Пинг всех",
+            "Измерить пинг всех",
             self.on_ping_dns_catalog,
             "success",
             font=FONT_SMALL_B,
-            padx=8,
+            padx=9,
             pady=3,
+            tooltip="Проверяет скорость отклика (мс) и доступность каждого DNS-сервера в текущем списке.",
         ).pack(side="right", padx=(6, 0))
 
         cat_btns: tuple[tuple[str, str], ...] = (
@@ -2544,7 +3925,7 @@ class NetdoctorGuiApp(tk.Tk):
                 bar,
                 label,
                 lambda c=cat_id: self.set_dns_category_filter(c),
-                "primary" if cat_id == "ALL" else "neutral",
+                "pill_active" if cat_id == "ALL" else "neutral",
                 font=FONT_SMALL,
                 padx=7,
                 pady=3,
@@ -2552,7 +3933,7 @@ class NetdoctorGuiApp(tk.Tk):
             btn.pack(side="left", padx=(0, 3))
             self._dns_cat_buttons[cat_id] = btn
 
-        # Clean two-column action row (each card has ample room without horizontal clipping)
+        # Clean two-column action row
         tools_row = tk.Frame(tab, bg=BG)
         tools_row.pack(fill="x", pady=(0, 8))
         tools_row.columnconfigure(0, weight=1, uniform="dnstools")
@@ -2565,7 +3946,7 @@ class NetdoctorGuiApp(tk.Tk):
         )
         roll_sub = tk.Label(
             roll_box,
-            text="Подбирает отдельный рабочий DNS для домена.",
+            text="Находит отдельный рабочий DNS для указанного домена или сразу для всех ИИ.",
             bg=CARD,
             fg=MUTED,
             font=FONT_SMALL,
@@ -2577,12 +3958,26 @@ class NetdoctorGuiApp(tk.Tk):
         self._bind_responsive_wrap(roll_sub, min_wrap=200, pad=24)
         r_inner = tk.Frame(roll_box, bg=CARD)
         r_inner.pack(fill="x", padx=12, pady=(0, 10))
-        self.make_button(r_inner, "Ролл для ИИ", self.on_roll_all_ai_dns, "primary", font=FONT_SMALL_B, padx=8, pady=4).pack(
-            side="right", padx=(4, 0)
-        )
-        self.make_button(r_inner, "Подобрать", self.on_roll_dns_domain, "success", font=FONT_SMALL_B, padx=8, pady=4).pack(
-            side="right", padx=(6, 0)
-        )
+        self.make_button(
+            r_inner,
+            "Настроить для всех ИИ",
+            self.on_roll_all_ai_dns,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=8,
+            pady=4,
+            tooltip="Автоматически подбирает рабочие DNS для ChatGPT, Claude, Gemini и других нейросетей.",
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            r_inner,
+            "Подобрать",
+            self.on_roll_dns_domain,
+            "success",
+            font=FONT_SMALL_B,
+            padx=8,
+            pady=4,
+            tooltip="Проверит и назначит лучший персональный DNS для введённого сайта.",
+        ).pack(side="right", padx=(6, 0))
         self.dns_roll_domain_var = tk.StringVar()
         roll_entry = self.make_entry(r_inner, self.dns_roll_domain_var, 10)
         roll_entry.pack(side="left", fill="x", expand=True, ipady=3)
@@ -2604,10 +3999,17 @@ class NetdoctorGuiApp(tk.Tk):
 
         c_row2 = tk.Frame(custom_box, bg=CARD)
         c_row2.pack(fill="x", padx=12, pady=(0, 10))
-        self.make_button(c_row2, "+ Добавить", self.on_add_custom_dns, "primary", font=FONT_SMALL_B, padx=8, pady=4).pack(
-            side="right", padx=(6, 0)
-        )
-        tk.Label(c_row2, text="DoH / заметка:", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(0, 4))
+        self.make_button(
+            c_row2,
+            "+ Добавить DNS",
+            self.on_add_custom_dns,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=8,
+            pady=4,
+            tooltip="Сохранить собственный DNS или DoH-адрес в раздел «Мои DNS».",
+        ).pack(side="right", padx=(6, 0))
+        tk.Label(c_row2, text="DoH URL / заметка:", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(0, 4))
         self.custom_dns_desc_var = tk.StringVar()
         self.make_entry(c_row2, self.custom_dns_desc_var, 10).pack(side="left", fill="x", expand=True, ipady=2)
 
@@ -2663,7 +4065,7 @@ class NetdoctorGuiApp(tk.Tk):
     def set_dns_category_filter(self, category: str) -> None:
         self.dns_category_filter = category
         for cid, btn in self._dns_cat_buttons.items():
-            self._restyle_button(btn, btn.cget("text"), "primary" if cid == category else "neutral")
+            self._restyle_button(btn, btn.cget("text"), "pill_active" if cid == category else "neutral")
         self._dns_signature = ""
         if self.dns_catalog:
             self.render_dns_grid(self.dns_catalog, self.active_dns_id)
@@ -2777,7 +4179,7 @@ class NetdoctorGuiApp(tk.Tk):
     ) -> None:
         card_bg = CARD_ACTIVE if is_active else CARD
         hover_bg = CARD_ACTIVE if is_active else CARD_ALT
-        border_col = ACCENT if is_active else BORDER
+        border_col = CYAN_BORDER if is_active else BORDER
         border_w = 2 if is_active else 1
 
         card = tk.Frame(
@@ -2930,17 +4332,17 @@ class NetdoctorGuiApp(tk.Tk):
     def _set_conn_health_filter(self, health: str) -> None:
         self.conn_health_filter = health
         for fid, btn in self._conn_filter_buttons.items():
-            self._restyle_button(btn, btn.cget("text"), "primary" if fid == health else "neutral")
+            self._restyle_button(btn, btn.cget("text"), "pill_active" if fid == health else "neutral")
         self.populate_connections_table(self.live_connections, events=self._last_conn_events)
 
-    # ---------------------------------------------------------------- Tab 5: VPN Подписки и Журналы
+    # ---------------------------------------------------------------- Tab 5: VPN и журналы
 
     def _build_vpn_tab(self) -> None:
         tab = self.tab_vpn
         self._make_page_header(
             tab,
-            "VPN-подписки и журналы служб",
-            "Обычный трафик идёт напрямую; VPN-туннель sing-box используется точечно для сайтов из слоя «vpn».",
+            "VPN и журналы служб",
+            "Обычный трафик идёт напрямую или через Zapret; VPN используется точечно для сайтов с блокировкой по IP.",
         )
 
         vpn_card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
@@ -2948,13 +4350,27 @@ class NetdoctorGuiApp(tk.Tk):
 
         row1 = tk.Frame(vpn_card, bg=CARD)
         row1.pack(fill="x", padx=12, pady=(8, 5))
-        self.make_button(row1, "Обновить подписки", self.on_refresh_subscriptions, "neutral", font=FONT_SMALL_B, padx=9, pady=4).pack(
-            side="right", padx=(4, 0)
-        )
-        self.make_button(row1, "+ Добавить", self.on_add_subscription, "primary", font=FONT_SMALL_B, padx=10, pady=4).pack(
-            side="right", padx=(8, 0)
-        )
-        tk.Label(row1, text="Подписка / URI:", bg=CARD, fg=MUTED, font=FONT_SMALL_B).pack(side="left", padx=(0, 8))
+        self.make_button(
+            row1,
+            "Обновить список",
+            self.on_refresh_subscriptions,
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=9,
+            pady=4,
+            tooltip="Скачать актуальный список серверов из всех добавленных подписок.",
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            row1,
+            "+ Добавить подписку",
+            self.on_add_subscription,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=4,
+            tooltip="Добавить ссылку на подписку (URL) или отдельный ключ vless://, vmess://, trojan://, ss://.",
+        ).pack(side="right", padx=(8, 0))
+        tk.Label(row1, text="Ссылка / ключ:", bg=CARD, fg=MUTED, font=FONT_SMALL_B).pack(side="left", padx=(0, 8))
         self.sub_var = tk.StringVar()
         sub_entry = self.make_entry(row1, self.sub_var, 20)
         sub_entry.pack(side="left", ipady=3, fill="x", expand=True)
@@ -2964,15 +4380,29 @@ class NetdoctorGuiApp(tk.Tk):
 
         row2 = tk.Frame(vpn_card, bg=CARD)
         row2.pack(fill="x", padx=12, pady=(5, 5))
-        self.make_button(row2, "Ротировать узел", self.on_rotate_vpn_node, "warn", font=FONT_SMALL_B, padx=9, pady=4).pack(
-            side="right", padx=(6, 0)
-        )
         self.make_button(
-            row2, "Проверить туннель / пинг", self.on_ping_vpn_nodes, "success", font=FONT_SMALL_B, padx=9, pady=4
+            row2,
+            "Сменить сервер",
+            self.on_rotate_vpn_node,
+            "warn",
+            font=FONT_SMALL_B,
+            padx=9,
+            pady=4,
+            tooltip="Переключить активный VPN на выбранный в таблице сервер или на следующий рабочий без перезапуска защиты.",
+        ).pack(side="right", padx=(6, 0))
+        self.make_button(
+            row2,
+            "Проверить пинг серверов",
+            self.on_ping_vpn_nodes,
+            "cyan_ghost",
+            font=FONT_SMALL_B,
+            padx=9,
+            pady=4,
+            tooltip="Измерить реальную задержку (пинг) и доступность каждого VPN-сервера внутри туннеля.",
         ).pack(side="right", padx=(8, 0))
         self._vpn_summary_lbl = tk.Label(
             row2,
-            text="Узлы VPN-пула (Circuit Breaker и задержка внутри туннеля)",
+            text="Список серверов VPN и текущая задержка внутри туннеля",
             bg=CARD,
             fg=FG_SOFT,
             font=FONT_SMALL,
@@ -2993,21 +4423,43 @@ class NetdoctorGuiApp(tk.Tk):
             textvariable=self.vpn_mode_var,
             values=[VPN_MODE_AUTO_LABEL, VPN_MODE_PRIORITY_LABEL],
             state="readonly",
-            width=25,
+            width=26,
         )
         self.vpn_mode_cb.pack(side="left", padx=(0, 8))
         self.vpn_mode_cb.bind("<<ComboboxSelected>>", self.on_vpn_mode_change)
+        self.attach_tooltip(
+            self.vpn_mode_cb,
+            "Автовыбор сам переключается на самый быстрый рабочий сервер; Приоритетный держит выбранный вами сервер №1.",
+        )
         self.make_button(
-            row3, "Автовыбор", self.on_set_vpn_auto_mode, "neutral", font=FONT_SMALL_B, padx=8, pady=3
+            row3,
+            "↓ Ниже",
+            lambda: self.on_move_vpn_priority(1),
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=8,
+            pady=3,
+            tooltip="Понизить приоритет выбранного в таблице сервера.",
         ).pack(side="right", padx=(4, 0))
         self.make_button(
-            row3, "▼", lambda: self.on_move_vpn_priority(1), "neutral", font=FONT_SMALL_B, padx=8, pady=3
+            row3,
+            "↑ Выше",
+            lambda: self.on_move_vpn_priority(-1),
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=8,
+            pady=3,
+            tooltip="Повысить приоритет выбранного в таблице сервера.",
         ).pack(side="right", padx=(4, 0))
         self.make_button(
-            row3, "▲", lambda: self.on_move_vpn_priority(-1), "neutral", font=FONT_SMALL_B, padx=8, pady=3
-        ).pack(side="right", padx=(4, 0))
-        self.make_button(
-            row3, "★ Приоритетный", self.on_set_priority_vpn_node, "primary", font=FONT_SMALL_B, padx=9, pady=3
+            row3,
+            "★ Сделать основным",
+            self.on_set_priority_vpn_node,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=9,
+            pady=3,
+            tooltip="Назначить выбранный сервер основным (#1) и переключить режим на «Приоритетный».",
         ).pack(side="right", padx=(8, 0))
 
         paned = ttk.PanedWindow(tab, orient="vertical")
@@ -3019,12 +4471,12 @@ class NetdoctorGuiApp(tk.Tk):
         )
         for cid, title, width in (
             ("priority", "Приоритет", 82),
-            ("tag", "Сервер (tag)", 180),
+            ("tag", "Сервер", 180),
             ("region", "Регион", 66),
             ("protocol", "Протокол", 82),
             ("transport", "Транспорт", 82),
             ("server", "Адрес : Порт / Пинг", 210),
-            ("health", "Circuit Breaker / Статус", 175),
+            ("health", "Состояние сервера", 175),
         ):
             self.vpn_tree.heading(cid, text=title)
             self.vpn_tree.column(cid, width=width, anchor="w", stretch=cid in ("tag", "health"))  # type: ignore[arg-type]
@@ -3043,6 +4495,7 @@ class NetdoctorGuiApp(tk.Tk):
         log_cb = ttk.Combobox(head, textvariable=self.log_var, values=LOG_FILES, state="readonly", width=20)
         log_cb.pack(side="left")
         log_cb.bind("<<ComboboxSelected>>", lambda _e: self.refresh_logs_async())
+        self.attach_tooltip(log_cb, "winws2.log — обход DPI; sing-box.log — VPN и DNS; tg-ws-proxy.log — прокси Telegram.")
         tk.Label(head, text="● автообновление 2с", bg=OK_BG, fg=OK_TEXT, font=FONT_MICRO, padx=7, pady=2).pack(
             side="left", padx=10
         )
@@ -3051,7 +4504,7 @@ class NetdoctorGuiApp(tk.Tk):
         self._log_alert_bar = tk.Frame(log_panel, bg=WARN_BG, highlightthickness=1, highlightbackground=WARN)
         self.make_button(
             self._log_alert_bar,
-            "Открыть DNS →",
+            "Перейти в DNS →",
             lambda: self._select_tab(self.tab_dns),
             "warn",
             font=FONT_MICRO,
@@ -3075,28 +4528,29 @@ class NetdoctorGuiApp(tk.Tk):
         self._scrolled(wrap, self.log_view, horizontal=True)
         paned.add(log_panel, weight=3)
 
-    # ---------------------------------------------------------------- Tab 6: Сервис и Конфиги
+    # ---------------------------------------------------------------- Tab 6: Настройки и система
 
     def _build_service_tab(self) -> None:
         tab = self.tab_service
         self._make_page_header(
             tab,
-            "Сервис, исключения и конфигурация",
-            "Управление службами, защита сторонних анлокеров и просмотр сгенерированных файлов winws2 / sing-box.",
+            "Настройки и система",
+            "Автозапуск, обслуживание модулей, исключения для сторонних программ и просмотр конфигов.",
         )
 
         body = tk.Frame(tab, bg=BG)
         body.pack(fill="both", expand=True)
 
         # Left column: actions, settings, exit
-        left = tk.Frame(body, bg=BG, width=282)
+        left = tk.Frame(body, bg=BG, width=312)
         left.pack(side="left", fill="y", padx=(0, 10))
         left.pack_propagate(False)
 
-        act_card = tk.Frame(left, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        act_card.pack(fill="x", pady=(0, 5))
-        tk.Label(act_card, text="Обслуживание стека", bg=CARD, fg=ACCENT, font=FONT_UI_B, anchor="w").pack(
-            fill="x", padx=10, pady=(6, 3)
+        act_wrap = RoundedCard(left, bg=CARD, outer_bg=BG, border=BORDER, radius=13, pad=2)
+        act_wrap.pack(fill="x", pady=(0, 4))
+        act_card = act_wrap.body
+        tk.Label(act_card, text="Обслуживание модулей", bg=CARD, fg=ACCENT, font=FONT_UI_B, anchor="w").pack(
+            fill="x", padx=10, pady=(4, 2)
         )
         handlers: dict[str, Callable[[], None]] = {
             "layers": self.on_check_layers,
@@ -3104,47 +4558,76 @@ class NetdoctorGuiApp(tk.Tk):
             "reload_sb": self.on_reload_singbox,
             "reval": self.on_revalidate,
             "gen": self.on_generate,
+            "flush_dns": self.on_flush_dns,
             "verify": self.on_verify,
         }
         kinds = {"layers": "primary"}
-        for key, title in SERVICE_ACTIONS:
-            btn = self.make_button(act_card, title, handlers[key], kinds.get(key, "neutral"), font=FONT_SMALL_B, padx=9, pady=3)
+        for key, title, tip_text in SERVICE_ACTIONS:
+            btn = self.make_button(
+                act_card,
+                title,
+                handlers[key],
+                kinds.get(key, "neutral"),
+                font=FONT_SMALL_B,
+                padx=9,
+                pady=2,
+                radius=8,
+                tooltip=tip_text,
+            )
             btn.configure(anchor="w")
             btn.pack(fill="x", padx=10, pady=1)
-        tk.Frame(act_card, bg=CARD, height=5).pack()
+        tk.Frame(act_card, bg=CARD, height=3).pack()
 
-        opt_card = tk.Frame(left, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        opt_card.pack(fill="x", pady=(0, 5))
-        tk.Label(opt_card, text="Параметры работы", bg=CARD, fg=ACCENT, font=FONT_UI_B, anchor="w").pack(
-            fill="x", padx=10, pady=(6, 3)
+        opt_wrap = RoundedCard(left, bg=CARD, outer_bg=BG, border=BORDER, radius=13, pad=2)
+        opt_wrap.pack(fill="x", pady=(0, 4))
+        opt_card = opt_wrap.body
+        tk.Label(opt_card, text="Системные параметры", bg=CARD, fg=ACCENT, font=FONT_UI_B, anchor="w").pack(
+            fill="x", padx=10, pady=(4, 2)
         )
-        for var, label, cmd in (
-            (self.minimize_to_tray_var, "Сворачивать в трей при закрытии (X)", None),
-            (self.autostart_var, "Автозапуск Windows при входе", self.on_toggle_autostart),
-            (self.dpi_only_var, "Режим без TUN (только Zapret2 + TG)", self.on_toggle_dpi_only),
-            (self.byedpi_var, "ByeDPI SOCKS5 резерв (ciadpi.exe)", self.on_toggle_byedpi),
-            (self.debug_log_var, "Подробный лог winws2 (--debug=1)", self.on_toggle_debug_log),
+        for var, label, cmd, tip_text in (
+            (
+                self.minimize_to_tray_var,
+                "Сворачивать в трей при закрытии окна",
+                None,
+                "При нажатии на крестик окно скроется в значок у часов, а защита продолжит работать.",
+            ),
+            (
+                self.autostart_var,
+                "Запускать вместе с Windows",
+                self.on_toggle_autostart,
+                "Автоматически запускать NetDoctor в свёрнутом виде при входе в Windows.",
+            ),
+            (
+                self.autostart_protection_var,
+                "Включать защиту сразу при старте",
+                self.on_toggle_autostart_protection,
+                "Запускать обход блокировок сразу после открытия программы.",
+            ),
+            (
+                self.debug_log_var,
+                "Подробный журнал отладки winws2",
+                self.on_toggle_debug_log,
+                "Включает расширенное логирование (--debug=1) для диагностики проблем.",
+            ),
         ):
-            tk.Checkbutton(
+            t_row = self.make_toggle_row(
                 opt_card,
-                text=label,
-                variable=var,
+                label,
+                var,
                 command=cmd,
                 bg=CARD,
-                fg=FG_SOFT,
-                selectcolor=PRIMARY_BG,
-                activebackground=CARD,
-                activeforeground=ACCENT,
                 font=FONT_SMALL,
-                cursor="hand2",
-                anchor="w",
-                bd=0,
-                highlightthickness=0,
-            ).pack(fill="x", padx=9, pady=1)
+                fg=FG_SOFT,
+                tooltip=tip_text,
+                slider_width=34,
+                slider_height=16,
+            )
+            t_row.pack(fill="x", padx=10, pady=1)
 
         net_row = tk.Frame(opt_card, bg=CARD)
-        net_row.pack(fill="x", padx=10, pady=(4, 6))
-        tk.Label(net_row, text="TUN:", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(0, 4))
+        net_row.pack(fill="x", padx=10, pady=(3, 5))
+        tun_lbl = tk.Label(net_row, text="TUN:", bg=CARD, fg=MUTED, font=FONT_SMALL)
+        tun_lbl.pack(side="left", padx=(0, 4))
         self.tun_stack_cb = ttk.Combobox(
             net_row,
             textvariable=self.tun_stack_var,
@@ -3154,51 +4637,104 @@ class NetdoctorGuiApp(tk.Tk):
         )
         self.tun_stack_cb.pack(side="left", padx=(0, 8))
         self.tun_stack_cb.bind("<<ComboboxSelected>>", lambda _e: self.on_change_tun_stack())
+        self.attach_tooltip(self.tun_stack_cb, "Стек сетевого драйвера для VPN-туннеля (рекомендуется gvisor).")
 
-        tk.Label(net_row, text="ifIndex:", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(0, 4))
+        if_lbl = tk.Label(net_row, text="Сеть:", bg=CARD, fg=MUTED, font=FONT_SMALL)
+        if_lbl.pack(side="left", padx=(0, 4))
         self.iface_var = tk.StringVar()
-        self.make_entry(net_row, self.iface_var, 6).pack(side="left", fill="x", expand=True, ipady=2)
+        if_entry = self.make_entry(net_row, self.iface_var, 6)
+        if_entry.pack(side="left", fill="x", expand=True, ipady=2)
+        self.attach_tooltip(if_entry, "Необязательный номер сетевого адаптера (ifIndex) для привязки.")
 
         exit_btn = self.make_button(
-            left, "Полный выход (остановить службы)", self.on_exit_app, "danger", font=FONT_SMALL_B, pady=4
+            left,
+            "Выход и остановка служб",
+            self.on_exit_app,
+            "danger",
+            font=FONT_SMALL_B,
+            pady=4,
+            tooltip="Полностью останавливает все фоновые службы обхода и закрывает программу.",
         )
         exit_btn.pack(fill="x", pady=(1, 0))
 
-        # Right column: Unlocker Guard + Vertical Split (Config Preview + Operations Console)
+        # Right column: Version/Updates Bar + Unlocker Guard + Vertical Split (Config Preview + Operations Console)
         right = tk.Frame(body, bg=BG)
         right.pack(side="left", fill="both", expand=True)
 
-        guard_box = tk.Frame(right, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        guard_box.pack(fill="x", pady=(0, 6))
+        mode_raw = self.backend.get_install_mode() if hasattr(self.backend, "get_install_mode") else "portable"
+        mode_label = "git" if mode_raw == "git" else "ZIP"
+        update_wrap = RoundedCard(right, bg=CARD, outer_bg=BG, border=BORDER, radius=13, pad=2)
+        update_wrap.pack(fill="x", pady=(0, 6))
+        update_bar = update_wrap.body
+        u_row = tk.Frame(update_bar, bg=CARD)
+        u_row.pack(fill="x", padx=12, pady=4)
+        self.version_info_label = tk.Label(
+            u_row,
+            text=f"Версия: v{__version__} ({mode_label}) · Обновления не проверялись",
+            bg=CARD,
+            fg=FG_SOFT,
+            font=FONT_SMALL,
+            anchor="w",
+        )
+        self.version_info_label.pack(side="left", fill="x", expand=True)
+        self.check_update_btn = self.make_button(
+            u_row,
+            "Проверить обновления",
+            self.on_check_updates,
+            "neutral",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=2,
+            tooltip="Проверить наличие новой версии NetDoctor на сервере.",
+        )
+        self.check_update_btn.pack(side="right")
+        self.apply_update_btn = self.make_button(
+            u_row,
+            "Обновить",
+            self.on_apply_update,
+            "success",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=2,
+            tooltip="Скачать и установить доступное обновление программы.",
+        )
+
+        guard_wrap = RoundedCard(right, bg=CARD, outer_bg=BG, border=BORDER, radius=13, pad=2)
+        guard_wrap.pack(fill="x", pady=(0, 6))
+        guard_box = guard_wrap.body
         tk.Label(
             guard_box,
-            text="Защита сторонних анлокеров (Antigravity Unlocker, hosts, прокси)",
+            text="Защита сторонних программ и файла hosts",
             bg=CARD,
             fg=OK_TEXT,
             font=FONT_UI_B,
             anchor="w",
-        ).pack(fill="x", padx=12, pady=(6, 2))
+        ).pack(fill="x", padx=12, pady=(5, 2))
         self.unlocker_guard_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
+        guard_row = self.make_toggle_row(
             guard_box,
-            text="Не трогать Antigravity.exe, Cursor, ag_dns.exe, xray/happ и hosts",
-            variable=self.unlocker_guard_var,
+            "Не вмешиваться в Antigravity.exe, Cursor, ag_dns.exe, xray/happ и hosts",
+            self.unlocker_guard_var,
             command=self.on_save_unlocker_guard,
             bg=CARD,
-            fg=FG_SOFT,
-            selectcolor=PRIMARY_BG,
-            activebackground=CARD,
-            activeforeground=ACCENT,
             font=FONT_SMALL,
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0,
-        ).pack(anchor="w", padx=10, pady=(0, 3))
-        g_row = tk.Frame(guard_box, bg=CARD)
-        g_row.pack(fill="x", padx=12, pady=(0, 8))
-        self.make_button(g_row, "Сохранить", self.on_save_unlocker_guard, "primary", font=FONT_SMALL_B, pady=3).pack(
-            side="right", padx=(6, 0)
+            fg=FG_SOFT,
+            slider_width=34,
+            slider_height=16,
+            tooltip="Исключает перечисленные программы и домены из файла hosts из обработки VPN и Zapret.",
         )
+        guard_row.pack(fill="x", padx=12, pady=(0, 3))
+        g_row = tk.Frame(guard_box, bg=CARD)
+        g_row.pack(fill="x", padx=12, pady=(0, 6))
+        self.make_button(
+            g_row,
+            "Сохранить",
+            self.on_save_unlocker_guard,
+            "primary",
+            font=FONT_SMALL_B,
+            pady=3,
+            tooltip="Сохранить список исключений и обновить конфигурацию.",
+        ).pack(side="right", padx=(6, 0))
         tk.Label(g_row, text="Исключения (.exe, домены, IP):", bg=CARD, fg=MUTED, font=FONT_SMALL).pack(
             side="left", padx=(0, 6)
         )
@@ -3211,9 +4747,15 @@ class NetdoctorGuiApp(tk.Tk):
         preview_panel = tk.Frame(r_paned, bg=BG)
         head = tk.Frame(preview_panel, bg=BG)
         head.pack(fill="x", pady=(0, 4))
-        self.make_button(head, "↻ Обновить", self.refresh_previews_async, "neutral", font=FONT_SMALL_B, pady=3).pack(
-            side="right", padx=(6, 0)
-        )
+        self.make_button(
+            head,
+            "↻ Обновить",
+            self.refresh_previews_async,
+            "neutral",
+            font=FONT_SMALL_B,
+            pady=3,
+            tooltip="Перечитать содержимое выбранного файла конфигурации с диска.",
+        ).pack(side="right", padx=(6, 0))
         tk.Label(head, text="Просмотр файла:", bg=BG, fg=FG_SOFT, font=FONT_SMALL_B).pack(side="left", padx=(0, 8))
         self.file_var = tk.StringVar()
         self.file_cb = ttk.Combobox(head, textvariable=self.file_var, state="readonly", width=24)
@@ -3336,6 +4878,10 @@ class NetdoctorGuiApp(tk.Tk):
     def apply_snapshot(self, snap: dict[str, Any]) -> None:
         """Update header, layer cards, preset bar, test pills, domain table, and VPN table from snapshot."""
         self.last_snapshot = snap
+        first_load = not self._initial_loaded
+        self._initial_loaded = True
+        if first_load:
+            self._progress_update()
         asn = snap.get("network_asn", 0)
         kind = snap.get("network_kind", "unknown")
         isp = str(snap.get("network_isp") or "")
@@ -3358,7 +4904,7 @@ class NetdoctorGuiApp(tk.Tk):
         if ext_bypass:
             self.bypass_label.configure(text="⚠ Обнаружен сторонний обход/VPN")
             if not self.bypass_label.winfo_manager():
-                self.bypass_label.pack(fill="x", anchor="w", pady=(4, 0), before=self.hint_label)
+                self.bypass_label.pack(fill="x", anchor="w", pady=(3, 0))
         else:
             self.bypass_label.configure(text="")
             if self.bypass_label.winfo_manager():
@@ -3368,7 +4914,7 @@ class NetdoctorGuiApp(tk.Tk):
         if dns_alert:
             self._home_alert_lbl.configure(text=f"⚠ {dns_alert}")
             if not self._home_alert_frame.winfo_manager():
-                self._home_alert_frame.pack(fill="x", pady=(0, 6), before=self._home_section1_lbl)
+                self._home_alert_frame.pack(fill="x", padx=16, pady=(0, 5), before=self._home_section1_lbl)
         elif self._home_alert_frame.winfo_manager():
             self._home_alert_frame.pack_forget()
 
@@ -3389,11 +4935,7 @@ class NetdoctorGuiApp(tk.Tk):
         pending = snap.get("pending_changes") or {}
         p_cnt = int(pending.get("count") or 0)
         if p_cnt > 0:
-            self._restyle_button(self.apply_pending_btn, f"Применить правила ({p_cnt})", "warn")
-            if not self.apply_pending_btn.winfo_manager():
-                self.apply_pending_btn.pack(side="right", padx=(0, 8))
-        elif stack_running:
-            self._restyle_button(self.apply_pending_btn, "Применить правила", "ghost")
+            self._restyle_button(self.apply_pending_btn, f"Применить ({p_cnt})", "warn")
             if not self.apply_pending_btn.winfo_manager():
                 self.apply_pending_btn.pack(side="right", padx=(0, 8))
         elif self.apply_pending_btn.winfo_manager():
@@ -3402,48 +4944,73 @@ class NetdoctorGuiApp(tk.Tk):
         preset_locked = self.active_preset_id != "auto"
         wd = snap.get("watchdog") or {}
         wd_cnt = int(wd.get("restarts_count") or 0)
-        wd_note = f"  •  Watchdog перезапусков: {wd_cnt}" if wd_cnt > 0 else ""
+        wd_note = f"  •  Перезапусков модуля: {wd_cnt}" if wd_cnt > 0 else ""
 
         if stack_running:
-            self._restyle_button(self.autopilot_btn, "Остановить защиту", "danger")
-            self.hero_state_pill.configure(text="● Защита активна", bg=OK_BG, fg=OK_TEXT)
+            if self._power_transition is None:
+                self._restyle_button(self.autopilot_btn, "ОТКЛЮЧИТЬ ЗАЩИТУ  ⏻", "hero_active")
+            self.hero_state_pill.configure(text="● ЗАЩИТА АКТИВНА", bg=OK_BG, fg=OK_TEXT)
+            self._home_zapret_pill.configure(text="● ПОДКЛЮЧЕНО", bg=OK_BG, fg=OK_TEXT)
+            self._home_zapret_card.configure(highlightbackground=CYAN_BORDER)
             if preset_locked:
                 self.hint_label.configure(
-                    text=f"Работает пресет «{self.active_preset_name}» — оркестратор на паузе, Watchdog следит за winws2.{wd_note}",
+                    text=f"Активен пресет «{self.active_preset_name}» — защита работает.{wd_note}",
                     fg=OK_TEXT,
                 )
             elif self.radar_enabled:
                 self.hint_label.configure(
-                    text=f"Защита работает + Live-Радар активен — стратегии подбираются на лету.{wd_note}",
+                    text=f"Защита активна + Монитор включён — правила подбираются автоматически.{wd_note}",
                     fg=OK_TEXT,
                 )
             else:
                 self.hint_label.configure(
-                    text=f"Защита работает. Live-Радар выключен — включите на «Главной» для автолечения.{wd_note}",
+                    text=f"Защита активна. Монитор на паузе — можете включить его на вкладке «Монитор».{wd_note}",
                     fg=ACCENT,
                 )
         else:
-            self._restyle_button(self.autopilot_btn, "Включить защиту", "success")
-            self.hero_state_pill.configure(text="● Защита выключена", bg=INPUT, fg=MUTED)
+            if self._power_transition is None:
+                self._restyle_button(self.autopilot_btn, "ВКЛЮЧИТЬ ЗАЩИТУ  ⏻", "hero")
+            self.hero_state_pill.configure(text="● ОСТАНОВЛЕНО", bg=INPUT, fg=MUTED)
+            self._home_zapret_pill.configure(text="● ОТКЛЮЧЕНО", bg=INPUT, fg=MUTED)
+            self._home_zapret_card.configure(highlightbackground=BORDER)
             if is_admin:
                 self.hint_label.configure(
-                    text="Выберите готовый пресет Zapret2 (или Авто-оркестратор) и нажмите «Включить защиту».",
-                    fg=FG_SOFT,
+                    text="Выберите стратегию обхода и нажмите «ВКЛЮЧИТЬ ЗАЩИТУ».",
+                    fg=MUTED,
                 )
             else:
                 self.hint_label.configure(
-                    text="Нажмите «Запустить от Admin» или «Включить защиту» для запроса прав.",
+                    text="Нажмите «Права Admin» вверху или «ВКЛЮЧИТЬ ЗАЩИТУ» для запуска.",
                     fg=WARN_TEXT,
                 )
 
+        vpn_or_tg_up = bool((processes.get("sing-box") or {}).get("running")) or bool(
+            (processes.get("tg-ws-proxy") or {}).get("running")
+        )
+        if vpn_or_tg_up:
+            self._home_vpn_state_pill.configure(text="● ПОДКЛЮЧЕНО", bg=OK_BG, fg=OK_TEXT)
+            self._home_vpn_card.configure(highlightbackground=CYAN_BORDER)
+        else:
+            self._home_vpn_state_pill.configure(text="● РЕЗЕРВ", bg=INPUT, fg=MUTED)
+            self._home_vpn_card.configure(highlightbackground=BORDER)
+
         if "game_filter" in snap:
             self.game_filter_var.set(bool(snap["game_filter"]))
+        if "auto_start_protection" in snap:
+            self.autostart_protection_var.set(bool(snap["auto_start_protection"]))
         if "byedpi_fallback" in snap:
             self.byedpi_var.set(bool(snap["byedpi_fallback"]))
         if "winws2_debug_log" in snap:
             self.debug_log_var.set(bool(snap["winws2_debug_log"]))
         if "stack_mode" in snap:
-            self.dpi_only_var.set(str(snap["stack_mode"]) == "dpi_only")
+            dpi_only = str(snap["stack_mode"]) == "dpi_only"
+            self.dpi_only_var.set(dpi_only)
+            if hasattr(self, "home_stack_mode_var"):
+                self._stack_mode_syncing = True
+                try:
+                    self.home_stack_mode_var.set(self._stack_mode_labels[1 if dpi_only else 0])
+                finally:
+                    self._stack_mode_syncing = False
         if "tun_stack" in snap and str(snap["tun_stack"]) in ("gvisor", "mixed", "system"):
             self.tun_stack_var.set(str(snap["tun_stack"]))
         preset_err = str(snap.get("preset_compile_error") or "")
@@ -3518,9 +5085,17 @@ class NetdoctorGuiApp(tk.Tk):
                 fg=ACCENT,
             )
         if self.active_preset_id in self._home_preset_id_to_label:
-            self.home_preset_var.set(self._home_preset_id_to_label[self.active_preset_id])
+            self._preset_cb_syncing = True
+            try:
+                self.home_preset_var.set(self._home_preset_id_to_label[self.active_preset_id])
+            finally:
+                self._preset_cb_syncing = False
         elif not is_preset:
-            self.home_preset_var.set("Авто-оркестратор (подбор по доменам)")
+            self._preset_cb_syncing = True
+            try:
+                self.home_preset_var.set("Авто-оркестратор (подбор по доменам)")
+            finally:
+                self._preset_cb_syncing = False
 
     def _update_test_summary_ui(self, summary: dict[str, Any]) -> None:
         by_srv = summary.get("by_service") or {}
@@ -3750,12 +5325,12 @@ class NetdoctorGuiApp(tk.Tk):
             self.show_inspector(None)
 
         badge_txt = f"{len(self.rows_by_iid)}/{len(self.all_rows)}"
-        self.notebook.tab(self.tab_domains, text=f"Домены и Трафик ({badge_txt})")
+        self.notebook.tab(self.tab_domains, text=f"Монитор и Сайты ({badge_txt})")
         self._update_nav_badge(self.tab_domains, badge_txt)
         self._restyle_button(
             self._subtab_domains_btn,
-            f"Подобранные домены ({len(self.rows_by_iid)})",
-            "primary" if self._domains_subview_mode == "domains" else "neutral",
+            f"Правила для сайтов ({len(self.rows_by_iid)})",
+            "pill_active" if self._domains_subview_mode == "domains" else "neutral",
         )
 
     def on_domain_select(self, _event: Any = None) -> None:
@@ -3820,7 +5395,7 @@ class NetdoctorGuiApp(tk.Tk):
         if hasattr(self, "unpin_btn"):
             self._restyle_button(
                 self.unpin_btn,
-                "Открепить" if row.get("pinned") else "Закрепить",
+                "Снять фиксацию" if row.get("pinned") else "Зафиксировать",
                 "warn" if row.get("pinned") else "neutral",
             )
 
@@ -3945,9 +5520,15 @@ class NetdoctorGuiApp(tk.Tk):
         needs_fix_cnt = sum(1 for c in connections if str(c.get("health") or "") == "needs_fix")
         direct_cnt = max(0, total - protected_cnt - needs_fix_cnt)
         self._rt_summary_lbl.configure(
-            text=f"Всего: {total}  •  Под защитой: {protected_cnt}  •  Нужна починка: {needs_fix_cnt}  •  Напрямую: {direct_cnt}",
+            text=f"Всего: {total}  •  Под защитой: {protected_cnt}  •  Требуют обхода: {needs_fix_cnt}  •  Напрямую: {direct_cnt}",
             fg=WARN_TEXT if needs_fix_cnt > 0 else FG_SOFT,
         )
+        if hasattr(self, "_rt_metric_total"):
+            self._rt_metric_total.configure(text=str(total))
+            self._rt_metric_prot.configure(text=str(protected_cnt))
+            self._rt_metric_fix.configure(text=str(needs_fix_cnt), fg=WARN_TEXT if needs_fix_cnt > 0 else LAVENDER)
+        if hasattr(self, "sparkline_canvas"):
+            self.sparkline_canvas.push_sample(total, protected_cnt)
 
         health_labels = {
             "needs_fix": "⚠ Нужна починка",
@@ -4003,8 +5584,8 @@ class NetdoctorGuiApp(tk.Tk):
 
         self._restyle_button(
             self._subtab_conns_btn,
-            f"Активные сокеты ({len(self.conns_by_iid)})",
-            "primary" if self._domains_subview_mode == "connections" else "neutral",
+            f"Активные подключения ({len(self.conns_by_iid)})",
+            "pill_active" if self._domains_subview_mode == "connections" else "neutral",
         )
         new_sock_counts: dict[str, int] = {}
         for c in connections:
@@ -4087,12 +5668,12 @@ class NetdoctorGuiApp(tk.Tk):
     def on_toggle_radar(self) -> None:
         self.radar_enabled = not self.radar_enabled
         if self.radar_enabled:
-            self._restyle_button(self.radar_btn, "Live-Радар: ВКЛ", "primary")
+            self._restyle_button(self.radar_btn, "⏹ Остановить мониторинг", "danger")
             self.refresh_realtime_async(
                 auto_heal=bool(self.auto_heal_var.get()) and bool(self.last_snapshot.get("running"))
             )
         else:
-            self._restyle_button(self.radar_btn, "Live-Радар: ВЫКЛ", "neutral")
+            self._restyle_button(self.radar_btn, "▶ Запустить мониторинг", "cyan_ghost")
         if self.last_snapshot:
             self.apply_snapshot(self.last_snapshot)
 
@@ -4392,7 +5973,21 @@ class NetdoctorGuiApp(tk.Tk):
             self.set_status(str(exc), ERR_TEXT)
             return
 
+        self._power_transition = "starting"
+        if hasattr(self, "autopilot_btn"):
+            self._restyle_button(self.autopilot_btn, "⠋ ЗАПУСК ЗАЩИТЫ…", "hero_active")
+        self._progress_update()
+
+        def _restore_power_btn(active: bool) -> None:
+            self._power_transition = None
+            if hasattr(self, "autopilot_btn"):
+                if active:
+                    self._restyle_button(self.autopilot_btn, "ОТКЛЮЧИТЬ ЗАЩИТУ  ⏻", "hero_active")
+                else:
+                    self._restyle_button(self.autopilot_btn, "ВКЛЮЧИТЬ ЗАЩИТУ  ⏻", "hero")
+
         def done(res: dict[str, Any]) -> None:
+            _restore_power_btn(bool(res.get("ok")))
             self.log_console(dumps_pretty(res))
             if res.get("live_connections") is not None:
                 self.populate_connections_table(res["live_connections"])
@@ -4400,7 +5995,7 @@ class NetdoctorGuiApp(tk.Tk):
                 self.update_layer_cards(res["orchestrators"])
             if res.get("ok"):
                 self.radar_enabled = True
-                self._restyle_button(self.radar_btn, "Live-Радар: ВКЛ", "primary")
+                self._restyle_button(self.radar_btn, "⏹ Остановить мониторинг", "danger")
                 self.set_status("Защита запущена: " + ", ".join(res.get("services", [])), OK_TEXT)
             elif res.get("requires_admin"):
                 self.set_status("Конфиги готовы! Нужны права Admin (UAC) для запуска служб", WARN_TEXT)
@@ -4415,14 +6010,35 @@ class NetdoctorGuiApp(tk.Tk):
                 self.set_status(f"Ошибка запуска: {res.get('error', 'неизвестная ошибка')}", ERR_TEXT)
             self._after_change()
 
-        self.run_bg("Запуск защиты (Автопилот)", lambda: self.backend.start_autopilot(iface=iface), done)
+        def on_err(_exc: Exception) -> None:
+            _restore_power_btn(bool(self.last_snapshot.get("running")))
+
+        self.run_bg("Запуск защиты (Автопилот)", lambda: self.backend.start_autopilot(iface=iface), done, on_err=on_err)
 
     def on_stop(self) -> None:
+        self._power_transition = "stopping"
+        if hasattr(self, "autopilot_btn"):
+            self._restyle_button(self.autopilot_btn, "⠋ ОСТАНОВКА…", "hero")
+        self._progress_update()
+
         def done(stopped: list[str]) -> None:
+            self._power_transition = None
+            if hasattr(self, "autopilot_btn"):
+                self._restyle_button(self.autopilot_btn, "ВКЛЮЧИТЬ ЗАЩИТУ  ⏻", "hero")
             self.log_console("Остановлено: " + (", ".join(stopped) if stopped else "ничего не запущено"))
             self._after_change()
 
-        self.run_bg("Остановка защиты", self.backend.stop_services, done)
+        def on_err(_exc: Exception) -> None:
+            self._power_transition = None
+            if hasattr(self, "autopilot_btn"):
+                running = bool(self.last_snapshot.get("running"))
+                self._restyle_button(
+                    self.autopilot_btn,
+                    "ОТКЛЮЧИТЬ ЗАЩИТУ  ⏻" if running else "ВКЛЮЧИТЬ ЗАЩИТУ  ⏻",
+                    "hero_active" if running else "hero",
+                )
+
+        self.run_bg("Остановка защиты", self.backend.stop_services, done, on_err=on_err)
 
     def on_check_layers(self) -> None:
         def done(orch: dict[str, Any]) -> None:
@@ -4513,7 +6129,8 @@ class NetdoctorGuiApp(tk.Tk):
 
     def _ensure_deps_on_startup(self) -> None:
         manifest = self.backend.bin_dir / "manifest.json"
-        if self.backend.has_core_binaries() and manifest.is_file():
+        has_outdated = hasattr(self.backend, "has_outdated_pinned_bins") and self.backend.has_outdated_pinned_bins()
+        if self.backend.has_core_binaries() and manifest.is_file() and not has_outdated:
             return
 
         def done(res: dict[str, Any]) -> None:
@@ -4521,6 +6138,108 @@ class NetdoctorGuiApp(tk.Tk):
             self._format_deps_status(res)
 
         self.run_bg("Автодокачка компонентов", self.backend.ensure_deps, done)
+
+    def _apply_update_check_result(self, info: dict[str, Any], *, silent: bool = False) -> None:
+        self._last_update_info = dict(info or {})
+        cur = str(info.get("current_version") or __version__)
+        latest = str(info.get("latest_version") or cur)
+        mode_raw = str(info.get("install_mode") or "portable")
+        mode_label = "git" if mode_raw == "git" else "ZIP"
+
+        if info.get("ok") and info.get("update_available"):
+            self.version_info_label.configure(
+                text=f"Версия: v{cur} ({mode_label}) · Доступно обновление v{latest}",
+                fg=ACCENT,
+            )
+            self._restyle_button(self.update_badge_btn, f"↑ v{latest}", "primary")
+            if not self.update_badge_btn.winfo_manager():
+                self.update_badge_btn.pack(side="right", padx=(0, 8))
+            if not self.apply_update_btn.winfo_manager():
+                self.apply_update_btn.pack(side="right", padx=(0, 6))
+            if not silent:
+                self.set_status(f"Доступно обновление netdoctor v{latest}", ACCENT)
+            return
+
+        if self.update_badge_btn.winfo_manager():
+            self.update_badge_btn.pack_forget()
+        if self.apply_update_btn.winfo_manager():
+            self.apply_update_btn.pack_forget()
+
+        if info.get("ok"):
+            self.version_info_label.configure(
+                text=f"Версия: v{cur} ({mode_label}) · Установлена актуальная версия",
+                fg=OK_TEXT,
+            )
+            if not silent:
+                self.set_status(f"Установлена актуальная версия netdoctor v{cur}", OK_TEXT)
+        else:
+            err = str(info.get("error") or "ошибка сети")
+            self.version_info_label.configure(
+                text=f"Версия: v{cur} ({mode_label}) · Проверка не удалась",
+                fg=WARN_TEXT,
+            )
+            if not silent:
+                self.set_status(f"Не удалось проверить обновления: {err}", WARN_TEXT)
+
+    def _check_updates_on_startup(self) -> None:
+        if self._closed or self._exiting or not hasattr(self.backend, "check_updates"):
+            return
+
+        def runner() -> None:
+            try:
+                info = self.backend.check_updates(force=False)
+            except Exception as exc:  # noqa: BLE001
+                info = {"ok": False, "error": str(exc), "current_version": __version__}
+            self._post(lambda res: self._apply_update_check_result(res, silent=True), info)
+
+        threading.Thread(target=runner, name="gui-update-check", daemon=True).start()
+
+    def on_check_updates(self) -> None:
+        def done(info: dict[str, Any]) -> None:
+            self.log_console("Проверка обновлений:\n" + dumps_pretty(info))
+            self._apply_update_check_result(info, silent=False)
+
+        self.run_bg("Проверка обновлений", lambda: self.backend.check_updates(force=True), done)
+
+    def on_apply_update(self) -> None:
+        info = self._last_update_info or {}
+        latest = str(info.get("latest_version") or "").strip()
+        mode_raw = str(info.get("install_mode") or "portable")
+        mode_label = "git pull" if mode_raw == "git" else "ZIP-архив"
+        prompt = (
+            f"Обновить netdoctor до версии v{latest} ({mode_label})?\n\n"
+            "На время обновления службы обхода будут остановлены, а затем программа перезапустится."
+            if latest
+            else f"Выполнить обновление netdoctor ({mode_label})?\n\n"
+            "На время обновления службы обхода будут остановлены, а затем программа перезапустится."
+        )
+        if not messagebox.askyesno("Обновление netdoctor", prompt):
+            return
+
+        def done(res: dict[str, Any]) -> None:
+            self.log_console("Обновление netdoctor:\n" + dumps_pretty(res))
+            if not res.get("ok"):
+                err = str(res.get("error") or "Неизвестная ошибка")
+                self.set_status(f"Ошибка обновления: {err}", ERR_TEXT)
+                messagebox.showerror("Ошибка обновления", err)
+                return
+            detail = str(res.get("detail") or "Обновление установлено")
+            self.set_status(f"{detail} — перезапуск…", OK_TEXT)
+            restart = self.backend.restart_gui_process()
+            if restart.get("ok"):
+                if not self._closed:
+                    self.after(150, self.on_close)
+            else:
+                messagebox.showinfo("Обновление завершено", f"{detail}.\nПерезапустите программу вручную.")
+
+        self.run_bg(
+            "Обновление netdoctor",
+            lambda: self.backend.apply_update(
+                download_url=info.get("download_url") or None,
+                target_version=latest or None,
+            ),
+            done,
+        )
 
     def on_verify(self) -> None:
         def done(res: dict[str, Any]) -> None:
@@ -4790,9 +6509,32 @@ class NetdoctorGuiApp(tk.Tk):
                 st = self.backend.get_autostart_status()
             except Exception:  # noqa: BLE001
                 return
-            self._post(lambda res=st: self.autostart_var.set(bool(res.get("enabled"))))
+
+            def _apply(res: dict[str, Any] = st) -> None:
+                self.autostart_var.set(bool(res.get("enabled")))
+                if "auto_start_protection" in res:
+                    self.autostart_protection_var.set(bool(res.get("auto_start_protection")))
+
+            self._post(_apply)
 
         threading.Thread(target=runner, name="gui-autostart-chk", daemon=True).start()
+
+    def _maybe_auto_start_protection(self) -> None:
+        if self._closed or self._exiting or not _is_admin():
+            return
+        should_start = self._auto_start_stack or (
+            hasattr(self.backend, "get_auto_start_protection") and self.backend.get_auto_start_protection()
+        )
+        if not should_start:
+            return
+        if hasattr(self.backend, "_collect_processes_state"):
+            try:
+                procs = self.backend._collect_processes_state()
+                if bool((procs.get("winws2") or {}).get("running")):
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        self.on_start()
 
     def on_reload_singbox(self) -> None:
         try:
@@ -4931,13 +6673,36 @@ class NetdoctorGuiApp(tk.Tk):
         enabled = bool(self.autostart_var.get())
 
         def done(res: dict[str, Any]) -> None:
+            if "auto_start_protection" in res:
+                self.autostart_protection_var.set(bool(res.get("auto_start_protection")))
             if res.get("ok"):
-                self.set_status(f"Автозапуск Windows {'включён' if res.get('enabled') else 'отключён'}", OK_TEXT)
+                if res.get("enabled"):
+                    suffix = " (с автозапуском защиты)" if res.get("auto_start_protection") else " (только приложение)"
+                    self.set_status(f"Автозапуск с Windows включён{suffix}", OK_TEXT)
+                else:
+                    self.set_status("Автозапуск с Windows отключён", OK_TEXT)
             else:
                 self.autostart_var.set(bool(res.get("enabled")))
                 self.set_status(f"Автозапуск: {res.get('error', 'ошибка настройки')}", WARN_TEXT)
 
         self.run_bg("Настройка автозапуска Windows", lambda: self.backend.set_autostart(enabled), done)
+
+    def on_toggle_autostart_protection(self) -> None:
+        enabled = bool(self.autostart_protection_var.get())
+
+        def done(res: dict[str, Any]) -> None:
+            if res.get("ok"):
+                state = "включён" if res.get("auto_start_protection") else "выключен"
+                self.set_status(f"Автозапуск защиты при старте {state}", OK_TEXT)
+            else:
+                self.set_status(f"Автозапуск защиты: {res.get('error', 'ошибка')}", WARN_TEXT)
+            self._after_change()
+
+        self.run_bg(
+            "Настройка автозапуска защиты",
+            lambda: self.backend.set_auto_start_protection(enabled),
+            done,
+        )
 
     def on_toggle_byedpi(self) -> None:
         enabled = bool(self.byedpi_var.get())
@@ -4980,7 +6745,7 @@ class NetdoctorGuiApp(tk.Tk):
     def _set_preset_filter(self, flt: str) -> None:
         self.preset_filter = flt
         for pid, btn in self._preset_filter_buttons.items():
-            self._restyle_button(btn, btn.cget("text"), "primary" if pid == flt else "neutral")
+            self._restyle_button(btn, btn.cget("text"), "pill_active" if pid == flt else "neutral")
         self.populate_presets_table()
 
     def _sync_home_preset_combo(self) -> None:
@@ -5003,10 +6768,14 @@ class NetdoctorGuiApp(tk.Tk):
         self._home_preset_label_to_id = label_to_id
         self._home_preset_id_to_label = id_to_label
         self.home_preset_cb.configure(values=values)
-        if self.active_preset_id in id_to_label:
-            self.home_preset_var.set(id_to_label[self.active_preset_id])
-        else:
-            self.home_preset_var.set(auto_label)
+        self._preset_cb_syncing = True
+        try:
+            if self.active_preset_id in id_to_label:
+                self.home_preset_var.set(id_to_label[self.active_preset_id])
+            else:
+                self.home_preset_var.set(auto_label)
+        finally:
+            self._preset_cb_syncing = False
 
     def populate_presets_table(self, presets: list[dict[str, Any]] | None = None) -> None:
         if presets is not None:
@@ -5176,8 +6945,9 @@ class NetdoctorGuiApp(tk.Tk):
         )
 
     def on_import_presets_dir(self) -> None:
-        default_dir = r"C:\vso\Dev\presets\winws2" if Path(r"C:\vso\Dev\presets\winws2").is_dir() else str(Path.cwd())
-        dpath = filedialog.askdirectory(title="Выберите папку с пресетами Zapret2", initialdir=default_dir)
+        presets_dir = Path.cwd() / "presets" / "zapret2"
+        default_dir = str(presets_dir) if presets_dir.is_dir() else str(Path.cwd())
+        dpath = filedialog.askdirectory(title="Выберите папку с пресетами Zapret", initialdir=default_dir)
         if not dpath:
             return
 
@@ -5340,15 +7110,22 @@ class NetdoctorGuiApp(tk.Tk):
         )
 
     def on_toggle_dpi_only(self) -> None:
-        mode = "dpi_only" if bool(self.dpi_only_var.get()) else "hybrid"
+        dpi_only = bool(self.dpi_only_var.get())
+        mode = "dpi_only" if dpi_only else "hybrid"
+        if hasattr(self, "home_stack_mode_var"):
+            self._stack_mode_syncing = True
+            try:
+                self.home_stack_mode_var.set(self._stack_mode_labels[1 if dpi_only else 0])
+            finally:
+                self._stack_mode_syncing = False
 
         def done(res: dict[str, Any]) -> None:
-            txt = "Без TUN (только Zapret2 + TG)" if res.get("stack_mode") == "dpi_only" else "Гибрид (Zapret2 + sing-box TUN)"
-            self.log_console(f"Режим стека: {txt}")
-            self.set_status(f"Режим стека: {txt}", OK_TEXT)
+            txt = "Без VPN (только обход DPI + TG)" if res.get("stack_mode") == "dpi_only" else "Гибрид (Обход DPI + точечный VPN)"
+            self.log_console(f"Режим маршрутизации: {txt}")
+            self.set_status(f"Режим маршрутизации: {txt}", OK_TEXT)
             self._after_change()
 
-        self.run_bg("Переключение режима без TUN", lambda: self.backend.set_stack_mode(mode), done)
+        self.run_bg("Переключение режима маршрутизации", lambda: self.backend.set_stack_mode(mode), done)
 
     def on_change_tun_stack(self) -> None:
         stack = (self.tun_stack_var.get() or "gvisor").strip()

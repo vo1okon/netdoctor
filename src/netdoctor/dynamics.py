@@ -9,9 +9,9 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from netdoctor.models import Decision, NetworkFingerprint, Strategy
+from netdoctor.models import Decision, NetworkFingerprint, Protocol, Strategy
 from netdoctor.probes import detect_network_fingerprint, probe_dns, probe_tcp, probe_tls
-from netdoctor.selector import DEFAULT_STRATEGIES
+from netdoctor.selector import DEFAULT_STRATEGIES, _ordered_pool
 from netdoctor.storage import Storage
 
 
@@ -26,11 +26,16 @@ def is_decision_expired(decision: Decision, now: datetime | None = None) -> bool
         return True
 
 
-def promote_fallback_on_failure(storage: Storage, decision: Decision) -> Decision:
+def promote_fallback_on_failure(
+    storage: Storage,
+    decision: Decision,
+    *,
+    vpn_available: bool = True,
+) -> Decision:
     """Handle failure policy:
     1. Increment consecutive_fails.
     2. If fallback strategies exist, promote the first fallback to active strategy_id.
-    3. If no fallbacks remain, escalate layer to 'vpn' (outbound sing-box urltest/selector).
+    3. If no fallbacks remain, escalate layer to 'vpn' only when usable VPN exists; otherwise rotate DPI strategies.
     """
     decision.consecutive_fails += 1
     decision.updated_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -39,10 +44,34 @@ def promote_fallback_on_failure(storage: Storage, decision: Decision) -> Decisio
         next_strat = decision.fallback_strategies.pop(0)
         decision.strategy_id = next_strat
         decision.status = "active"
-    else:
+    elif vpn_available:
         decision.layer = "vpn"
         decision.strategy_id = "vpn-select"
         decision.status = "active"
+    else:
+        stored_pool = storage.get_strategies(decision.protocol)
+        pool = _ordered_pool(stored_pool or None, decision.protocol)
+        ordered_ids = (
+            [s.id for s in pool if s.args_template]
+            if decision.protocol == Protocol.TLS
+            else [s.id for s in pool]
+        )
+        if decision.strategy_id in ordered_ids:
+            idx = ordered_ids.index(decision.strategy_id)
+            rotated = ordered_ids[idx + 1 :] + ordered_ids[:idx]
+        else:
+            rotated = [sid for sid in ordered_ids if sid != decision.strategy_id]
+
+        if rotated:
+            decision.layer = "dpi"
+            decision.strategy_id = rotated[0]
+            decision.fallback_strategies = rotated[1:3]
+            decision.status = "active"
+        else:
+            if decision.layer == "vpn":
+                decision.layer = "direct"
+                decision.strategy_id = None
+            decision.status = "degraded"
 
     storage.save_decision(decision)
     return decision
@@ -201,6 +230,7 @@ async def run_canary_cycle(
     """
     net = network or await detect_network_fingerprint()
     net_key = storage.upsert_network(net)
+    vpn_ok = storage.has_usable_vpn()
     expired = get_due_decisions(storage, net)
     expired_keys = {(d.domain.lower(), d.protocol) for d in expired}
     active = storage.get_decisions(net_key, active_only=True)
@@ -233,7 +263,7 @@ async def run_canary_cycle(
             # Immediate confirmation retry to filter transient single-packet drops
             ok_retry = await _run_probe(decision)
             if not ok_retry:
-                promote_fallback_on_failure(storage, decision)
+                promote_fallback_on_failure(storage, decision, vpn_available=vpn_ok)
                 promoted.append(decision.domain)
                 continue
 

@@ -498,6 +498,34 @@ def _is_external_ip(ip_str: str) -> bool:
     return not any(addr in net for net in _LOCAL_NETWORKS)
 
 
+_SHARED_CDN_ANYCAST_NETS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "104.16.0.0/12",
+        "172.64.0.0/13",
+        "188.114.96.0/22",
+        "162.158.0.0/15",
+        "198.41.128.0/17",
+        "108.162.192.0/18",
+        "141.101.64.0/18",
+        "190.93.240.0/20",
+        "197.234.240.0/22",
+    )
+)
+
+
+def _is_shared_cdn_anycast_ip(ip_str: str) -> bool:
+    """Return True for multi-tenant shared CDN anycast IPs (e.g. Cloudflare) unsafe to attribute from history."""
+    clean = ip_str.split("%", 1)[0].strip()
+    if not clean:
+        return False
+    try:
+        addr = ipaddress.ip_address(clean)
+    except ValueError:
+        return False
+    return any(addr in net for net in _SHARED_CDN_ANYCAST_NETS)
+
+
 def _tail_text(path: Path, max_bytes: int = 32768) -> str:
     if not path.is_file():
         return ""
@@ -1054,6 +1082,7 @@ class DpiLayerOrchestrator:
         candidates: list[Strategy] | None = None,
         live_eval: bool = True,
         bin_dir: str | Path = "bin",
+        vpn_available: bool = True,
     ) -> Decision:
         """Select optimal DPI strategy (with live winws2 eval when elevated and no conflict active)."""
         bypass = detect_bypass_active()
@@ -1072,6 +1101,7 @@ class DpiLayerOrchestrator:
             protocol=protocol,
             evaluator=eval_fn,
             early_stop=True,
+            vpn_available=vpn_available,
         )
 
     def inspect_status(
@@ -2293,7 +2323,7 @@ class RealtimeConnectionMonitor:
             if verdicts_cached is not None:
                 new_map.update(verdicts_cached)
             else:
-                verdicts_map: dict[str, str] = {}
+                ip_to_domains: dict[str, set[str]] = {}
                 rows = storage.conn.execute("SELECT domain, probes_json FROM verdicts").fetchall()
                 for r in rows:
                     dom = str(r["domain"]).lower()
@@ -2302,12 +2332,27 @@ class RealtimeConnectionMonitor:
                     except (json.JSONDecodeError, TypeError):
                         continue
                     dns = probes.get("dns") or {}
-                    for ip_val in (dns.get("doh_ips") or []) + (dns.get("system_ips") or []):
-                        if ip_val and _is_external_ip(str(ip_val)):
-                            verdicts_map.setdefault(str(ip_val), dom)
+                    doh_ips = [str(x) for x in (dns.get("doh_ips") or []) if x]
+                    doh_set = set(doh_ips)
+                    candidate_ips: list[str] = list(doh_ips)
+                    if dns.get("system") == "ok":
+                        for ip_val in dns.get("system_ips") or []:
+                            ip_s = str(ip_val)
+                            if ip_s and (not doh_set or ip_s in doh_set):
+                                candidate_ips.append(ip_s)
                     target_ip = (probes.get("tcp") or {}).get("target_ip")
-                    if target_ip and _is_external_ip(str(target_ip)):
-                        verdicts_map.setdefault(str(target_ip), dom)
+                    if target_ip:
+                        ip_s = str(target_ip)
+                        if not doh_set or ip_s in doh_set:
+                            candidate_ips.append(ip_s)
+                    for ip_s in candidate_ips:
+                        if _is_external_ip(ip_s) and not _is_shared_cdn_anycast_ip(ip_s):
+                            ip_to_domains.setdefault(ip_s, set()).add(dom)
+                verdicts_map = {
+                    ip_s: next(iter(doms))
+                    for ip_s, doms in ip_to_domains.items()
+                    if len(doms) == 1
+                }
                 with self._lock:
                     self._verdicts_sig = db_sig
                     self._verdicts_ip_map = verdicts_map
@@ -2362,6 +2407,13 @@ class RealtimeConnectionMonitor:
                 new_map[dest_ip] = host
 
         with self._lock:
+            stale_cdn = [
+                k
+                for k in self.ip_to_domain
+                if _is_shared_cdn_anycast_ip(k) and k not in new_map
+            ]
+            for k in stale_cdn:
+                del self.ip_to_domain[k]
             self.ip_to_domain.update(new_map)
 
     @staticmethod
@@ -2810,12 +2862,7 @@ class RealtimeConnectionMonitor:
             net_key = storage.upsert_network(net)
             backend._seed_default_strategies(storage)
             strategy_pool = storage.get_strategies()
-            all_vpn_nodes = storage.get_all_subscription_nodes()
-            has_real_vpn = any(
-                str(n.get("server") or "").strip()
-                and not str(n.get("server") or "").strip().lower().endswith(".example.com")
-                for n in all_vpn_nodes
-            )
+            has_real_vpn = storage.has_usable_vpn()
             active_decisions = {
                 (d.domain.lower(), d.protocol): d for d in storage.get_decisions(net_key, active_only=False)
             }
@@ -2882,7 +2929,7 @@ class RealtimeConnectionMonitor:
                             rotated = [sid for sid in ordered_tls_ids if sid != existing.strategy_id]
                         if rotated:
                             existing.fallback_strategies = rotated[:3]
-                    new_dec = promote_fallback_on_failure(storage, existing)
+                    new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
                     action = f"Fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
                 else:
                     new_dec = await dpi_orch.evaluate_domain(
@@ -2894,13 +2941,20 @@ class RealtimeConnectionMonitor:
                         candidates=strategy_pool,
                         live_eval=True,
                         bin_dir=backend.bin_dir,
+                        vpn_available=has_real_vpn,
                     )
                     if (
                         bypass
                         and new_dec.layer == "direct"
                         and existing is not None
                         and existing.status == "active"
-                        and existing.layer in ("dpi", "vpn", "dns")
+                        and (
+                            existing.layer in ("dpi", "dns")
+                            or (
+                                existing.layer == "vpn"
+                                and (has_real_vpn or getattr(existing, "pinned", False))
+                            )
+                        )
                     ):
                         # Self-probe protection: preserve active bypass rules when probes succeed through them
                         continue

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 import ipaddress
 import json
 import re
@@ -97,6 +98,25 @@ def is_placeholder_node(node: VpnNode | dict[str, Any]) -> bool:
     if any(marker in label for marker in _PLACEHOLDER_MARKERS):
         return True
     if label and _INFO_BANNER_TAG_RE.search(label):
+        return True
+    return False
+
+
+def has_usable_vpn_nodes(nodes: Sequence[VpnNode | dict[str, Any]]) -> bool:
+    """Return True if at least one enabled, non-placeholder, non-demo VPN node is configured."""
+    for node in nodes:
+        if isinstance(node, VpnNode):
+            enabled = bool(getattr(node, "enabled", True))
+            server = str(node.server or "").strip().lower()
+        elif isinstance(node, dict):
+            raw_enabled = node.get("enabled")
+            enabled = True if raw_enabled is None else bool(raw_enabled)
+            raw_ob = node.get("raw_outbound") if isinstance(node.get("raw_outbound"), dict) else {}
+            server = str(node.get("server") or raw_ob.get("server") or "").strip().lower()
+        else:
+            continue
+        if not enabled or not server or server.endswith(".example.com") or is_placeholder_node(node):
+            continue
         return True
     return False
 

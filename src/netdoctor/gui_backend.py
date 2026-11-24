@@ -26,6 +26,7 @@ from typing import Any, Coroutine, TypeVar
 
 import psutil
 
+from netdoctor import __version__
 from netdoctor.clash_api import ClashApiClient
 from netdoctor.classifier import classify_probes
 from netdoctor.config_gen import (
@@ -72,6 +73,7 @@ from netdoctor.probes import (
 )
 from netdoctor.selector import (
     DEFAULT_STRATEGIES,
+    _ordered_pool,
     evaluate_domains_live_batch,
     live_winws2_strategy_evaluator,
     load_targets_from_yaml,
@@ -84,12 +86,14 @@ from netdoctor.supervisor import (
     _is_admin,
     fetch_all_bins,
     fetch_xray_binary,
+    get_outdated_pinned_artifacts,
     inspect_supervisor_state,
     stop_persisted_supervisor,
     validate_singbox_config,
     validate_xray_config,
     verify_binaries,
 )
+from netdoctor.updater import apply_app_update, check_for_updates, detect_install_mode
 from netdoctor.tray import (
     _decode_process_output,
     get_autostart_status as tray_get_autostart_status,
@@ -97,6 +101,7 @@ from netdoctor.tray import (
 )
 from netdoctor.vpn import (
     fetch_subscription,
+    has_usable_vpn_nodes,
     is_auto_select_node,
     is_placeholder_node,
     refresh_all_subscriptions,
@@ -498,6 +503,8 @@ class GuiBackend:
         self._service_fail_counts: dict[str, int] = {}
         self._strategies_seeded_sig: tuple[Any, ...] | None = None
         self._last_singbox_check: tuple[str, int] | None = None
+        self._last_xray_check: tuple[str, int] | None = None
+        self._sub_refresh_in_progress: bool = False
         self._last_vpn_reconcile_ts: float = 0.0
         self._vpn_reconciling: bool = False
 
@@ -693,6 +700,7 @@ class GuiBackend:
             active_dns = self.orchestrator.dns.get_active_dns(storage)
             all_dns = self.orchestrator.dns.get_all_dns_servers(storage)
             game_filter = storage.get_setting("game_filter", "0") == "1"
+            auto_start_protection = storage.get_setting("auto_start_protection", "0") == "1"
             byedpi_fallback = storage.get_setting("byedpi_fallback", "0") == "1"
             winws2_debug_log = storage.get_setting("winws2_debug_log", "0") == "1"
             stack_mode = storage.get_setting("stack_mode", "hybrid").strip() or "hybrid"
@@ -799,6 +807,7 @@ class GuiBackend:
             "dns_alert": dns_alert,
             "dns_servers_count": len(all_dns),
             "game_filter": game_filter,
+            "auto_start_protection": auto_start_protection,
             "byedpi_fallback": byedpi_fallback,
             "winws2_debug_log": winws2_debug_log,
             "stack_mode": stack_mode,
@@ -1067,13 +1076,13 @@ class GuiBackend:
             storage.close()
 
         diagnosed_now = False
-        if not existing_decisions and is_admin:
-            self.run_diag_sync(None)
-            diagnosed_now = True
 
-        applied = self.trigger_apply_configs(iface=iface)
-        srv_res = self.start_services(iface=iface, force=force)
-        live = self.scan_live_connections()
+        if is_admin:
+            srv_res = self.start_services(iface=iface, force=force)
+            applied = srv_res.get("applied") or {}
+        else:
+            applied = self.trigger_apply_configs(iface=iface)
+            srv_res = self.start_services(iface=iface, force=force)
         orchestrators = self.get_orchestrators_summary(probe_live=False)
 
         storage = Storage(self.db_path)
@@ -1094,7 +1103,7 @@ class GuiBackend:
             "applied": applied,
             "services": srv_res.get("services", []),
             "processes": srv_res.get("processes", self._collect_processes_state()),
-            "live_connections": live["connections"],
+            "live_connections": None,
             "orchestrators": orchestrators,
         }
 
@@ -1950,6 +1959,7 @@ class GuiBackend:
                 net_key = storage.upsert_network(net)
                 self._seed_default_strategies(storage)
                 candidates: list[Strategy] = storage.get_strategies()
+                vpn_available = storage.has_usable_vpn()
 
                 probes_list = await asyncio.gather(
                     *(run_domain_probes(dom, timeout=timeout) for dom in target_domains)
@@ -1981,6 +1991,7 @@ class GuiBackend:
                             protocol=Protocol.TLS,
                             evaluator=eval_fn,
                             early_stop=True,
+                            vpn_available=vpn_available,
                         )
                     }
                 else:
@@ -1990,6 +2001,7 @@ class GuiBackend:
                         candidates=candidates,
                         bin_dir=self.bin_dir,
                         use_live_eval=can_live_eval,
+                        vpn_available=vpn_available,
                     )
 
                 existing_map = {
@@ -2007,7 +2019,13 @@ class GuiBackend:
                         bypass
                         and cand_dec.layer == "direct"
                         and prev_dec is not None
-                        and prev_dec.layer in ("dpi", "vpn", "dns")
+                        and (
+                            prev_dec.layer in ("dpi", "dns")
+                            or (
+                                prev_dec.layer == "vpn"
+                                and (vpn_available or getattr(prev_dec, "pinned", False))
+                            )
+                        )
                     ):
                         continue
                     storage.save_decision(cand_dec)
@@ -2024,6 +2042,7 @@ class GuiBackend:
                                 protocol=Protocol.QUIC,
                                 evaluator=eval_fn if len(target_domains) == 1 else None,
                                 early_stop=True,
+                                vpn_available=vpn_available,
                             )
                         )
 
@@ -2135,9 +2154,34 @@ class GuiBackend:
                     winws_args = []
             self._last_preset_error = preset_error
 
+            has_real_vpn = stack_mode != "dpi_only" and has_usable_vpn_nodes(vpn_nodes)
+            singbox_decisions = decisions
+            winws_decisions = decisions
+            if not has_real_vpn:
+                # Never route non-pinned rules into sing-box VPN when no usable VPN exists
+                singbox_decisions = [
+                    d for d in decisions if not (d.layer == "vpn" and not getattr(d, "pinned", False))
+                ]
+                if active_preset_id == "auto":
+                    tls_pool = _ordered_pool(list(strategies.values()), Protocol.TLS)
+                    quic_pool = _ordered_pool(list(strategies.values()), Protocol.QUIC)
+                    fallback_by_proto = {
+                        Protocol.TLS: tls_pool[0].id if tls_pool else None,
+                        Protocol.QUIC: quic_pool[0].id if quic_pool else None,
+                    }
+                    remapped: list[Decision] = []
+                    for d in decisions:
+                        if d.layer == "vpn" and not getattr(d, "pinned", False):
+                            fb_id = fallback_by_proto.get(d.protocol)
+                            if fb_id:
+                                remapped.append(d.model_copy(update={"layer": "dpi", "strategy_id": fb_id}))
+                            continue
+                        remapped.append(d)
+                    winws_decisions = remapped
+
             if not winws_args:
                 winws_args, hostlists = generate_winws2_config(
-                    decisions=decisions,
+                    decisions=winws_decisions,
                     strategies=strategies,
                     lists_dir=self.lists_dir,
                     vpn_server_ips=all_excluded_ips,
@@ -2165,18 +2209,6 @@ class GuiBackend:
                 if parsed.hostname:
                     doh_tls_sni = parsed.hostname
 
-            has_real_vpn = any(
-                n.server and not n.server.strip().lower().endswith(".example.com")
-                for n in vpn_nodes
-            )
-            singbox_decisions = decisions
-            if active_preset_id != "auto" and not has_real_vpn:
-                # Never let stale auto-escalated VPN rules hijack traffic into a placeholder demo node
-                # when the user explicitly activated a fixed working Zapret2 preset.
-                singbox_decisions = [
-                    d for d in decisions if not (d.layer == "vpn" and not getattr(d, "pinned", False))
-                ]
-
             xray_file = self.configs_dir / "xray.json"
             xray_exe = self.bin_dir.resolve() / "xray.exe"
             xray_bridge_ports: dict[str, int] = {}
@@ -2190,7 +2222,17 @@ class GuiBackend:
                     enable_byedpi=byedpi_fallback,
                 )
                 if candidate_ports:
-                    xray_valid, xray_err = validate_xray_config(self.bin_dir, xray_file)
+                    xray_hash = hashlib.sha256(xray_file.read_bytes()).hexdigest()
+                    try:
+                        xray_mtime = int(xray_exe.stat().st_mtime_ns)
+                    except OSError:
+                        xray_mtime = 0
+                    xray_sig = (xray_hash, xray_mtime)
+                    if self._last_xray_check == xray_sig:
+                        xray_valid, xray_err = True, ""
+                    else:
+                        xray_valid, xray_err = validate_xray_config(self.bin_dir, xray_file)
+                        self._last_xray_check = xray_sig if xray_valid else None
                     if xray_valid:
                         xray_bridge_ports = candidate_ports
                     else:
@@ -2529,6 +2571,28 @@ class GuiBackend:
         finally:
             storage.close()
 
+    def _schedule_stale_subscription_refresh(self) -> None:
+        """Refresh stale HTTP(S) subscriptions asynchronously after bypass startup."""
+        if self._sub_refresh_in_progress:
+            return
+        self._sub_refresh_in_progress = True
+
+        def _worker() -> None:
+            try:
+                if self._refresh_stale_subscriptions_if_needed() and self._desired_running and not self._stopping:
+                    self.trigger_apply_configs()
+                    self._reload_running_services(singbox=True)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                self._sub_refresh_in_progress = False
+
+        threading.Thread(
+            target=_worker,
+            name="netdoctor-sub-refresh",
+            daemon=True,
+        ).start()
+
     def _restart_xray(self) -> dict[str, Any]:
         """Start or reload managed xray.exe SOCKS5 Reality bridge via ProcessSupervisor."""
         with self._lock:
@@ -2628,7 +2692,6 @@ class GuiBackend:
         if not self.has_core_binaries(stack_mode):
             deps_report = self.ensure_deps(force=False)
 
-        self._refresh_stale_subscriptions_if_needed()
         if (
             stack_mode != "dpi_only"
             and (self.bin_dir.resolve() / "sing-box.exe").is_file()
@@ -2695,7 +2758,7 @@ class GuiBackend:
             )
             sup = ProcessSupervisor(bin_dir=bin_path, logs_dir=self.logs_dir.resolve())
             try:
-                sup.start_stack(specs, startup_wait=0.5)
+                sup.start_stack(specs, startup_wait=0.35, skip_stop=True)
             except OSError as exc:
                 self._supervisor = None
                 return {
@@ -2757,7 +2820,13 @@ class GuiBackend:
             except Exception:  # noqa: BLE001
                 pass
             if stack_mode != "dpi_only" and int(applied.get("vpn_nodes_count") or 0) > 0:
-                self._sync_singbox_vpn_selector()
+                threading.Thread(
+                    target=self._sync_singbox_vpn_selector,
+                    kwargs={"retries": 4},
+                    name="netdoctor-vpn-sync",
+                    daemon=True,
+                ).start()
+            self._schedule_stale_subscription_refresh()
             return {
                 "ok": True,
                 "started": True,
@@ -3893,19 +3962,64 @@ class GuiBackend:
             "strategies": [s.model_dump(mode="json") for s in discovered],
         }
 
-    def get_autostart_status(self) -> dict[str, Any]:
-        return tray_get_autostart_status()
+    def get_auto_start_protection(self) -> bool:
+        """Return True when protection autopilot should start automatically right after GUI launch."""
+        storage = Storage(self.db_path)
+        try:
+            return storage.get_setting("auto_start_protection", "0") == "1"
+        finally:
+            storage.close()
 
-    def set_autostart(self, enabled: bool) -> dict[str, Any]:
-        return tray_set_autostart_enabled(
+    def set_auto_start_protection(self, enabled: bool) -> dict[str, Any]:
+        """Persist auto-start protection preference and refresh Task Scheduler entry if autostart is active."""
+        storage = Storage(self.db_path)
+        try:
+            storage.set_setting("auto_start_protection", "1" if enabled else "0")
+        finally:
+            storage.close()
+
+        cur_status = tray_get_autostart_status()
+        autostart_updated = False
+        task_res: dict[str, Any] | None = None
+        if cur_status.get("enabled"):
+            task_res = self.set_autostart(True, auto_start_protection=bool(enabled))
+            autostart_updated = bool(task_res.get("ok"))
+        return {
+            "ok": True if task_res is None else bool(task_res.get("ok")),
+            "auto_start_protection": bool(enabled),
+            "autostart_updated": autostart_updated,
+            "error": (task_res or {}).get("error", ""),
+        }
+
+    def get_autostart_status(self) -> dict[str, Any]:
+        return {
+            **tray_get_autostart_status(),
+            "auto_start_protection": self.get_auto_start_protection(),
+        }
+
+    def set_autostart(self, enabled: bool, *, auto_start_protection: bool | None = None) -> dict[str, Any]:
+        storage = Storage(self.db_path)
+        try:
+            if auto_start_protection is not None:
+                storage.set_setting("auto_start_protection", "1" if auto_start_protection else "0")
+            elif enabled and storage.get_setting("auto_start_protection", "") == "":
+                storage.set_setting("auto_start_protection", "1")
+            prot = storage.get_setting("auto_start_protection", "0") == "1"
+        finally:
+            storage.close()
+
+        res = tray_set_autostart_enabled(
             enabled=enabled,
-            working_dir=Path.cwd().resolve(),
+            working_dir=self.db_path.resolve().parent,
             db_path=self.db_path,
             configs_dir=self.configs_dir,
             lists_dir=self.lists_dir,
             logs_dir=self.logs_dir,
             bin_dir=self.bin_dir,
+            auto_start_protection=prot,
         )
+        res["auto_start_protection"] = prot
+        return res
 
     def has_core_binaries(self, stack_mode: str | None = None) -> bool:
         """Return True when required core executables (`winws2.exe`, and `sing-box.exe` in hybrid mode) exist."""
@@ -3948,6 +4062,57 @@ class GuiBackend:
             if fetch_error is not None:
                 post["fetch_error"] = fetch_error
             return post
+
+    def get_app_version(self) -> str:
+        """Return the installed/source netdoctor version string."""
+        return __version__
+
+    def get_install_mode(self) -> str:
+        """Return `git` if running from a git clone or `portable` otherwise."""
+        return detect_install_mode()
+
+    def has_outdated_pinned_bins(self) -> bool:
+        """Return True when bin/manifest.json records binary versions differing from pinned release tags."""
+        return bool(get_outdated_pinned_artifacts(self.bin_dir))
+
+    def check_updates(self, *, force: bool = False) -> dict[str, Any]:
+        """Check GitHub Releases for a newer netdoctor version using SQLite cache when not forced."""
+        storage = Storage(self.db_path)
+        try:
+            return _run_coro_sync(check_for_updates(storage=storage, force=force))
+        finally:
+            storage.close()
+
+    def apply_update(self, *, download_url: str | None = None, target_version: str | None = None) -> dict[str, Any]:
+        """Stop running bypass services, apply the app update, and sync pinned binaries."""
+        try:
+            self.stop_services()
+        except Exception:  # noqa: BLE001
+            pass
+        storage = Storage(self.db_path)
+        try:
+            return _run_coro_sync(
+                apply_app_update(
+                    bin_dir=self.bin_dir,
+                    lists_dir=self.lists_dir,
+                    storage=storage,
+                    download_url=download_url,
+                    target_version=target_version,
+                )
+            )
+        finally:
+            storage.close()
+
+    def restart_gui_process(self) -> dict[str, Any]:
+        """Spawn a detached replacement GUI process to complete an in-app update."""
+        return launch_gui_detached(
+            db_path=self.db_path,
+            configs_dir=self.configs_dir,
+            lists_dir=self.lists_dir,
+            logs_dir=self.logs_dir,
+            bin_dir=self.bin_dir,
+            replace_pid=os.getpid(),
+        )
 
     def trigger_revalidate(self) -> dict[str, Any]:
         """Run one canary/TTL revalidation cycle against stored decisions."""

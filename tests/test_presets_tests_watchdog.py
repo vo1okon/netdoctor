@@ -1739,6 +1739,196 @@ def test_audit_fixes_start_stack_exception_rollback_autostart_len_and_nonroot_cw
     assert "успешно очищен" in flush_res["output"]
 
 
+def test_supervisor_start_stack_shared_wait_and_crash_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import netdoctor.supervisor as sup_mod
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    sup = ProcessSupervisor(bin_dir=bin_dir, logs_dir=tmp_path / "logs")
+    sleep_cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+    specs = [
+        ("tg-ws-proxy", sleep_cmd, tmp_path),
+        ("byedpi", sleep_cmd, tmp_path),
+        ("xray", sleep_cmd, tmp_path),
+    ]
+
+    recorded_sleeps: list[float] = []
+    real_sleep = sup_mod.time.sleep
+
+    def spy_sleep(secs: float) -> None:
+        recorded_sleeps.append(float(secs))
+        real_sleep(secs)
+
+    monkeypatch.setattr(sup_mod.time, "sleep", spy_sleep)
+    # Isolate unit test from real host processes listening on default ports (e.g. 10808/18100)
+    monkeypatch.setattr(sup_mod, "SERVICE_PORTS", {})
+
+    try:
+        sup.start_stack(specs, startup_wait=0.4, skip_stop=True)
+        total_slept = sum(recorded_sleeps)
+        # Shared wait across 3 services must sleep ~0.4s total, not 3 * 0.4s = 1.2s sequential delay
+        assert 0.35 <= total_slept < 0.7, f"Expected single shared ~0.4s wait, slept {total_slept:.3f}s"
+        assert set(sup.processes.keys()) == {"tg-ws-proxy", "byedpi", "xray"}
+    finally:
+        sup.stop_all()
+
+    crash_cmd = [sys.executable, "-c", "import sys; sys.stderr.write('boom\\n'); sys.exit(1)"]
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            sup.start_stack(
+                [
+                    ("tg-ws-proxy", sleep_cmd, tmp_path),
+                    ("winws2", crash_cmd, tmp_path),
+                ],
+                startup_wait=3.0,
+                skip_stop=True,
+            )
+    finally:
+        sup.stop_all()
+    assert "Service 'winws2' exited prematurely on startup with code 1: boom" in str(exc_info.value)
+    assert sup.processes == {}
+
+
+def test_start_autopilot_admin_single_apply_and_nonblocking_vpn_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    import netdoctor.gui_backend as backend_mod
+    from netdoctor.storage import Storage
+
+    bin_dir = tmp_path / "bin"
+    lists_dir = tmp_path / "lists"
+    cfg_dir = tmp_path / "configs"
+    logs_dir = tmp_path / "logs"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "winws2.exe").write_bytes(b"MZ" + b"\x00" * 64)
+    (bin_dir / "sing-box.exe").write_bytes(b"MZ" + b"\x00" * 64)
+
+    db_path = tmp_path / "fast_start.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=cfg_dir,
+        lists_dir=lists_dir,
+        logs_dir=logs_dir,
+        bin_dir=bin_dir,
+    )
+
+    st = Storage(db_path)
+    try:
+        net_key, _, _, _ = backend._resolve_network_info(st)
+        st.save_decision(
+            Decision(
+                network_key=net_key,
+                domain="youtube.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="z2_multisplit_sni",
+            )
+        )
+        st.save_subscription(
+            "fast-sub",
+            "https://example.com/sub",
+            [
+                {
+                    "tag": "nl-1",
+                    "protocol": "vless",
+                    "server": "1.2.3.4",
+                    "server_port": 443,
+                    "raw_outbound": {
+                        "type": "vless",
+                        "tag": "nl-1",
+                        "server": "1.2.3.4",
+                        "server_port": 443,
+                        "uuid": "00000000-0000-0000-0000-000000000000",
+                    },
+                    "enabled": True,
+                }
+            ],
+        )
+    finally:
+        st.close()
+
+    monkeypatch.setattr(backend_mod, "_is_admin", lambda: True)
+    monkeypatch.setattr(backend_mod, "detect_bypass_active", lambda: False)
+    monkeypatch.setattr(backend_mod, "detect_physical_egress_iface", lambda: 1)
+    monkeypatch.setattr(backend_mod, "validate_singbox_config", lambda *_a, **_kw: (True, ""))
+    monkeypatch.setattr(backend_mod, "stop_persisted_supervisor", lambda **_kw: [])
+
+    start_stack_calls: list[dict[str, Any]] = []
+
+    class FakeSupervisor:
+        def __init__(self, **_kw: Any) -> None:
+            self.processes: dict[str, Any] = {}
+            self._adopted: dict[str, Any] = {}
+
+        def adopt_persisted_state(self) -> dict[str, Any]:
+            return {}
+
+        def start_stack(self, specs: Any, **kw: Any) -> None:
+            start_stack_calls.append({"specs": [s[0] for s in specs], **kw})
+
+        def status(self) -> dict[str, Any]:
+            return {"winws2": {"running": True, "pid": 123}, "sing-box": {"running": True, "pid": 456}}
+
+        def stop_process(self, _name: str) -> None:
+            pass
+
+    monkeypatch.setattr(backend_mod, "ProcessSupervisor", FakeSupervisor)
+
+    apply_count = 0
+    orig_apply = backend.trigger_apply_configs
+
+    def wrapped_apply(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal apply_count
+        apply_count += 1
+        return orig_apply(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "trigger_apply_configs", wrapped_apply)
+
+    sub_started = threading.Event()
+    vpn_sync_started = threading.Event()
+    release_bg = threading.Event()
+
+    def slow_sub_refresh(*_a: Any, **_kw: Any) -> bool:
+        sub_started.set()
+        release_bg.wait(timeout=2.0)
+        return False
+
+    def slow_vpn_sync(*_a: Any, **_kw: Any) -> None:
+        vpn_sync_started.set()
+        release_bg.wait(timeout=2.0)
+
+    monkeypatch.setattr(backend, "_refresh_stale_subscriptions_if_needed", slow_sub_refresh)
+    monkeypatch.setattr(backend, "_sync_singbox_vpn_selector", slow_vpn_sync)
+    monkeypatch.setattr(
+        backend,
+        "scan_live_connections",
+        lambda: (_ for _ in ()).throw(AssertionError("start_autopilot should not scan live connections synchronously")),
+    )
+
+    try:
+        t0 = time.monotonic()
+        res = backend.start_autopilot(iface=1)
+        elapsed = time.monotonic() - t0
+    finally:
+        release_bg.set()
+
+    assert res["ok"] is True
+    assert res["started_services"] is True
+    assert res["live_connections"] is None
+    assert apply_count == 1
+    assert elapsed < 0.8
+    assert start_stack_calls and start_stack_calls[0]["skip_stop"] is True
+    assert start_stack_calls[0]["startup_wait"] == 0.35
+    assert sub_started.wait(timeout=1.0)
+    assert vpn_sync_started.wait(timeout=1.0)
+
+
+
 
 
 

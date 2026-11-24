@@ -23,16 +23,19 @@ from typing import Any
 import httpx
 import psutil
 
+from netdoctor import __version__
+
 
 DEFAULT_BIN_DIR = Path("bin")
 DEFAULT_LISTS_DIR = Path("lists")
 DEFAULT_PRESETS_DIR = Path("presets")
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# Upstream GitHub release metadata for external binaries
+# Strictly pinned upstream GitHub release metadata tied to this netdoctor release
 UPSTREAM_RELEASES: dict[str, dict[str, str]] = {
     "sing-box": {
         "repo": "SagerNet/sing-box",
+        "tag": "v1.14.4",
         "asset_keyword": "windows-amd64.zip",
         "direct_archive": "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-windows-amd64.zip",
         "binary_name": "sing-box.exe",
@@ -40,7 +43,9 @@ UPSTREAM_RELEASES: dict[str, dict[str, str]] = {
     },
     "zapret-win-bundle": {
         "repo": "bol-van/zapret-win-bundle",
-        "branch_archive": "https://github.com/bol-van/zapret-win-bundle/archive/refs/heads/master.zip",
+        "tag": "6b4375fa04f6",
+        "commit": "6b4375fa04f6bd7017eec379e16e462d3ea8df66",
+        "branch_archive": "https://github.com/bol-van/zapret-win-bundle/archive/6b4375fa04f6bd7017eec379e16e462d3ea8df66.zip",
         "binary_name": "winws2.exe",
         "license": "MIT",
     },
@@ -69,12 +74,63 @@ UPSTREAM_RELEASES: dict[str, dict[str, str]] = {
     },
     "xray": {
         "repo": "XTLS/Xray-core",
+        "tag": "v26.11.9",
         "asset_keyword": "Xray-windows-64.zip",
-        "direct_archive": "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip",
+        "direct_archive": "https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-windows-64.zip",
         "binary_name": "xray.exe",
         "license": "MPL-2.0 (external binary only)",
     },
 }
+
+
+def get_pinned_binary_versions() -> dict[str, str]:
+    """Return pinned upstream tag/commit versions for all external binaries."""
+    return {
+        name: str(meta.get("tag") or "").strip()
+        for name, meta in UPSTREAM_RELEASES.items()
+        if str(meta.get("tag") or "").strip()
+    }
+
+
+def get_outdated_pinned_artifacts(bin_dir: Path = DEFAULT_BIN_DIR) -> dict[str, dict[str, str]]:
+    """Compare bin/manifest.json artifact tags against UPSTREAM_RELEASES pinned tags."""
+    bin_path = Path(bin_dir)
+    manifest_file = bin_path / "manifest.json"
+    if not manifest_file.is_file():
+        return {}
+    try:
+        manifest_obj = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(manifest_obj, dict):
+        return {}
+    try:
+        schema_ver = int(manifest_obj.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        schema_ver = 1
+    artifacts = manifest_obj.get("artifacts", {})
+    if not isinstance(artifacts, dict):
+        return {}
+
+    check_names = ["sing-box", "zapret-win-bundle", "tg-ws-proxy", "zapret-discord-youtube", "byedpi"]
+    if "xray" in artifacts or (bin_path / "xray.exe").is_file():
+        check_names.append("xray")
+
+    outdated: dict[str, dict[str, str]] = {}
+    for art_name in check_names:
+        expected_tag = str(UPSTREAM_RELEASES.get(art_name, {}).get("tag") or "").strip()
+        if not expected_tag:
+            continue
+        art_entry = artifacts.get(art_name)
+        if not isinstance(art_entry, dict):
+            continue
+        recorded_tag = str(art_entry.get("tag") or "").strip()
+        if recorded_tag:
+            if recorded_tag != expected_tag:
+                outdated[art_name] = {"installed": recorded_tag, "expected": expected_tag}
+        elif schema_ver >= 2:
+            outdated[art_name] = {"installed": "", "expected": expected_tag}
+    return outdated
 
 
 def sha256_file(path: Path) -> str:
@@ -162,6 +218,31 @@ async def _download_bytes(url: str, *, timeout: float, client: httpx.AsyncClient
         return resp.content
 
 
+async def _fetch_zip_binary(
+    target_exe: Path,
+    url: str,
+    exe_filename: str,
+    *,
+    force: bool = False,
+    timeout: float = 60.0,
+    client: httpx.AsyncClient | None = None,
+) -> Path:
+    """Download a pinned ZIP archive and extract a single named executable atomically."""
+    target_exe.parent.mkdir(parents=True, exist_ok=True)
+    if target_exe.exists() and not force:
+        return target_exe
+
+    archive_bytes = await _download_bytes(url, timeout=timeout, client=client)
+    expected_lower = exe_filename.lower()
+    with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
+        for member in zf.namelist():
+            rel = _safe_rel_path(member, strip_root=False)
+            if rel is not None and rel.name.lower() == expected_lower:
+                _write_bytes_atomic(target_exe, zf.read(member))
+                return target_exe
+    raise RuntimeError(f"{exe_filename} not found inside downloaded archive")
+
+
 async def fetch_singbox_binary(
     bin_dir: Path = DEFAULT_BIN_DIR,
     timeout: float = 60.0,
@@ -169,46 +250,15 @@ async def fetch_singbox_binary(
     force: bool = False,
     client: httpx.AsyncClient | None = None,
 ) -> Path:
-    """Download latest official SagerNet/sing-box Windows amd64 release binary into bin_dir."""
-    bin_dir = Path(bin_dir)
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    target_exe = bin_dir / "sing-box.exe"
-    if target_exe.exists() and not force:
-        return target_exe
-
-    async def _fetch_with(active_client: httpx.AsyncClient) -> Path:
-        download_url: str | None = None
-        try:
-            resp = await active_client.get("https://api.github.com/repos/SagerNet/sing-box/releases/latest")
-            if resp.is_success:
-                release = resp.json()
-                assets = release.get("assets") or []
-                for asset in assets:
-                    name = asset.get("name", "")
-                    if "windows-amd64.zip" in name and "legacy" not in name:
-                        download_url = asset.get("browser_download_url")
-                        break
-        except Exception:  # noqa: BLE001
-            download_url = None
-
-        if not download_url:
-            download_url = UPSTREAM_RELEASES["sing-box"]["direct_archive"]
-
-        dl_resp = await active_client.get(download_url)
-        dl_resp.raise_for_status()
-
-        with zipfile.ZipFile(io.BytesIO(dl_resp.content), "r") as zf:
-            for member in zf.namelist():
-                rel = _safe_rel_path(member, strip_root=False)
-                if rel is not None and rel.name == "sing-box.exe":
-                    _write_bytes_atomic(target_exe, zf.read(member))
-                    return target_exe
-        raise RuntimeError("sing-box.exe not found inside downloaded archive")
-
-    if client is not None:
-        return await _fetch_with(client)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as own_client:
-        return await _fetch_with(own_client)
+    """Download the pinned SagerNet/sing-box Windows amd64 release binary into bin_dir."""
+    return await _fetch_zip_binary(
+        Path(bin_dir) / "sing-box.exe",
+        UPSTREAM_RELEASES["sing-box"]["direct_archive"],
+        "sing-box.exe",
+        force=force,
+        timeout=timeout,
+        client=client,
+    )
 
 
 async def fetch_xray_binary(
@@ -218,47 +268,15 @@ async def fetch_xray_binary(
     force: bool = False,
     client: httpx.AsyncClient | None = None,
 ) -> Path:
-    """Download latest official XTLS/Xray-core Windows amd64 release binary into bin_dir."""
-    bin_dir = Path(bin_dir)
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    target_exe = bin_dir / "xray.exe"
-    if target_exe.exists() and not force:
-        return target_exe
-
-    async def _fetch_with(active_client: httpx.AsyncClient) -> Path:
-        download_url: str | None = None
-        try:
-            resp = await active_client.get("https://api.github.com/repos/XTLS/Xray-core/releases/latest")
-            if resp.is_success:
-                release = resp.json()
-                assets = release.get("assets") or []
-                for asset in assets:
-                    name = str(asset.get("name") or "")
-                    if name.endswith(".dgst"):
-                        continue
-                    if "xray-windows-64.zip" in name.lower():
-                        download_url = asset.get("browser_download_url")
-                        break
-        except Exception:  # noqa: BLE001
-            download_url = None
-        if not download_url:
-            download_url = UPSTREAM_RELEASES["xray"]["direct_archive"]
-
-        dl_resp = await active_client.get(download_url)
-        dl_resp.raise_for_status()
-
-        with zipfile.ZipFile(io.BytesIO(dl_resp.content), "r") as zf:
-            for member in zf.namelist():
-                rel = _safe_rel_path(member, strip_root=False)
-                if rel is not None and rel.name.lower() == "xray.exe":
-                    _write_bytes_atomic(target_exe, zf.read(member))
-                    return target_exe
-        raise RuntimeError("xray.exe not found inside downloaded archive")
-
-    if client is not None:
-        return await _fetch_with(client)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as own_client:
-        return await _fetch_with(own_client)
+    """Download the pinned XTLS/Xray-core Windows amd64 release binary into bin_dir."""
+    return await _fetch_zip_binary(
+        Path(bin_dir) / "xray.exe",
+        UPSTREAM_RELEASES["xray"]["direct_archive"],
+        "xray.exe",
+        force=force,
+        timeout=timeout,
+        client=client,
+    )
 
 
 def _sync_blockcheck_fake_bins(bin_dir: Path) -> list[Path]:
@@ -544,18 +562,35 @@ async def fetch_all_bins(
     presets_path.mkdir(parents=True, exist_ok=True)
 
     singbox_preexisted = (bin_dir / "sing-box.exe").exists()
+    outdated = get_outdated_pinned_artifacts(bin_dir)
 
     async def _run(active_client: httpx.AsyncClient) -> dict[str, Any]:
-        # Protect pre-existing sing-box.exe unless missing (always force=False)
-        singbox_exe = await fetch_singbox_binary(bin_dir, timeout=timeout, force=False, client=active_client)
-        zapret_files = await fetch_zapret_win_bundle(bin_dir, force=force, timeout=timeout, client=active_client)
-        tg_files = await fetch_tg_ws_proxy(bin_dir, force=force, timeout=timeout, client=active_client)
-        zdy_files = await fetch_zapret_discord_youtube(
-            bin_dir, lists_dir, presets_path, force=force, timeout=timeout, client=active_client
+        # Protect pre-existing sing-box.exe unless missing or its manifest tag changed in this release
+        singbox_exe = await fetch_singbox_binary(
+            bin_dir, timeout=timeout, force=("sing-box" in outdated), client=active_client
         )
-        ciadpi_exe = await fetch_byedpi(bin_dir, force=force, timeout=timeout, client=active_client)
+        zapret_files = await fetch_zapret_win_bundle(
+            bin_dir, force=force or ("zapret-win-bundle" in outdated), timeout=timeout, client=active_client
+        )
+        tg_files = await fetch_tg_ws_proxy(
+            bin_dir, force=force or ("tg-ws-proxy" in outdated), timeout=timeout, client=active_client
+        )
+        zdy_files = await fetch_zapret_discord_youtube(
+            bin_dir,
+            lists_dir,
+            presets_path,
+            force=force or ("zapret-discord-youtube" in outdated),
+            timeout=timeout,
+            client=active_client,
+        )
+        ciadpi_exe = await fetch_byedpi(
+            bin_dir, force=force or ("byedpi" in outdated), timeout=timeout, client=active_client
+        )
+        xray_exe = bin_dir / "xray.exe"
         try:
-            await fetch_xray_binary(bin_dir, force=force, timeout=timeout, client=active_client)
+            xray_exe = await fetch_xray_binary(
+                bin_dir, force=force or ("xray" in outdated), timeout=timeout, client=active_client
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -600,15 +635,23 @@ async def fetch_all_bins(
         )
 
         manifest_data: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "netdoctor_version": __version__,
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "artifacts": {
                 "sing-box": {
-                    "source": "preinstalled" if singbox_preexisted else UPSTREAM_RELEASES["sing-box"]["repo"],
+                    "tag": UPSTREAM_RELEASES["sing-box"]["tag"],
+                    "source": (
+                        "preinstalled"
+                        if (singbox_preexisted and "sing-box" not in outdated)
+                        else UPSTREAM_RELEASES["sing-box"]["direct_archive"]
+                    ),
                     "protected": True,
                     "files": _collect_records("bin", bin_dir, [singbox_exe]),
                 },
                 "zapret-win-bundle": {
+                    "tag": UPSTREAM_RELEASES["zapret-win-bundle"]["tag"],
+                    "commit": UPSTREAM_RELEASES["zapret-win-bundle"]["commit"],
                     "source": UPSTREAM_RELEASES["zapret-win-bundle"]["branch_archive"],
                     "files": _collect_records("bin", bin_dir, zapret_tracked),
                 },
@@ -634,6 +677,12 @@ async def fetch_all_bins(
                 },
             },
         }
+        if xray_exe.is_file():
+            manifest_data["artifacts"]["xray"] = {
+                "tag": UPSTREAM_RELEASES["xray"]["tag"],
+                "source": UPSTREAM_RELEASES["xray"]["direct_archive"],
+                "files": _collect_records("bin", bin_dir, [xray_exe]),
+            }
         manifest_path = bin_dir / "manifest.json"
         _write_bytes_atomic(manifest_path, (json.dumps(manifest_data, indent=2) + "\n").encode("utf-8"))
         return {
@@ -1033,6 +1082,7 @@ def verify_binaries(
         "exists": manifest_file.is_file(),
         "checked_files": 0,
         "mismatches": [],
+        "outdated_artifacts": {},
         "status": "missing",
         "detail": "",
     }
@@ -1115,6 +1165,13 @@ def verify_binaries(
             for req_art, req_root, req_rel in required_manifest_entries:
                 if (req_art, req_root, req_rel) not in present_entries:
                     mismatches.append(f"{req_art}:{req_rel}:missing_from_manifest")
+
+            outdated = get_outdated_pinned_artifacts(bin_path)
+            manifest_report["outdated_artifacts"] = outdated
+            for art_name, info in outdated.items():
+                mismatches.append(
+                    f"{art_name}:version_mismatch:{info['installed'] or 'none'}!={info['expected']}"
+                )
 
             manifest_report["checked_files"] = checked
             manifest_report["mismatches"] = mismatches
@@ -1557,7 +1614,14 @@ class ProcessSupervisor:
         }
         _write_bytes_atomic(self.state_path, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
 
-    def start_process(self, name: str, cmd: list[str], cwd: Path | None = None) -> subprocess.Popen[bytes]:
+    def start_process(
+        self,
+        name: str,
+        cmd: list[str],
+        cwd: Path | None = None,
+        *,
+        skip_stop: bool = False,
+    ) -> subprocess.Popen[bytes]:
         if not cmd:
             raise ValueError(f"Empty command for process '{name}'")
         exe = cmd[0]
@@ -1571,23 +1635,24 @@ class ProcessSupervisor:
                 Path(cwd) if cwd is not None else (exe_path.parent if exe_path.parent != Path(".") else self.bin_dir)
             )
 
-        was_running = (name in self.processes and self.processes[name].poll() is None) or (
-            name in self._adopted
-            and _is_pid_running(
-                self._adopted[name].get("pid"),
-                expected_create_time=self._adopted[name].get("create_time"),
+        if not skip_stop:
+            was_running = (name in self.processes and self.processes[name].poll() is None) or (
+                name in self._adopted
+                and _is_pid_running(
+                    self._adopted[name].get("pid"),
+                    expected_create_time=self._adopted[name].get("create_time"),
+                )
             )
-        )
-        if not was_running:
-            persisted = inspect_supervisor_state(state_path=self.state_path)
-            was_running = bool((persisted.get(name) or {}).get("running"))
-        self.stop_process(name)
-        if was_running and name == "winws2":
-            # Allow WinDivert64.sys kernel driver to finish releasing the filter handle cleanly
-            time.sleep(0.35)
-        elif was_running and name == "sing-box":
-            # Allow Wintun adapter teardown to settle before re-creating netdoctor-tun
-            time.sleep(0.25)
+            if not was_running:
+                persisted = inspect_supervisor_state(state_path=self.state_path)
+                was_running = bool((persisted.get(name) or {}).get("running"))
+            self.stop_process(name)
+            if was_running and name == "winws2":
+                # Allow WinDivert64.sys kernel driver to finish releasing the filter handle cleanly
+                time.sleep(0.35)
+            elif was_running and name == "sing-box":
+                # Allow Wintun adapter teardown to settle before re-creating netdoctor-tun
+                time.sleep(0.25)
 
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.logs_dir / f"{name}.log"
@@ -1710,8 +1775,11 @@ class ProcessSupervisor:
         self,
         specs: list[tuple[str, list[str]] | tuple[str, list[str], Path | None]],
         startup_wait: float = 0.35,
+        *,
+        skip_stop: bool = False,
     ) -> dict[str, subprocess.Popen[bytes]]:
-        """Start a stack of services sequentially, rolling back all started processes if any crashes."""
+        """Start a stack of services, rolling back all started processes if any crashes."""
+        started: list[tuple[str, subprocess.Popen[bytes]]] = []
         for spec in specs:
             if len(spec) == 2:
                 name, cmd = spec
@@ -1719,25 +1787,42 @@ class ProcessSupervisor:
             else:
                 name, cmd, cwd = spec
             try:
-                proc = self.start_process(name, cmd, cwd=cwd)
+                proc = self.start_process(name, cmd, cwd=cwd, skip_stop=skip_stop)
             except Exception:
                 self.stop_all()
                 raise
-            if startup_wait > 0:
-                time.sleep(startup_wait)
-            rc = proc.poll()
-            if rc is not None:
-                log_path = self.logs_dir / f"{name}.log"
-                self.stop_all()
-                detail = ""
-                try:
-                    if log_path.is_file():
-                        lines = [ln.strip() for ln in log_path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
-                        if lines:
-                            detail = f": {lines[-1][:180]}"
-                except OSError:
-                    pass
-                raise RuntimeError(f"Service '{name}' exited prematurely on startup with code {rc}{detail}")
+            started.append((name, proc))
+
+        def _abort_if_exited() -> None:
+            for svc_name, proc in started:
+                rc = proc.poll()
+                if rc is not None:
+                    log_path = self.logs_dir / f"{svc_name}.log"
+                    self.stop_all()
+                    detail = ""
+                    try:
+                        if log_path.is_file():
+                            lines = [
+                                ln.strip()
+                                for ln in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                                if ln.strip()
+                            ]
+                            if lines:
+                                detail = f": {lines[-1][:180]}"
+                    except OSError:
+                        pass
+                    raise RuntimeError(f"Service '{svc_name}' exited prematurely on startup with code {rc}{detail}")
+
+        _abort_if_exited()
+        if startup_wait > 0 and started:
+            deadline = time.monotonic() + float(startup_wait)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.05, remaining))
+                _abort_if_exited()
+            _abort_if_exited()
         return dict(self.processes)
 
     def reload_process(self, name: str, cmd: list[str], cwd: Path | None = None) -> subprocess.Popen[bytes]:

@@ -23,6 +23,8 @@ from netdoctor.models import (
 )
 
 
+CURRENT_DB_VERSION = 2
+
 _INITIALIZED_DB_SIGNATURES: dict[str, tuple[int, int, int]] = {}
 _INIT_DB_LOCK = threading.Lock()
 
@@ -76,8 +78,14 @@ class Storage:
             self.conn.close()
             raise
 
+    def get_schema_version(self) -> int:
+        """Return the SQLite `PRAGMA user_version` schema version."""
+        row = self.conn.execute("PRAGMA user_version").fetchone()
+        return int(row[0]) if row else 0
+
     def _init_schema(self) -> None:
-        with self.conn:
+        ver = self.get_schema_version()
+        if ver < 1:
             self.conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS networks (
@@ -200,13 +208,20 @@ class Storage:
                 );
                 """
             )
-            # Safe schema migration for existing DBs lacking decisions.pinned
-            dec_cols = {
-                str(r["name"])
-                for r in self.conn.execute("PRAGMA table_info(decisions)").fetchall()
-            }
-            if "pinned" not in dec_cols:
-                self.conn.execute("ALTER TABLE decisions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            with self.conn:
+                self.conn.execute("PRAGMA user_version = 1")
+            ver = 1
+
+        if ver < 2:
+            with self.conn:
+                dec_cols = {
+                    str(r["name"])
+                    for r in self.conn.execute("PRAGMA table_info(decisions)").fetchall()
+                }
+                if "pinned" not in dec_cols:
+                    self.conn.execute("ALTER TABLE decisions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+                self.conn.execute("PRAGMA user_version = 2")
+            ver = 2
 
     def upsert_network(self, net: NetworkFingerprint) -> str:
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -529,6 +544,15 @@ class Storage:
                     node["enabled"] = bool(node["enabled"])
                 all_nodes.append(node)
         return all_nodes
+
+    def has_usable_vpn(self) -> bool:
+        """Return True when hybrid VPN mode is active and at least one usable VPN node is configured."""
+        stack_mode = self.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
+        if stack_mode == "dpi_only":
+            return False
+        from netdoctor.vpn import has_usable_vpn_nodes
+
+        return has_usable_vpn_nodes(self.get_all_subscription_nodes())
 
     def upsert_vpn_node_health(self, record: dict[str, Any]) -> None:
         node_tag = str(record.get("node_tag") or record.get("tag") or "").strip()

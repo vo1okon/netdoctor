@@ -445,3 +445,274 @@ def test_supervisor_reload_and_stop_under_pythonw_no_monotonic_systemerror(tmp_p
     assert res.returncode == 0
     assert out_file.is_file()
     assert out_file.read_text(encoding="utf-8").strip() == "OK"
+
+
+def test_has_usable_vpn_nodes_and_storage_check(tmp_path: Path) -> None:
+    from netdoctor.vpn import has_usable_vpn_nodes
+
+    assert has_usable_vpn_nodes([]) is False
+    assert (
+        has_usable_vpn_nodes(
+            [
+                VpnNode(
+                    tag="Demo",
+                    protocol="vless",
+                    server="de1.example.com",
+                    server_port=443,
+                    raw_outbound={"type": "vless", "tag": "Demo", "server": "de1.example.com", "server_port": 443},
+                )
+            ]
+        )
+        is False
+    )
+    assert has_usable_vpn_nodes([{"tag": "Banner ↙", "protocol": "vless", "server": "198.51.100.10"}]) is False
+    assert has_usable_vpn_nodes([{"tag": "Off", "protocol": "vless", "server": "198.51.100.10", "enabled": False}]) is False
+    assert has_usable_vpn_nodes([{"tag": "Real", "protocol": "vless", "server": "198.51.100.10", "enabled": True}]) is True
+
+    st = Storage(tmp_path / "vpn_check.db")
+    try:
+        assert st.has_usable_vpn() is False
+        st.save_subscription(
+            "demo",
+            "https://demo.example",
+            [{"tag": "Demo-DE", "protocol": "vless", "server": "de1.example.com", "server_port": 443}],
+        )
+        assert st.has_usable_vpn() is False
+
+        st.save_subscription(
+            "real",
+            "https://real.example",
+            [{"tag": "Real-NL", "protocol": "vless", "server": "198.51.100.22", "server_port": 443, "enabled": True}],
+        )
+        assert st.has_usable_vpn() is True
+
+        st.set_setting("stack_mode", "dpi_only")
+        assert st.has_usable_vpn() is False
+    finally:
+        st.close()
+
+
+@pytest.mark.asyncio
+async def test_selector_never_picks_vpn_when_vpn_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import netdoctor.selector as sel_mod
+    from netdoctor.models import VerdictClass
+    from netdoctor.selector import (
+        CandidateEvaluation,
+        DEFAULT_STRATEGIES,
+        evaluate_domains_live_batch,
+        select_best_strategy,
+    )
+
+    async def always_fail(_dom: str, _ip: str, strat: Strategy) -> CandidateEvaluation:
+        return CandidateEvaluation(strat, success_rate=0.0, throughput_kbps=0.0, ttfb_ms=9999.0)
+
+    dec_ip = await select_best_strategy(
+        network_key="AS12389:home:default",
+        domain="blocked-ip.example",
+        ip="198.51.100.10",
+        verdicts=[VerdictClass.IP_BLOCK],
+        candidates=DEFAULT_STRATEGIES,
+        evaluator=always_fail,
+        vpn_available=False,
+    )
+    assert dec_ip.layer == "dpi" and dec_ip.strategy_id is not None
+
+    dec_sni = await select_best_strategy(
+        network_key="AS12389:home:default",
+        domain="blocked-sni.example",
+        ip="198.51.100.11",
+        verdicts=[VerdictClass.SNI_DPI],
+        candidates=DEFAULT_STRATEGIES,
+        evaluator=always_fail,
+        vpn_available=False,
+    )
+    assert dec_sni.layer == "dpi" and dec_sni.strategy_id is not None
+
+    dec_proto = await select_best_strategy(
+        network_key="AS12389:home:default",
+        domain="proto.example",
+        ip="198.51.100.12",
+        verdicts=[VerdictClass.PROTOCOL_BLOCK],
+        candidates=DEFAULT_STRATEGIES,
+        vpn_available=False,
+    )
+    assert dec_proto.layer == "direct"
+    assert dec_proto.status == "degraded"
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    (fake_bin / "winws2.exe").write_bytes(b"MZ")
+
+    class _FakeProc:
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float = 1.0) -> int:
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    monkeypatch.setattr(sel_mod, "_is_admin", lambda: True)
+    monkeypatch.setattr(sel_mod, "detect_bypass_active", lambda: False)
+    monkeypatch.setattr(sel_mod.subprocess, "Popen", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr(
+        sel_mod,
+        "default_strategy_evaluator",
+        lambda _d, _ip, s, **_kw: asyncio.sleep(0, result=CandidateEvaluation(s, 0.0, 0.0, 9999.0)),
+    )
+
+    batch = await evaluate_domains_live_batch(
+        domains_info=[
+            ("ipblock.example", "198.51.100.13", [VerdictClass.IP_BLOCK]),
+            ("snidpi.example", "198.51.100.14", [VerdictClass.SNI_DPI]),
+        ],
+        network_key="AS12389:home:default",
+        candidates=DEFAULT_STRATEGIES[:4],
+        bin_dir=fake_bin,
+        use_live_eval=True,
+        vpn_available=False,
+    )
+    assert batch["ipblock.example"].layer == "dpi"
+    assert batch["snidpi.example"].layer == "dpi"
+
+
+@pytest.mark.asyncio
+async def test_canary_and_fallback_rotate_dpi_instead_of_vpn_when_no_vpn(tmp_path: Path) -> None:
+    from netdoctor.dynamics import promote_fallback_on_failure, run_canary_cycle
+    from netdoctor.selector import DEFAULT_STRATEGIES
+
+    st = Storage(tmp_path / "canary_novpn.db")
+    try:
+        net = NetworkFingerprint(asn=12389, kind=NetworkKind.HOME)
+        net_key = st.upsert_network(net)
+        st.upsert_strategies(DEFAULT_STRATEGIES)
+
+        d = Decision(
+            network_key=net_key,
+            domain="discord.com",
+            protocol=Protocol.TLS,
+            layer="dpi",
+            strategy_id="tls_alt1_199_fake_fakedsplit",
+            fallback_strategies=[],
+        )
+        st.save_decision(d)
+
+        promoted = promote_fallback_on_failure(st, d, vpn_available=False)
+        assert promoted.layer == "dpi"
+        assert promoted.strategy_id != "vpn-select"
+        assert promoted.strategy_id != "tls_alt1_199_fake_fakedsplit"
+
+        promoted.fallback_strategies = []
+        st.save_decision(promoted)
+        summary = await run_canary_cycle(st, network=net, probe_fn=lambda _dom: asyncio.sleep(0, result=False))
+        assert "discord.com" in summary["promoted"]
+        after = st.get_decisions(net_key)[0]
+        assert after.layer == "dpi"
+        assert after.strategy_id != "vpn-select"
+    finally:
+        st.close()
+
+
+def test_gui_backend_diag_and_apply_never_route_unpinned_vpn_without_active_vpn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import netdoctor.gui_backend as backend_mod
+
+    db_path = tmp_path / "novpn_backend.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+
+    monkeypatch.setattr(backend_mod, "_is_admin", lambda: False)
+    monkeypatch.setattr(backend_mod, "detect_bypass_active", lambda: False)
+    monkeypatch.setattr(
+        backend_mod,
+        "detect_network_fingerprint",
+        lambda timeout=2.5: asyncio.sleep(0, result=NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="ISP")),
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "run_domain_probes",
+        lambda dom, timeout=2.5: asyncio.sleep(
+            0,
+            result=ProbesSummary(
+                dns=DnsProbeResult(system="ok", doh="ok", system_ips=["198.51.100.55"], doh_ips=["198.51.100.55"]),
+                tcp=TcpProbeResult(result="timeout", target_ip="198.51.100.55"),
+                tls=TlsProbeResult(real_sni="timeout", neutral_sni="timeout"),
+            ),
+        ),
+    )
+
+    # 1. No VPN subscription at all -> run_diag_sync picks DPI, never VPN
+    rows_no_vpn = backend.run_diag_sync(domains=["blocked.example"], live_eval=False, timeout=1.0)
+    assert len(rows_no_vpn) == 1
+    assert rows_no_vpn[0]["layer"] == "dpi"
+    assert rows_no_vpn[0]["strategy_id"] != "vpn-select"
+
+    # 2. Real VPN configured, but stack_mode == "dpi_only" -> still picks DPI, never VPN
+    st = Storage(db_path)
+    try:
+        st.save_subscription(
+            "real",
+            "https://sub.example",
+            [
+                {
+                    "tag": "DE-Real",
+                    "protocol": "vless",
+                    "server": "198.51.100.88",
+                    "server_port": 443,
+                    "enabled": True,
+                    "raw_outbound": {"type": "vless", "tag": "DE-Real", "server": "198.51.100.88", "server_port": 443},
+                }
+            ],
+        )
+        st.set_setting("stack_mode", "dpi_only")
+        # Also inject a stale unpinned VPN decision and an explicitly pinned VPN decision
+        net_key = st.upsert_network(NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="ISP"))
+        st.save_decision(
+            Decision(
+                network_key=net_key,
+                domain="stale-auto.example",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                pinned=False,
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=net_key,
+                domain="explicit-pin.example",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                pinned=True,
+            )
+        )
+    finally:
+        st.close()
+
+    rows_dpi_only = backend.run_diag_sync(domains=["blocked2.example"], live_eval=False, timeout=1.0)
+    assert rows_dpi_only[0]["layer"] == "dpi"
+
+    sb_cfg = json.loads((tmp_path / "configs" / "sing-box.json").read_text(encoding="utf-8"))
+    vpn_rules = [r for r in sb_cfg["route"]["rules"] if r.get("outbound") == "vpn-select"]
+    vpn_suffixes = {dom for r in vpn_rules for dom in (r.get("domain_suffix") or [])}
+    assert "stale-auto.example" not in vpn_suffixes
+    assert "explicit-pin.example" in vpn_suffixes
+
+    winws_text = (tmp_path / "configs" / "winws2_preset.txt").read_text(encoding="utf-8")
+    assert "stale-auto.example" in winws_text or any(
+        "stale-auto.example" in p.read_text(encoding="utf-8")
+        for p in (tmp_path / "lists").glob("tls_*.txt")
+    )

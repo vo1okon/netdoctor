@@ -850,11 +850,42 @@ def _ordered_pool(candidates: list[Strategy] | None, protocol: Protocol) -> list
     return pool
 
 
+def _non_vpn_fallback_decision(
+    network_key: str,
+    domain: str,
+    protocol: Protocol,
+    pool: list[Strategy],
+    *,
+    status: str = "degraded",
+) -> Decision:
+    if pool:
+        winner = pool[0]
+        return Decision(
+            network_key=network_key,
+            domain=domain,
+            protocol=protocol,
+            layer="dpi",
+            strategy_id=winner.id,
+            fallback_strategies=[s.id for s in pool[1:3]],
+            status=status,
+        )
+    return Decision(
+        network_key=network_key,
+        domain=domain,
+        protocol=protocol,
+        layer="direct",
+        strategy_id=None,
+        status="degraded",
+    )
+
+
 def _quick_non_dpi_decision(
     network_key: str,
     domain: str,
     verdicts: list[VerdictClass],
     protocol: Protocol,
+    *,
+    vpn_available: bool = True,
 ) -> Decision | None:
     effective = [v for v in verdicts if v != VerdictClass.QUIC_BLOCK] if protocol == Protocol.TLS else list(verdicts)
     if not effective or effective == [VerdictClass.OK]:
@@ -877,13 +908,24 @@ def _quick_non_dpi_decision(
             status="degraded",
         )
     if VerdictClass.IP_BLOCK in effective or VerdictClass.PROTOCOL_BLOCK in effective:
-        return Decision(
-            network_key=network_key,
-            domain=domain,
-            protocol=protocol,
-            layer="vpn",
-            strategy_id="vpn-select",
-        )
+        if vpn_available:
+            return Decision(
+                network_key=network_key,
+                domain=domain,
+                protocol=protocol,
+                layer="vpn",
+                strategy_id="vpn-select",
+            )
+        if VerdictClass.PROTOCOL_BLOCK in effective and VerdictClass.IP_BLOCK not in effective:
+            return Decision(
+                network_key=network_key,
+                domain=domain,
+                protocol=protocol,
+                layer="direct",
+                strategy_id=None,
+                status="degraded",
+            )
+        return None
     if effective == [VerdictClass.DNS_POISON]:
         return Decision(
             network_key=network_key,
@@ -903,13 +945,14 @@ async def evaluate_domains_live_batch(
     use_live_eval: bool = True,
     iface: int | None = None,
     min_success_rate: float = 0.5,
+    vpn_available: bool = True,
 ) -> dict[str, Decision]:
     """Evaluate a batch of TLS domains concurrently, sharing one winws2.exe process per candidate strategy."""
     decisions: dict[str, Decision] = {}
     unresolved: dict[str, tuple[str, list[VerdictClass]]] = {}
 
     for dom, ip, verdicts in domains_info:
-        quick = _quick_non_dpi_decision(network_key, dom, verdicts, Protocol.TLS)
+        quick = _quick_non_dpi_decision(network_key, dom, verdicts, Protocol.TLS, vpn_available=vpn_available)
         if quick is not None:
             decisions[dom] = quick
         else:
@@ -980,15 +1023,20 @@ async def evaluate_domains_live_batch(
                     )
                     unresolved.pop(dom, None)
 
-        # Any domain that genuinely failed every tested live strategy escalates to VPN
+        # Escalate to VPN only when usable VPN exists; otherwise keep best DPI candidate as degraded fallback
         for dom in list(unresolved.keys()):
-            decisions[dom] = Decision(
-                network_key=network_key,
-                domain=dom,
-                protocol=Protocol.TLS,
-                layer="vpn",
-                strategy_id="vpn-select",
-            )
+            if vpn_available:
+                decisions[dom] = Decision(
+                    network_key=network_key,
+                    domain=dom,
+                    protocol=Protocol.TLS,
+                    layer="vpn",
+                    strategy_id="vpn-select",
+                )
+            else:
+                decisions[dom] = _non_vpn_fallback_decision(
+                    network_key, dom, Protocol.TLS, pool, status="degraded"
+                )
             unresolved.pop(dom, None)
 
     for dom in unresolved:
@@ -1003,13 +1051,22 @@ async def evaluate_domains_live_batch(
                 strategy_id=winner_strat.id,
                 fallback_strategies=fallback_ids,
             )
-        else:
+        elif vpn_available:
             decisions[dom] = Decision(
                 network_key=network_key,
                 domain=dom,
                 protocol=Protocol.TLS,
                 layer="vpn",
                 strategy_id="vpn-select",
+            )
+        else:
+            decisions[dom] = Decision(
+                network_key=network_key,
+                domain=dom,
+                protocol=Protocol.TLS,
+                layer="direct",
+                strategy_id=None,
+                status="degraded",
             )
 
     return decisions
@@ -1025,11 +1082,12 @@ async def select_best_strategy(
     min_success_rate: float = 0.5,
     evaluator: Callable[[str, str, Strategy], Awaitable[CandidateEvaluation]] | None = None,
     early_stop: bool = False,
+    vpn_available: bool = True,
 ) -> Decision:
     """Iterate through candidate strategies from cheapest tier to heaviest, picking the lightest tier above threshold,
     tie-breaking by highest throughput_kbps and then lowest ttfb_ms. Saves winner + up to 2 fallback strategies.
     """
-    quick = _quick_non_dpi_decision(network_key, domain, verdicts, protocol)
+    quick = _quick_non_dpi_decision(network_key, domain, verdicts, protocol, vpn_available=vpn_available)
     if quick is not None:
         return quick
 
@@ -1038,6 +1096,7 @@ async def select_best_strategy(
         VerdictClass.SNI_DPI in verdicts
         or VerdictClass.THROTTLE in verdicts
         or (protocol == Protocol.QUIC and VerdictClass.QUIC_BLOCK in verdicts)
+        or (not vpn_available and VerdictClass.IP_BLOCK in verdicts)
     )
     if evaluator is None and dpi_treatable and pool:
         # Without a live winws2 evaluator, default_strategy_evaluator cannot vary bypass state between strategies.
@@ -1072,6 +1131,9 @@ async def select_best_strategy(
                 strategy_id=winner_strat.id,
                 fallback_strategies=[s.id for s in pool[1:3]],
             )
+
+        if not vpn_available:
+            return _non_vpn_fallback_decision(network_key, domain, protocol, pool, status="degraded")
 
         # Escalate to Tier 4 (VPN outbound) if live DPI strategies all failed or verdict is non-DPI
         return Decision(
