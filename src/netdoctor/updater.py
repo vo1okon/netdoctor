@@ -8,9 +8,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, version as importlib_version
+from importlib.metadata import PackageNotFoundError, distribution as importlib_distribution, version as importlib_version
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -253,6 +254,93 @@ def _build_pip_install_cmd(*, no_deps: bool = False) -> list[str]:
     return cmd
 
 
+def _is_locked_exe_pip_error(err_text: str) -> bool:
+    low = (err_text or "").lower()
+    return "winerror 32" in low and ("netdoctor-gui.exe" in low or "netdoctor.exe" in low)
+
+
+def _sync_editable_metadata_fallback(
+    root: Path,
+    *,
+    timeout: float = 120.0,
+    dist_path_override: Path | None = None,
+) -> tuple[bool, str]:
+    """Install any missing dependencies directly and sync editable .dist-info version when GUI exe is locked."""
+    pyproject_file = root / "pyproject.toml"
+    try:
+        data = tomllib.loads(pyproject_file.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return False, f"Failed to read pyproject.toml: {exc}"
+
+    project = data.get("project") if isinstance(data, dict) else {}
+    if not isinstance(project, dict):
+        project = {}
+    new_version = str(project.get("version") or "").strip()
+    deps = project.get("dependencies") or []
+
+    missing: list[str] = []
+    for dep in deps:
+        if not isinstance(dep, str):
+            continue
+        pkg_name = re.split(r"[<>=!~;\[\s]", dep, 1)[0].strip()
+        if not pkg_name:
+            continue
+        try:
+            importlib_version(pkg_name)
+        except PackageNotFoundError:
+            missing.append(dep)
+
+    if missing:
+        dep_proc = _run_cmd([sys.executable, "-m", "pip", "install", *missing], cwd=root, timeout=timeout)
+        if dep_proc.returncode != 0:
+            return False, _cmd_err(dep_proc)
+
+    dist_dir = dist_path_override
+    if dist_dir is None:
+        try:
+            raw_path = getattr(importlib_distribution("netdoctor"), "_path", None)
+            if raw_path is not None:
+                dist_dir = Path(raw_path)
+        except PackageNotFoundError:
+            dist_dir = None
+
+    if dist_dir is not None and dist_dir.is_dir() and new_version:
+        meta_file = dist_dir / "METADATA"
+        if meta_file.is_file():
+            meta_text = meta_file.read_text(encoding="utf-8", errors="replace")
+            updated_meta = re.sub(
+                r"^Version:\s*.*$",
+                f"Version: {new_version}",
+                meta_text,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            if updated_meta != meta_text:
+                meta_file.write_text(updated_meta, encoding="utf-8")
+        if dist_dir.name.endswith(".dist-info"):
+            target_dir = dist_dir.with_name(f"netdoctor-{new_version}.dist-info")
+            if target_dir != dist_dir and not target_dir.exists():
+                dist_dir.rename(target_dir)
+
+    return True, f"synced editable metadata to {new_version or 'current'}"
+
+
+def _run_pip_install(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    timeout: float = 120.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run pip install and recover cleanly when Windows locks running netdoctor-gui.exe (WinError 32)."""
+    proc = _run_cmd(cmd, cwd=cwd, timeout=timeout)
+    if proc.returncode != 0 and _is_locked_exe_pip_error(_cmd_err(proc)):
+        ok, detail = _sync_editable_metadata_fallback(cwd, timeout=timeout)
+        if ok:
+            return subprocess.CompletedProcess(cmd, 0, stdout=detail, stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=detail)
+    return proc
+
+
 def _sync_bins_subprocess(root: Path, bin_dir: Path | None, lists_dir: Path | None, timeout: float) -> tuple[bool, str]:
     if bin_dir is None:
         return True, ""
@@ -319,7 +407,7 @@ async def apply_app_update(
                 pyproject_changed = False
 
             pip_cmd = _build_pip_install_cmd(no_deps=not pyproject_changed)
-            pip_proc = _run_cmd(pip_cmd, cwd=root, timeout=max(timeout, 120.0))
+            pip_proc = _run_pip_install(pip_cmd, cwd=root, timeout=max(timeout, 120.0))
             if pip_proc.returncode != 0:
                 return {"ok": False, "mode": "git", "error": f"pip install failed: {_cmd_err(pip_proc)}"}
         except (OSError, subprocess.SubprocessError) as exc:
@@ -378,7 +466,7 @@ async def apply_app_update(
                 "mode": "portable",
                 "error": "В архиве релиза не найдены файлы проекта netdoctor.",
             }
-        pip_proc = _run_cmd(_build_pip_install_cmd(), cwd=root, timeout=max(timeout, 120.0))
+        pip_proc = _run_pip_install(_build_pip_install_cmd(), cwd=root, timeout=max(timeout, 120.0))
         if pip_proc.returncode != 0:
             return {"ok": False, "mode": "portable", "error": f"pip install failed: {_cmd_err(pip_proc)}"}
     except Exception as exc:  # noqa: BLE001

@@ -647,3 +647,49 @@ def test_updater_guards_no_build_isolation_by_setuptools(monkeypatch: pytest.Mon
     monkeypatch.setattr(updater_mod, "importlib_version", _missing)
     assert updater_mod._has_build_setuptools() is False
     assert "--no-build-isolation" not in updater_mod._build_pip_install_cmd(no_deps=False)
+
+
+def test_run_pip_install_recovers_from_locked_gui_exe_winerror32(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    import netdoctor.updater as updater_mod
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "netdoctor"\nversion = "0.1.2"\ndependencies = ["httpx>=0.27.0"]\n',
+        encoding="utf-8",
+    )
+    fake_dist = tmp_path / "site" / "netdoctor-0.1.0.dist-info"
+    fake_dist.mkdir(parents=True)
+    (fake_dist / "METADATA").write_text("Metadata-Version: 2.4\nName: netdoctor\nVersion: 0.1.0\n", encoding="utf-8")
+
+    monkeypatch.setattr(updater_mod, "importlib_distribution", lambda _name: SimpleNamespace(_path=fake_dist))
+    monkeypatch.setattr(updater_mod, "importlib_version", lambda _name: "0.27.0")
+    monkeypatch.setattr(
+        updater_mod,
+        "_run_cmd",
+        lambda cmd, *, cwd, timeout=120.0: subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout="",
+            stderr=(
+                "ERROR: Could not install packages due to an OSError: "
+                "[WinError 32] Process cannot access file: '...\\\\netdoctor-gui.exe'"
+            ),
+        ),
+    )
+
+    res_ok = updater_mod._run_pip_install(["pip", "install", "-e", "."], cwd=tmp_path)
+    assert res_ok.returncode == 0
+    new_dist = tmp_path / "site" / "netdoctor-0.1.2.dist-info"
+    assert new_dist.is_dir()
+    assert not fake_dist.exists()
+    assert "Version: 0.1.2" in (new_dist / "METADATA").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        updater_mod,
+        "_run_cmd",
+        lambda cmd, *, cwd, timeout=120.0: subprocess.CompletedProcess(cmd, 1, stdout="", stderr="network timeout"),
+    )
+    res_err = updater_mod._run_pip_install(["pip", "install", "-e", "."], cwd=tmp_path)
+    assert res_err.returncode == 1
