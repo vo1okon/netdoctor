@@ -1892,3 +1892,94 @@ def test_singbox_dns_log_discovery_and_short_lived_failure_healing(tmp_path: Pat
         assert [c[0] for c in cands] == ["api.minecraftservices.com"]
     finally:
         st.close()
+
+
+def test_scan_active_connections_ignores_self_probes_fin_wait_and_quic_stalls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-Radar must exclude Netdoctor's own probe sockets, FIN_WAIT2 sockets, and QUIC UDP/443 no-reply."""
+    import os
+    import socket as sock_mod
+    import sys
+    from types import SimpleNamespace
+    from netdoctor.models import NetworkFingerprint, NetworkKind
+
+    fake_conns = [
+        SimpleNamespace(
+            fd=1,
+            family=sock_mod.AF_INET,
+            type=sock_mod.SOCK_STREAM,
+            laddr=SimpleNamespace(ip="192.168.1.10", port=51001),
+            raddr=SimpleNamespace(ip="203.0.113.10", port=443),
+            status="ESTABLISHED",
+            pid=os.getpid(),
+        ),
+        SimpleNamespace(
+            fd=2,
+            family=sock_mod.AF_INET,
+            type=sock_mod.SOCK_STREAM,
+            laddr=SimpleNamespace(ip="192.168.1.10", port=51002),
+            raddr=SimpleNamespace(ip="203.0.113.11", port=443),
+            status="FIN_WAIT2",
+            pid=99999,
+        ),
+        SimpleNamespace(
+            fd=3,
+            family=sock_mod.AF_INET,
+            type=sock_mod.SOCK_STREAM,
+            laddr=SimpleNamespace(ip="192.168.1.10", port=51003),
+            raddr=SimpleNamespace(ip="13.107.137.11", port=443),
+            status="ESTABLISHED",
+            pid=88888,
+        ),
+    ]
+    monkeypatch.setattr(psutil, "net_connections", lambda kind="inet": fake_conns)
+
+    class _MockClash:
+        def get_connections_sync(self) -> dict[str, Any]:
+            return {
+                "connections": [
+                    {
+                        "id": "self-flow",
+                        "upload": 200,
+                        "download": 0,
+                        "start": "2026-11-24T19:00:00Z",
+                        "metadata": {
+                            "processPath": sys.executable,
+                            "destinationIP": "203.0.113.20",
+                            "destinationPort": "443",
+                            "network": "tcp",
+                            "host": "self-probe.example",
+                        },
+                    },
+                    {
+                        "id": "quic-noreply",
+                        "upload": 1200,
+                        "download": 0,
+                        "start": "2026-11-24T19:00:00Z",
+                        "metadata": {
+                            "processPath": r"C:\Users\Test\OneDrive.exe",
+                            "destinationIP": "13.107.137.11",
+                            "destinationPort": "443",
+                            "network": "udp",
+                            "host": "sharepoint.example",
+                        },
+                    },
+                ]
+            }
+
+    st = Storage(tmp_path / "radar_filter.db")
+    try:
+        nk = st.upsert_network(NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP"))
+        mon = RealtimeConnectionMonitor()
+        monkeypatch.setattr(mon, "_resolve_pid_name", lambda pid: "OneDrive.exe" if pid == 88888 else "other.exe")
+
+        rows = mon.scan_active_connections(st, tmp_path, net_key=nk, clash_client=_MockClash())  # type: ignore[arg-type]
+        assert all(r["pid"] != os.getpid() for r in rows)
+        assert all(r["domain"] != "self-probe.example" for r in rows)
+        assert all(r["socket_status"] != "FIN_WAIT2" for r in rows)
+        assert all(r["socket_status"] != "STALLED" for r in rows)
+        onedrive_tls = next(r for r in rows if r["process"] == "OneDrive.exe" and r["protocol"] == "tls")
+        assert onedrive_tls["health"] != "needs_fix"
+    finally:
+        st.close()

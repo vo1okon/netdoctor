@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.parse
@@ -67,6 +69,8 @@ _INTERNAL_PROXY_PROCESSES = {
     "ciadpi.exe",
     "sing-box.exe",
     "tgwsproxy_windows.exe",
+    "netdoctor-gui.exe",
+    "netdoctor.exe",
 }
 
 PROTECTED_UNLOCKER_PROCESSES: tuple[str, ...] = (
@@ -2589,10 +2593,23 @@ class RealtimeConnectionMonitor:
         sb_tail = _tail_text(logs_dir / "sing-box.log", max_bytes=131072)
         failed_ips = _parse_singbox_failed_ips(sb_tail)
 
-        healthy_clash_endpoints: set[tuple[str, int]] = set()
+        healthy_clash_endpoints: set[tuple[str, int, str]] = set()
         healthy_clash_domains: set[str] = set()
-        stalled_clash_endpoints: set[tuple[str, int]] = set()
+        stalled_clash_endpoints: set[tuple[str, int, str]] = set()
         clash_flows: list[dict[str, Any]] = []
+        self_pid = os.getpid()
+        self_exe_paths: set[str] = set()
+        try:
+            self_exe_paths.add(os.path.normcase(os.path.abspath(sys.executable)))
+        except (OSError, ValueError):
+            pass
+        try:
+            proc_exe = psutil.Process(self_pid).exe()
+            if proc_exe:
+                self_exe_paths.add(os.path.normcase(os.path.abspath(proc_exe)))
+        except (psutil.Error, OSError, ValueError):
+            pass
+
         for c in clash_conns:
             meta = c.get("metadata") or {}
             rip = str(meta.get("destinationIP") or "").strip()
@@ -2608,9 +2625,22 @@ class RealtimeConnectionMonitor:
             if not proc_name:
                 proc_name = "sing-box"
             low_proc = proc_name.lower()
-            if raw_proc and (
-                low_proc in ("winws.exe", "winws2.exe", "ciadpi.exe", "tgwsproxy_windows.exe", "tg-ws-proxy.exe")
-                or "tgwsproxy" in low_proc
+            is_self_proc = False
+            if raw_proc:
+                try:
+                    norm_raw = os.path.normcase(os.path.abspath(raw_proc))
+                    if norm_raw in self_exe_paths:
+                        is_self_proc = True
+                except (OSError, ValueError):
+                    pass
+                if not is_self_proc and low_proc in ("netdoctor-gui.exe", "netdoctor.exe"):
+                    is_self_proc = True
+            if is_self_proc or (
+                raw_proc
+                and (
+                    low_proc in ("winws.exe", "winws2.exe", "ciadpi.exe", "tgwsproxy_windows.exe", "tg-ws-proxy.exe")
+                    or "tgwsproxy" in low_proc
+                )
             ):
                 continue
 
@@ -2619,6 +2649,7 @@ class RealtimeConnectionMonitor:
                 proto = "quic" if rport == 443 else "udp"
             else:
                 proto = "tls" if rport in (443, 8443) else ("http" if rport == 80 else "tcp")
+            t_proto = "udp" if proto in ("quic", "udp") else "tcp"
 
             host = str(meta.get("host") or meta.get("sniffHost") or "").strip().lower().rstrip(".")
             if host and _is_ip_literal(host):
@@ -2637,18 +2668,18 @@ class RealtimeConnectionMonitor:
             is_stalled = (
                 upload_b > 0
                 and download_b == 0
-                and proto in ("tls", "http", "tcp", "quic")
+                and proto in ("tls", "http", "tcp")
                 and (age_sec is None or age_sec >= 3.0)
             )
             if is_healthy:
-                healthy_clash_endpoints.add((rip, rport))
+                healthy_clash_endpoints.add((rip, rport, t_proto))
                 if host:
                     healthy_clash_domains.add(host)
                     matched_h, _ = _match_decision_domain(host, decisions_map)
                     if matched_h:
                         healthy_clash_domains.add(matched_h)
             if is_stalled:
-                stalled_clash_endpoints.add((rip, rport))
+                stalled_clash_endpoints.add((rip, rport, t_proto))
 
             clash_flows.append(
                 {
@@ -2656,6 +2687,7 @@ class RealtimeConnectionMonitor:
                     "rip": rip,
                     "rport": rport,
                     "proto": proto,
+                    "t_proto": t_proto,
                     "host": host,
                     "is_healthy": is_healthy,
                     "is_stalled": is_stalled,
@@ -2688,11 +2720,12 @@ class RealtimeConnectionMonitor:
                     if display_domain != "—"
                 )
             )
-            endpoint_stalled = (rip, rport) in stalled_clash_endpoints or sock_status == "STALLED"
+            t_proto = "udp" if proto in ("quic", "udp") else "tcp"
+            endpoint_stalled = (rip, rport, t_proto) in stalled_clash_endpoints or sock_status == "STALLED"
             is_healthy_conn = bool(
                 (
                     active_healthy
-                    or (rip, rport) in healthy_clash_endpoints
+                    or (rip, rport, t_proto) in healthy_clash_endpoints
                     or (matched_domain and matched_domain in healthy_clash_domains)
                 )
                 and not endpoint_stalled
@@ -2748,10 +2781,12 @@ class RealtimeConnectionMonitor:
                 continue
 
             sock_status = str(getattr(c, "status", "") or "NONE")
-            if sock_status in ("LISTEN", "CLOSE_WAIT", "TIME_WAIT"):
+            if sock_status in ("LISTEN", "CLOSE_WAIT", "TIME_WAIT", "FIN_WAIT1", "FIN_WAIT2", "CLOSING", "LAST_ACK"):
                 continue
 
             pid = getattr(c, "pid", None)
+            if pid is not None and pid == self_pid:
+                continue
             proc_name = self._resolve_pid_name(pid)
             if proc_name.lower() in _INTERNAL_PROXY_PROCESSES:
                 continue
@@ -2797,7 +2832,7 @@ class RealtimeConnectionMonitor:
 
             sock_status = (
                 "STALLED"
-                if (flow["is_stalled"] or (flow["rip"], flow["rport"]) in stalled_clash_endpoints)
+                if (flow["is_stalled"] or (flow["rip"], flow["rport"], flow["t_proto"]) in stalled_clash_endpoints)
                 else "ESTABLISHED"
             )
             rows_out.append(
