@@ -3067,6 +3067,44 @@ class RealtimeConnectionMonitor:
                 events = list(self.recent_events)
             return {"connections": connections, "healed": healed, "events": events}
 
+        procs_pre = backend._collect_processes_state() if hasattr(backend, "_collect_processes_state") else {}
+        winws_running_pre = bool((procs_pre.get("winws2") or {}).get("running"))
+
+        def _reload_winws2_now() -> dict[str, Any]:
+            if hasattr(backend, "reload_winws2_if_changed"):
+                res = backend.reload_winws2_if_changed(min_interval_sec=0.0, defer_if_active=bool(bypass))
+                return res if isinstance(res, dict) else {"ok": True}
+            if hasattr(backend, "reload_winws2"):
+                res = backend.reload_winws2()
+                return res if isinstance(res, dict) else {"ok": True}
+            if hasattr(backend, "trigger_apply_configs"):
+                backend.trigger_apply_configs()
+            return {"ok": True}
+
+        new_direct_test_doms = [dom for dom, _proc, _reason, existing in eligible if existing is None]
+        pre_excluded_for_direct: set[str] = set()
+        if new_direct_test_doms and winws_running_pre and _is_admin():
+            st_pre = Storage(backend.db_path)
+            try:
+                for dom in new_direct_test_doms:
+                    st_pre.save_decision(
+                        Decision(
+                            network_key=net_key,
+                            domain=dom,
+                            protocol=Protocol.TLS,
+                            layer="direct",
+                            strategy_id=None,
+                            status="active",
+                            consecutive_fails=0,
+                        )
+                    )
+            finally:
+                st_pre.close()
+            pre_res = _reload_winws2_now()
+            if not pre_res.get("deferred"):
+                pre_excluded_for_direct.update(d.lower() for d in new_direct_test_doms)
+                await asyncio.sleep(0.25)
+
         probes_list = await asyncio.gather(
             *(run_domain_probes(dom, timeout=timeout) for dom, _proc, _reason, _ex in eligible)
         )
@@ -3124,17 +3162,53 @@ class RealtimeConnectionMonitor:
                     storage.save_decision(new_dec)
                     action = f"SmartDNS ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
                 elif existing is not None and existing.layer == "dpi" and bypass and tls_broken:
-                    # If no fallbacks remain and no real VPN is configured, rotate to next untested ordered TLS strategies
-                    if not existing.fallback_strategies and not has_real_vpn and ordered_tls_ids:
-                        if existing.strategy_id in ordered_tls_ids:
-                            idx = ordered_tls_ids.index(existing.strategy_id)
-                            rotated = ordered_tls_ids[idx + 1 :] + ordered_tls_ids[:idx]
-                        else:
-                            rotated = [sid for sid in ordered_tls_ids if sid != existing.strategy_id]
-                        if rotated:
-                            existing.fallback_strategies = rotated[:3]
-                    new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
-                    action = f"Fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                    recovered_direct = False
+                    if winws_running_pre and _is_admin():
+                        direct_dec = Decision(
+                            network_key=net_key,
+                            domain=dom,
+                            protocol=Protocol.TLS,
+                            layer="direct",
+                            strategy_id=None,
+                            status="active",
+                            consecutive_fails=0,
+                        )
+                        storage.save_decision(direct_dec)
+                        pre_res = _reload_winws2_now()
+                        if not pre_res.get("deferred"):
+                            await asyncio.sleep(0.25)
+                            direct_probes = await run_domain_probes(dom, timeout=timeout)
+                            direct_report = classify_probes(
+                                domain=dom, probes=direct_probes, network=net, bypass_active=False
+                            )
+                            direct_blocked = any(
+                                v in direct_report.verdicts
+                                for v in (
+                                    VerdictClass.SNI_DPI,
+                                    VerdictClass.THROTTLE,
+                                    VerdictClass.IP_BLOCK,
+                                    VerdictClass.PROTOCOL_BLOCK,
+                                    VerdictClass.DNS_POISON,
+                                    VerdictClass.UNKNOWN,
+                                )
+                            )
+                            if not direct_blocked:
+                                new_dec = direct_dec
+                                pre_excluded_for_direct.add(dom.lower())
+                                action = f"Direct работает ({reason}) -> direct/—"
+                                recovered_direct = True
+                    if not recovered_direct:
+                        # If no fallbacks remain and no real VPN is configured, rotate to next untested ordered TLS strategies
+                        if not existing.fallback_strategies and not has_real_vpn and ordered_tls_ids:
+                            if existing.strategy_id in ordered_tls_ids:
+                                idx = ordered_tls_ids.index(existing.strategy_id)
+                                rotated = ordered_tls_ids[idx + 1 :] + ordered_tls_ids[:idx]
+                            else:
+                                rotated = [sid for sid in ordered_tls_ids if sid != existing.strategy_id]
+                            if rotated:
+                                existing.fallback_strategies = rotated[:3]
+                        new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
+                        action = f"Fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
                 else:
                     new_dec = await dpi_orch.evaluate_domain(
                         domain=dom,
@@ -3190,7 +3264,10 @@ class RealtimeConnectionMonitor:
                         bypass_fell = True
                     if new_dec.layer in ("dpi", "vpn", "dns"):
                         dpi_or_vpn_changed = True
-                    if new_dec.layer == "dpi" or (
+                    if new_dec.layer == "direct":
+                        if dom.lower() not in pre_excluded_for_direct:
+                            winws2_changed = True
+                    elif new_dec.layer == "dpi" or (
                         existing is not None and existing.layer == "dpi" and new_dec.layer != "dpi"
                     ):
                         winws2_changed = True

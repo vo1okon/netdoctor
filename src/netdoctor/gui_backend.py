@@ -512,8 +512,22 @@ class GuiBackend:
 
     @staticmethod
     def _winws2_args_hash(winws_args: list[str]) -> str:
-        payload = "\n".join(winws_args).encode("utf-8", errors="ignore")
-        return hashlib.sha256(payload).hexdigest()
+        hasher = hashlib.sha256("\n".join(winws_args).encode("utf-8", errors="ignore"))
+        list_prefixes = ("--hostlist=", "--hostlist-exclude=", "--ipset=", "--ipset-exclude=")
+        for arg in winws_args:
+            for prefix in list_prefixes:
+                if arg.startswith(prefix):
+                    fpath = Path(arg[len(prefix) :].strip().strip('"'))
+                    try:
+                        if fpath.is_file():
+                            hasher.update(b"\0")
+                            hasher.update(arg.encode("utf-8", errors="ignore"))
+                            hasher.update(b"\0")
+                            hasher.update(fpath.read_bytes())
+                    except OSError:
+                        pass
+                    break
+        return hasher.hexdigest()
 
     def _resolve_active_zapret_preset(
         self,
@@ -2035,6 +2049,35 @@ class GuiBackend:
                 self._seed_default_strategies(storage)
                 candidates: list[Strategy] = storage.get_strategies()
                 vpn_available = storage.has_usable_vpn()
+                existing_map = {
+                    (d.domain.lower(), d.protocol): d
+                    for d in storage.get_decisions(net_key, active_only=True)
+                }
+
+                procs_pre = self._collect_processes_state()
+                winws_running_pre = bool((procs_pre.get("winws2") or {}).get("running"))
+                if winws_running_pre and _is_admin():
+                    pre_existing = {
+                        dom_k
+                        for (dom_k, proto_k) in existing_map
+                        if proto_k == Protocol.TLS
+                    }
+                    new_doms = [d for d in target_domains if d.lower() not in pre_existing]
+                    if new_doms:
+                        for dom in new_doms:
+                            storage.save_decision(
+                                Decision(
+                                    network_key=net_key,
+                                    domain=dom,
+                                    protocol=Protocol.TLS,
+                                    layer="direct",
+                                    strategy_id=None,
+                                    status="active",
+                                    consecutive_fails=0,
+                                )
+                            )
+                        self.reload_winws2_if_changed(min_interval_sec=0.0, defer_if_active=False)
+                        await asyncio.sleep(0.25)
 
                 probes_list = await asyncio.gather(
                     *(run_domain_probes(dom, timeout=timeout) for dom in target_domains)
@@ -2078,11 +2121,6 @@ class GuiBackend:
                         use_live_eval=can_live_eval,
                         vpn_available=vpn_available,
                     )
-
-                existing_map = {
-                    (d.domain.lower(), d.protocol): d
-                    for d in storage.get_decisions(net_key, active_only=True)
-                }
 
                 quic_tasks = []
                 for dom, ip, verdicts in domains_info:

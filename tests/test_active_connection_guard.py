@@ -1297,7 +1297,7 @@ def test_auto_heal_immediate_on_new_domain_or_down_bypass(
         ],
     )
     asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
-    assert seen_w_calls == [{"min_interval_sec": 0.0, "defer_if_active": True}]
+    assert seen_w_calls and all(c == {"min_interval_sec": 0.0, "defer_if_active": True} for c in seen_w_calls)
 
     # 2. Existing domain when bypass itself is down (detect_bypass_active == False) -> min_interval_sec=0.0 AND defer_if_active=False
     seen_w_calls.clear()

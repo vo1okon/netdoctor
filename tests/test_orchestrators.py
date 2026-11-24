@@ -2251,3 +2251,156 @@ def test_find_best_bypass_tests_clean_direct_excluding_winws2(
     assert reloaded_before_probe == [1]
     assert all(t["layer"] == "direct" for t in res["tried"])
 
+
+def test_winws2_args_hash_changes_when_hostlist_file_changes(tmp_path: Path) -> None:
+    exclude_file = tmp_path / "exclude_unlocker_domains.txt"
+    exclude_file.write_text("a.com\n", encoding="utf-8")
+    args = [f"--hostlist-exclude={exclude_file.as_posix()}"]
+    h1 = GuiBackend._winws2_args_hash(args)
+    exclude_file.write_text("a.com\naccount.ubisoft.com\n", encoding="utf-8")
+    h2 = GuiBackend._winws2_args_hash(args)
+    assert h1 != h2
+
+
+def test_auto_heal_tests_clean_direct_first_for_new_and_broken_dpi_domains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "auto_heal_direct.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    st = Storage(db_path)
+    try:
+        net = NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP")
+        net_key = st.upsert_network(net)
+        st.upsert_strategies(DEFAULT_STRATEGIES)
+        st.save_decision(
+            Decision(
+                network_key=net_key,
+                domain="ubisoftconnect.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_alt1_199_fake_fakedsplit",
+                fallback_strategies=["tls_multisplit_pos2"],
+                status="active",
+                consecutive_fails=0,
+            )
+        )
+    finally:
+        st.close()
+
+    monkeypatch.setattr(orch_mod, "detect_bypass_active", lambda: True)
+    monkeypatch.setattr(orch_mod, "_is_admin", lambda: True)
+
+    async def fake_net(timeout: float = 2.0) -> NetworkFingerprint:
+        return NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP")
+
+    monkeypatch.setattr(orch_mod, "detect_network_fingerprint", fake_net)
+    monkeypatch.setattr(
+        backend,
+        "_collect_processes_state",
+        lambda: {"winws2": {"running": True}, "sing-box": {"running": False}},
+    )
+
+    reloads: list[dict[str, Any]] = []
+
+    def fake_reload(
+        iface: int | None = None,
+        min_interval_sec: float = 20.0,
+        *,
+        defer_if_active: bool = False,
+    ) -> dict[str, Any]:
+        reloads.append({"min_interval_sec": min_interval_sec, "defer_if_active": defer_if_active})
+        return {"ok": True, "reloaded": True}
+
+    monkeypatch.setattr(backend, "reload_winws2_if_changed", fake_reload)
+
+    async def fake_probes(domain: str, timeout: float = 2.0) -> ProbesSummary:
+        st_check = Storage(db_path)
+        try:
+            cur = next(
+                (
+                    d
+                    for d in st_check.get_decisions(net_key, active_only=False)
+                    if d.domain == domain and d.protocol == Protocol.TLS
+                ),
+                None,
+            )
+        finally:
+            st_check.close()
+        is_direct = cur is not None and cur.layer == "direct"
+        return ProbesSummary(
+            dns=DnsProbeResult(system="ok", doh="ok", system_ips=["203.0.113.1"], doh_ips=["203.0.113.1"]),
+            tcp=TcpProbeResult(result="ok", target_ip="203.0.113.1"),
+            tls=TlsProbeResult(real_sni="ok" if is_direct else "reset", neutral_sni="ok"),
+            stall=StallProbeResult(result="ok"),
+            quic=QuicProbeResult(result="ok"),
+        )
+
+    monkeypatch.setattr(orch_mod, "run_domain_probes", fake_probes)
+
+    # Scenario A: New unblocked domain broken by winws2 catch-all/base preset is excluded first and kept direct
+    monkeypatch.setattr(
+        backend.orchestrator.monitor,
+        "scan_active_connections",
+        lambda *_args, **_kw: [
+            {
+                "domain": "account.ubisoft.com",
+                "process": "upc.exe",
+                "layer": "direct",
+                "health": "needs_fix",
+                "socket_status": "SYN_SENT",
+                "has_decision": False,
+            }
+        ],
+    )
+    res_a = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
+    assert len(res_a["healed"]) == 1
+    assert res_a["healed"][0]["domain"] == "account.ubisoft.com"
+    assert res_a["healed"][0]["layer"] == "direct"
+    assert len(reloads) >= 1
+    st_a = Storage(db_path)
+    try:
+        dec_a = next(
+            d for d in st_a.get_decisions(net_key, active_only=False) if d.domain == "account.ubisoft.com"
+        )
+        assert dec_a.layer == "direct"
+    finally:
+        st_a.close()
+
+    # Scenario B: Existing broken DPI rule tests clean direct before rotating DPI/VPN fallbacks
+    reloads.clear()
+    backend.orchestrator.monitor.cooldown_until.clear()
+    monkeypatch.setattr(
+        backend.orchestrator.monitor,
+        "scan_active_connections",
+        lambda *_args, **_kw: [
+            {
+                "domain": "ubisoftconnect.com",
+                "process": "upc.exe",
+                "layer": "dpi",
+                "health": "needs_fix",
+                "socket_status": "SYN_SENT",
+                "has_decision": True,
+            }
+        ],
+    )
+    res_b = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
+    assert len(res_b["healed"]) == 1
+    assert res_b["healed"][0]["domain"] == "ubisoftconnect.com"
+    assert res_b["healed"][0]["layer"] == "direct"
+    assert len(reloads) >= 1
+    st_b = Storage(db_path)
+    try:
+        dec_b = next(
+            d for d in st_b.get_decisions(net_key, active_only=False) if d.domain == "ubisoftconnect.com"
+        )
+        assert dec_b.layer == "direct"
+    finally:
+        st_b.close()
+
+
