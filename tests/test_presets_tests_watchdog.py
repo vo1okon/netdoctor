@@ -1928,6 +1928,77 @@ def test_start_autopilot_admin_single_apply_and_nonblocking_vpn_tasks(
     assert vpn_sync_started.wait(timeout=1.0)
 
 
+def test_base_zapret_preset_merges_with_auto_orchestrator_decisions(tmp_path: Path) -> None:
+    """Base Zapret2 preset sits beneath Auto-Orchestrator DB decisions and excludes already-managed domains."""
+    from netdoctor.models import NetworkFingerprint, NetworkKind
+
+    bin_dir = tmp_path / "bin"
+    (bin_dir / "lua").mkdir(parents=True)
+    for fname in ("zapret-lib.lua", "zapret-antidpi.lua", "zapret-auto.lua"):
+        (bin_dir / "lua" / fname).write_text("function multisplit() end\nfunction fake() end\n", encoding="utf-8")
+
+    db_path = tmp_path / "base_preset.db"
+    lists_dir = tmp_path / "lists"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=lists_dir,
+        logs_dir=tmp_path / "logs",
+        bin_dir=bin_dir,
+        presets_dir=tmp_path / "presets_z2",
+        zdy_presets_dir=tmp_path / "presets_zdy",
+    )
+
+    st = Storage(db_path)
+    try:
+        nk = st.upsert_network(NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP"))
+        st.upsert_strategies(DEFAULT_STRATEGIES)
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="custom-site.example",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_multisplit_pos2",
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="vpn-site.example",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                pinned=True,
+            )
+        )
+    finally:
+        st.close()
+
+    saved = backend.add_user_zapret_preset(
+        name="My Base Preset",
+        content="--lua-desync=multisplit:pos=1",
+        activate=False,
+    )
+    preset_id = str(saved["preset"]["id"])
+
+    res = backend.set_base_zapret_preset(preset_id)
+    assert res["ok"] is True
+    assert res["active_preset_id"] == "auto"
+    assert res["base_preset_id"] == preset_id
+
+    args = res["applied"]["winws2_args"]
+    # DB per-domain hostlist profile must precede the base preset profiles (separated by --new)
+    custom_hostlist_idx = next(i for i, tok in enumerate(args) if tok.startswith("--hostlist=") and "custom-site" not in tok and "exclude_unlocker" not in tok)
+    new_after_idx = next(i for i, tok in enumerate(args[custom_hostlist_idx + 1 :], start=custom_hostlist_idx + 1) if tok == "--new")
+    base_desync_idx = next(i for i, tok in enumerate(args) if tok == "--lua-desync=multisplit:pos=1")
+    assert custom_hostlist_idx < new_after_idx < base_desync_idx
+
+    excl = (lists_dir / "exclude_unlocker_domains.txt").read_text(encoding="utf-8").splitlines()
+    assert "custom-site.example" in excl
+    assert "vpn-site.example" in excl
+
+
 
 
 

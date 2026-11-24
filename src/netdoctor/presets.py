@@ -771,6 +771,51 @@ def compile_zapret_preset(
     return final_args
 
 
+def merge_winws2_base_preset(auto_args: list[str], base_args: list[str]) -> list[str]:
+    """Merge Auto-Orchestrator per-domain profiles ahead of a compiled base Zapret2 preset."""
+    _profile_starts = ("--filter-", "--hostlist", "--ipset", "--lua-desync", "--new")
+
+    def _split(args: list[str]) -> tuple[list[str], list[str]]:
+        for idx, tok in enumerate(args):
+            if tok == "--new" or tok.startswith(_profile_starts):
+                return list(args[:idx]), list(args[idx:])
+        return list(args), []
+
+    auto_glob, auto_prof = _split(auto_args)
+    base_glob, base_prof = _split(base_args)
+
+    lua_inits: list[str] = []
+    seen_lua: set[str] = set()
+    blobs: list[str] = []
+    seen_blobs: set[str] = set()
+    other_globals: list[str] = []
+    seen_keys: set[str] = set()
+
+    for tok in [*auto_glob, *base_glob]:
+        if tok.startswith("--lua-init="):
+            if tok not in seen_lua:
+                seen_lua.add(tok)
+                lua_inits.append(tok)
+        elif tok.startswith("--blob="):
+            bname = tok[len("--blob=") :].split(":", 1)[0]
+            if bname not in seen_blobs:
+                seen_blobs.add(bname)
+                blobs.append(tok)
+        else:
+            key = tok.split("=", 1)[0]
+            if key not in seen_keys:
+                seen_keys.add(key)
+                other_globals.append(tok)
+
+    merged_profiles: list[str] = list(auto_prof)
+    if base_prof:
+        if merged_profiles and base_prof[0] != "--new":
+            merged_profiles.append("--new")
+        merged_profiles.extend(base_prof)
+
+    return [*lua_inits, *blobs, *other_globals, *merged_profiles]
+
+
 def discover_builtin_zapret_presets(
     presets_dir: str | Path = DEFAULT_ZAPRET2_PRESETS_DIR,
     zdy_dir: str | Path = DEFAULT_ZDY_PRESETS_DIR,

@@ -59,6 +59,7 @@ from netdoctor.presets import (
     import_preset_from_file,
     import_presets_from_directory,
     list_all_zapret_presets,
+    merge_winws2_base_preset,
     save_user_zapret_preset,
 )
 from netdoctor.probes import (
@@ -531,6 +532,23 @@ class GuiBackend:
             return "auto", "Авто-оркестратор (подбор по доменам)", None
         return str(match["id"]), str(match["name"]), match
 
+    def _resolve_base_zapret_preset(
+        self,
+        storage: Storage,
+    ) -> tuple[str, str, dict[str, Any] | None]:
+        pid = storage.get_setting("base_zapret_preset_id", "").strip()
+        if not pid or pid.lower() == "none":
+            return "", "", None
+        all_presets = list_all_zapret_presets(
+            storage,
+            presets_dir=self.presets_dir,
+            zdy_dir=self.zdy_presets_dir,
+        )
+        match = next((p for p in all_presets if p["id"] == pid), None)
+        if match is None:
+            return "", "", None
+        return str(match["id"]), str(match["name"]), match
+
     def _seed_default_strategies(self, storage: Storage) -> None:
         db_key = str(self.db_path)
         db_sig: tuple[Any, ...] | None = None
@@ -725,6 +743,14 @@ class GuiBackend:
             else:
                 active_preset_id = "auto"
                 active_preset_name = "Авто-оркестратор (подбор по доменам)"
+            raw_base_id = storage.get_setting("base_zapret_preset_id", "").strip()
+            base_match = (
+                next((p for p in all_zapret_presets if p["id"] == raw_base_id), None)
+                if raw_base_id and raw_base_id.lower() != "none"
+                else None
+            )
+            base_preset_id = str(base_match["id"]) if base_match is not None else ""
+            base_preset_name = str(base_match["name"]) if base_match is not None else ""
             test_summary = storage.get_overall_test_summary(net_key, window=10)
             desired_setting = storage.get_setting("stack_desired_running", "0") == "1"
         finally:
@@ -817,6 +843,8 @@ class GuiBackend:
             "unlocker_guard": unlocker_guard,
             "active_preset_id": active_preset_id,
             "active_preset_name": active_preset_name,
+            "base_preset_id": base_preset_id,
+            "base_preset_name": base_preset_name,
             "zapret_mode": "preset" if active_preset_id != "auto" else "auto",
             "zapret_presets_count": len(all_zapret_presets),
             "preset_compile_error": preset_compile_error,
@@ -1513,6 +1541,7 @@ class GuiBackend:
         storage = Storage(self.db_path)
         try:
             active_id, active_name, _ = self._resolve_active_zapret_preset(storage)
+            base_id, base_name, _ = self._resolve_base_zapret_preset(storage)
             presets = list_all_zapret_presets(
                 storage,
                 presets_dir=self.presets_dir,
@@ -1525,6 +1554,8 @@ class GuiBackend:
         return {
             "active_preset_id": active_id,
             "active_preset_name": active_name,
+            "base_preset_id": base_id,
+            "base_preset_name": base_name,
             "zapret_mode": "preset" if active_id != "auto" else "auto",
             "presets": presets,
             "external_dirs": external_dirs,
@@ -1566,6 +1597,49 @@ class GuiBackend:
             "active_preset_id": clean_id,
             "active_preset_name": active_name,
             "zapret_mode": "preset" if clean_id != "auto" else "auto",
+            "applied": applied,
+        }
+
+    def set_base_zapret_preset(self, preset_id: str | None) -> dict[str, Any]:
+        """Set or clear the base Zapret2 preset used beneath Auto-Orchestrator per-domain rules."""
+        clean_id = (preset_id or "").strip()
+        storage = Storage(self.db_path)
+        try:
+            if not clean_id or clean_id.lower() in ("none", "auto"):
+                clean_id = ""
+                base_name = ""
+                storage.set_setting("base_zapret_preset_id", "")
+                storage.set_setting("active_zapret_preset_id", "auto")
+            else:
+                all_presets = list_all_zapret_presets(
+                    storage,
+                    presets_dir=self.presets_dir,
+                    zdy_dir=self.zdy_presets_dir,
+                )
+                match = next((p for p in all_presets if p["id"] == clean_id), None)
+                if match is None:
+                    raise ValueError(f"Пресет Zapret2 не найден: {clean_id}")
+                compile_zapret_preset(
+                    str(match["content"]),
+                    bin_dir=self.bin_dir,
+                    lists_dir=self.lists_dir,
+                    game_filter=storage.get_setting("game_filter", "0") == "1",
+                )
+                storage.set_setting("base_zapret_preset_id", clean_id)
+                storage.set_setting("active_zapret_preset_id", "auto")
+                base_name = str(match["name"])
+        finally:
+            storage.close()
+
+        applied = self.trigger_apply_configs()
+        self._reload_running_services(winws2=True, singbox=True)
+        return {
+            "ok": True,
+            "active_preset_id": "auto",
+            "active_preset_name": "Авто-оркестратор (подбор по доменам)",
+            "base_preset_id": clean_id,
+            "base_preset_name": base_name,
+            "zapret_mode": "auto",
             "applied": applied,
         }
 
@@ -2334,6 +2408,7 @@ class GuiBackend:
                 if tun_stack not in ("gvisor", "mixed", "system"):
                     tun_stack = "gvisor"
                 active_preset_id, active_preset_name, active_preset = self._resolve_active_zapret_preset(storage)
+                base_preset_id, base_preset_name, base_preset = self._resolve_base_zapret_preset(storage)
                 vpn_policy = storage.get_vpn_selection_policy()
                 health_map = storage.get_vpn_node_health_map()
                 quarantined_tags = {
@@ -2451,18 +2526,50 @@ class GuiBackend:
                             st.close()
 
             if not winws_args:
-                winws_args, hostlists = generate_winws2_config(
-                    decisions=winws_decisions,
-                    strategies=strategies,
-                    lists_dir=self.lists_dir,
-                    vpn_server_ips=all_excluded_ips,
-                    iface=effective_iface,
-                    game_filter=game_filter,
-                    exclude_domains=exclude_domains,
-                    expand_cdn_domains=True,
-                    enable_tcp_in=True,
-                    enable_telegram_ipset=True,
-                )
+                if active_preset_id == "auto" and base_preset is not None:
+                    auto_args, hostlists = generate_winws2_config(
+                        decisions=winws_decisions,
+                        strategies=strategies,
+                        lists_dir=self.lists_dir,
+                        vpn_server_ips=all_excluded_ips,
+                        enable_circular_catchall=False,
+                        iface=effective_iface,
+                        game_filter=game_filter,
+                        exclude_domains=exclude_domains,
+                        expand_cdn_domains=True,
+                        enable_tcp_in=True,
+                        enable_telegram_ipset=True,
+                    )
+                    base_exclude = sorted(
+                        set(exclude_domains) | {d.domain.lower() for d in decisions if d.domain}
+                    )
+                    try:
+                        base_args = compile_zapret_preset(
+                            str(base_preset["content"]),
+                            bin_dir=self.bin_dir,
+                            lists_dir=self.lists_dir,
+                            vpn_server_ips=all_excluded_ips,
+                            exclude_domains=base_exclude,
+                            iface=effective_iface,
+                            game_filter=game_filter,
+                        )
+                        winws_args = merge_winws2_base_preset(auto_args, base_args)
+                    except Exception as exc:  # noqa: BLE001
+                        self._last_preset_error = f"Ошибка базового пресета «{base_preset_name}»: {exc}"
+                        winws_args = []
+                if not winws_args:
+                    winws_args, hostlists = generate_winws2_config(
+                        decisions=winws_decisions,
+                        strategies=strategies,
+                        lists_dir=self.lists_dir,
+                        vpn_server_ips=all_excluded_ips,
+                        iface=effective_iface,
+                        game_filter=game_filter,
+                        exclude_domains=exclude_domains,
+                        expand_cdn_domains=True,
+                        enable_tcp_in=True,
+                        enable_telegram_ipset=True,
+                    )
             self.configs_dir.mkdir(parents=True, exist_ok=True)
             winws_file = self.configs_dir / "winws2_preset.txt"
             winws_file.write_text("\n".join(winws_args) + "\n", encoding="utf-8")
@@ -2562,6 +2669,8 @@ class GuiBackend:
                 "winws2_args": winws_args,
                 "active_preset_id": active_preset_id,
                 "active_preset_name": active_preset_name,
+                "base_preset_id": base_preset_id,
+                "base_preset_name": base_preset_name,
                 "zapret_mode": "preset" if active_preset_id != "auto" else "auto",
                 "preset_compile_error": preset_error,
                 "tun_stack": tun_stack,

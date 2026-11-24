@@ -2148,3 +2148,30 @@ def test_find_best_bypass_for_domain_cascade_dpi_dns_vpn(
     assert res3["ok"] is True
     assert res3["winner"]["layer"] == "vpn"
     assert res3["winner"]["strategy_id"] == "vpn-select"
+
+
+def test_collect_fix_candidates_prioritizes_new_domains_without_decision(tmp_path: Path) -> None:
+    """Brand-new domains without a DB decision must be healed before existing failing domains."""
+    mon = RealtimeConnectionMonitor()
+    connections = [
+        {
+            "process": "chrome.exe",
+            "domain": "aaa-old.example",
+            "layer": "dpi",
+            "health": "needs_fix",
+            "socket_status": "SYN_SENT",
+            "active_healthy": False,
+            "has_decision": True,
+        },
+        {
+            "process": "upc.exe",
+            "domain": "ubisoft.com",
+            "layer": "direct",
+            "health": "needs_fix",
+            "socket_status": "SYN_SENT",
+            "active_healthy": False,
+            "has_decision": False,
+        },
+    ]
+    cands = mon._collect_fix_candidates(connections, tmp_path, max_domains=1)
+    assert cands == [("ubisoft.com", "upc.exe", "SYN_SENT stall")]

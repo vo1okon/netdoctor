@@ -1250,6 +1250,8 @@ class NetdoctorGuiApp(tk.Tk):
         self.selected_preset: dict[str, Any] | None = None
         self.active_preset_id: str = "auto"
         self.active_preset_name: str = "Авто-оркестратор (подбор по доменам)"
+        self.base_preset_id: str = ""
+        self.base_preset_name: str = ""
         self.preset_filter: str = "ALL"
         self._home_preset_label_to_id: dict[str, str] = {}
         self._home_preset_id_to_label: dict[str, str] = {}
@@ -3769,6 +3771,16 @@ class NetdoctorGuiApp(tk.Tk):
         ).pack(side="left", padx=(0, 6))
         self.make_button(
             act_bar,
+            "База для Авто",
+            self.on_set_base_selected_preset,
+            "cyan_ghost",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=4,
+            tooltip="Использовать этот пресет как базу для популярных сайтов, сохраняя работу Авто-оркестратора и всех ваших правил поверх.",
+        ).pack(side="left", padx=(0, 6))
+        self.make_button(
+            act_bar,
             "▶ Проверить пресет",
             self.on_test_selected_preset,
             "primary",
@@ -4944,6 +4956,8 @@ class NetdoctorGuiApp(tk.Tk):
         if "active_preset_id" in snap:
             self.active_preset_id = str(snap.get("active_preset_id") or "auto")
             self.active_preset_name = str(snap.get("active_preset_name") or "Авто-оркестратор (подбор по доменам)")
+            self.base_preset_id = str(snap.get("base_preset_id") or "")
+            self.base_preset_name = str(snap.get("base_preset_name") or "")
             self._sync_active_preset_indicators()
         if "zapret_presets_count" in snap:
             self._update_nav_badge(self.tab_presets, str(snap.get("zapret_presets_count") or 0))
@@ -5103,10 +5117,16 @@ class NetdoctorGuiApp(tk.Tk):
             )
         else:
             self.home_preset_mode_pill.configure(text="● Авто-оркестратор", bg=INFO_BG, fg=ACCENT)
-            self.presets_active_lbl.configure(
-                text="Активный режим: Авто-оркестратор (подбор по доменам)",
-                fg=ACCENT,
-            )
+            if self.base_preset_name:
+                self.presets_active_lbl.configure(
+                    text=f"Активный режим: Автоподбор (база: {self.base_preset_name})",
+                    fg=ACCENT,
+                )
+            else:
+                self.presets_active_lbl.configure(
+                    text="Активный режим: Авто-оркестратор (подбор по доменам)",
+                    fg=ACCENT,
+                )
         if self.active_preset_id in self._home_preset_id_to_label:
             self._preset_cb_syncing = True
             try:
@@ -6789,6 +6809,8 @@ class NetdoctorGuiApp(tk.Tk):
         def done(data: dict[str, Any]) -> None:
             self.active_preset_id = str(data.get("active_preset_id") or "auto")
             self.active_preset_name = str(data.get("active_preset_name") or "Авто-оркестратор (подбор по доменам)")
+            self.base_preset_id = str(data.get("base_preset_id") or "")
+            self.base_preset_name = str(data.get("base_preset_name") or "")
             self.populate_presets_table(list(data.get("presets") or []))
             self._sync_active_preset_indicators()
 
@@ -6864,11 +6886,15 @@ class NetdoctorGuiApp(tk.Tk):
                 continue
             new_map[pid] = p
             is_active = pid == self.active_preset_id
+            is_base = (not is_active) and bool(self.base_preset_id) and pid == self.base_preset_id
             is_user = not bool(p.get("builtin", True))
             src = "Мой рабочий" if is_user else ("ZDY .bat" if p.get("source") == "builtin_zdy" else "Zapret2")
             if is_active:
                 status_txt = "🔒 АКТИВЕН"
                 tag = "active"
+            elif is_base:
+                status_txt = "⚙ База (Авто)"
+                tag = "featured"
             elif is_user:
                 status_txt = "★ Рабочий" if p.get("is_working") else "Пользователь"
                 tag = "user"
@@ -6939,6 +6965,25 @@ class NetdoctorGuiApp(tk.Tk):
             self.set_status("Выберите пресет в списке выше", WARN_TEXT)
             return
         self.on_select_zapret_preset(str(self.selected_preset["id"]))
+
+    def on_set_base_selected_preset(self) -> None:
+        if not self.selected_preset:
+            self.set_status("Выберите пресет в списке выше", WARN_TEXT)
+            return
+        pid = str(self.selected_preset["id"])
+
+        def done(res: dict[str, Any]) -> None:
+            self.active_preset_id = str(res.get("active_preset_id") or "auto")
+            self.active_preset_name = str(res.get("active_preset_name") or "Авто-оркестратор (подбор по доменам)")
+            self.base_preset_id = str(res.get("base_preset_id") or "")
+            self.base_preset_name = str(res.get("base_preset_name") or "")
+            self._sync_active_preset_indicators()
+            self.populate_presets_table()
+            self.log_console(f"Установлен базовый пресет для Авто-оркестратора: {self.base_preset_name}")
+            self.set_status(f"Автоподбор + база: {self.base_preset_name}", OK_TEXT)
+            self._after_change()
+
+        self.run_bg(f"Базовый пресет ({pid})", lambda: self.backend.set_base_zapret_preset(pid), done)
 
     def on_load_selected_preset_to_editor(self) -> None:
         if not self.selected_preset:

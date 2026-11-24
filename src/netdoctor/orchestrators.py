@@ -2765,6 +2765,7 @@ class RealtimeConnectionMonitor:
                 "strategy_id": strategy_id,
                 "health": health,
                 "active_healthy": is_healthy_conn,
+                "has_decision": dec is not None,
             }
 
         conns = self._read_inet_connections()
@@ -2893,7 +2894,11 @@ class RealtimeConnectionMonitor:
             and (c.get("active_healthy") or c.get("socket_status") == "ESTABLISHED")
         }
 
-        for conn in connections:
+        ordered_conns = sorted(
+            connections,
+            key=lambda c: 0 if not c.get("has_decision") else 1,
+        )
+        for conn in ordered_conns:
             dom = str(conn.get("domain") or "")
             if (
                 conn.get("layer") == "unlocker"
@@ -3049,8 +3054,11 @@ class RealtimeConnectionMonitor:
                 if dom.lower() in pinned_domains or (existing is not None and getattr(existing, "pinned", False)):
                     # User explicitly pinned this working rule — never churn it automatically!
                     continue
-                prev_fails = existing.consecutive_fails if existing is not None else 0
-                cd_sec = min(300.0, self.cooldown_sec * (2 ** min(max(prev_fails, 0), 4)))
+                if existing is None:
+                    cd_sec = min(self.cooldown_sec, 6.0)
+                else:
+                    prev_fails = existing.consecutive_fails
+                    cd_sec = min(300.0, self.cooldown_sec * (2 ** min(max(prev_fails, 0), 4)))
                 self.cooldown_until[dom] = now_cd + cd_sec
                 eligible.append((dom, proc_name, reason, existing))
 
