@@ -1862,3 +1862,33 @@ def test_apply_configs_persists_vpn_to_dpi_when_no_vpn(tmp_path: Path) -> None:
         assert pinned.layer == "vpn"
     finally:
         st2.close()
+
+
+def test_singbox_dns_log_discovery_and_short_lived_failure_healing(tmp_path: Path) -> None:
+    """sing-box DNS A/CNAME log lines populate ip_to_domain and short-lived connection resets trigger healing."""
+    (tmp_path / "sing-box.log").write_text(
+        "\n".join(
+            [
+                "+0300 2026-11-24 18:45:25 INFO [3260571114 8ms] dns: exchanged CNAME login.live.com. 300 IN CNAME ms-pool.comss.one.",
+                "+0300 2026-11-24 18:45:25 INFO [3260571114 8ms] dns: exchanged A ms-pool.comss.one. 300 IN A 176.12.72.184",
+                "+0300 2026-11-24 18:45:30 INFO [1001 12ms] dns: exchanged A api.minecraftservices.com. 300 IN A 20.190.159.10",
+                "+0300 2026-11-24 18:45:31 INFO [1002 10ms] dns: exchanged A normal.example.com. 300 IN A 203.0.113.44",
+                "+0300 2026-11-24 18:45:34 ERROR [1003 55ms] connection: connection download closed: close tcp 172.19.0.1:50001->20.190.159.10:443: read tcp: connection reset by peer",
+                "+0300 2026-11-24 18:45:35 ERROR [1004 80ms] connection: connection download closed: close tcp 172.19.0.1:50002->203.0.113.44:443: endpoint not connected",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    st = Storage(tmp_path / "sb_disc.db")
+    try:
+        mon = RealtimeConnectionMonitor()
+        mon.update_ip_map_from_storage_and_logs(st, tmp_path)
+        assert mon.ip_to_domain["176.12.72.184"] == "login.live.com"
+        assert mon.ip_to_domain["20.190.159.10"] == "api.minecraftservices.com"
+
+        cands = mon._collect_fix_candidates([], tmp_path, max_domains=3)
+        assert [c[0] for c in cands] == ["api.minecraftservices.com"]
+    finally:
+        st.close()

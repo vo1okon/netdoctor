@@ -29,6 +29,7 @@ from netdoctor.models import (
     VerdictClass,
 )
 from netdoctor.probes import (
+    _single_tls_handshake,
     detect_bypass_active,
     detect_network_fingerprint,
     is_stub_ip,
@@ -444,6 +445,93 @@ def _parse_singbox_failed_ips(sb_tail: str) -> set[str]:
     return failed
 
 
+_SINGBOX_DNS_CNAME_RE = re.compile(
+    r"\[(\d+)\s+[^\]]+\]\s+dns:\s+(?:exchanged|cached)\s+CNAME\s+([a-z0-9.-]+\.[a-z]{2,})\.?\s+\d+\s+IN\s+CNAME\s+([a-z0-9.-]+\.[a-z]{2,})\.?",
+    re.IGNORECASE,
+)
+_SINGBOX_DNS_A_RE = re.compile(
+    r"(?:\[(\d+)\s+[^\]]+\]\s+)?dns:\s+(?:exchanged|cached)\s+A\s+([a-z0-9.-]+\.[a-z]{2,})\.?\s+\d+\s+IN\s+A\s+(\d{1,3}(?:\.\d{1,3}){3})\b",
+    re.IGNORECASE,
+)
+_SINGBOX_CLOSED_ERR_RE = re.compile(
+    r"connection (?:download|upload) closed:[^\r\n]*->(?:\[([0-9a-fA-F:]+)\]|(\d{1,3}(?:\.\d{1,3}){3})):(\d{1,5}):[^\r\n]*?(?:connection reset|forcibly closed|i/o timeout|\bEOF\b)",
+    re.IGNORECASE,
+)
+_SINGBOX_OPEN_HOST_RE = re.compile(
+    r"open connection to ([a-z0-9.-]+\.[a-z]{2,}):(\d{1,5})\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_singbox_dns_ip_map(sb_tail: str) -> dict[str, str]:
+    """Parse sing-box `dns: exchanged/cached CNAME/A` lines into IP -> original queried domain."""
+    if not sb_tail:
+        return {}
+    clean_tail = _ANSI_RE.sub("", sb_tail)
+    cname_root: dict[str, str] = {}
+    alias_to_root: dict[str, str] = {}
+    dns_map: dict[str, str] = {}
+    for line in clean_tail.splitlines():
+        cm = _SINGBOX_DNS_CNAME_RE.search(line)
+        if cm:
+            cid = cm.group(1)
+            src = cm.group(2).lower().rstrip(".")
+            dst = cm.group(3).lower().rstrip(".")
+            root = cname_root.setdefault(cid, alias_to_root.get(src, src))
+            alias_to_root[dst] = root
+            continue
+        am = _SINGBOX_DNS_A_RE.search(line)
+        if am:
+            cid = am.group(1) or ""
+            host_low = am.group(2).lower().rstrip(".")
+            ip_val = am.group(3)
+            dom = (cname_root.get(cid) if cid else None) or alias_to_root.get(host_low) or host_low
+            if dom and not _is_ip_literal(dom) and _is_external_ip(ip_val):
+                dns_map[ip_val] = dom
+    return dns_map
+
+
+def _parse_singbox_failed_targets(sb_tail: str) -> list[str]:
+    """Extract recently failed external IPs or hostnames from the tail of sing-box.log."""
+    if not sb_tail:
+        return []
+    clean_tail = _ANSI_RE.sub("", sb_tail)
+    recent_lines = clean_tail.splitlines()[-160:]
+    targets: list[str] = []
+    seen: set[str] = set()
+    for line in reversed(recent_lines):
+        cand: str | None = None
+        m = _SINGBOX_CONN_ERR_RE.search(line)
+        if m:
+            ip_cand = m.group(1) or m.group(2)
+            if not ip_cand:
+                dial_m = _SINGBOX_DIAL_IP_RE.search(m.group(0))
+                if dial_m:
+                    ip_cand = dial_m.group(1) or dial_m.group(2)
+            if not ip_cand:
+                arrow_m = _SINGBOX_ARROW_IP_RE.search(m.group(0))
+                if arrow_m:
+                    ip_cand = arrow_m.group(1) or arrow_m.group(2)
+            if ip_cand and _is_external_ip(ip_cand):
+                cand = ip_cand
+            else:
+                host_m = _SINGBOX_OPEN_HOST_RE.search(m.group(0))
+                if host_m:
+                    host_val = host_m.group(1).lower().rstrip(".")
+                    if host_val and not _is_ip_literal(host_val):
+                        cand = host_val
+        if cand is None:
+            cm = _SINGBOX_CLOSED_ERR_RE.search(line)
+            if cm:
+                ip_cand = cm.group(1) or cm.group(2)
+                if ip_cand and _is_external_ip(ip_cand):
+                    cand = ip_cand
+        if cand and cand not in seen:
+            seen.add(cand)
+            targets.append(cand)
+    return targets
+
+
 def _parse_clash_conn_age_sec(start_raw: Any, now_dt: datetime | None = None) -> float | None:
     """Parse Clash API RFC3339/ISO-8601 connection start timestamp and return age in seconds."""
     if not start_raw or not isinstance(start_raw, str):
@@ -708,6 +796,7 @@ AI_GEOBLOCK_DOMAINS: tuple[str, ...] = (
     "spotify.com",
     "canva.com",
     "login.live.com",
+    "login.microsoftonline.com",
     "account.live.com",
     "xboxlive.com",
     "minecraftservices.com",
@@ -846,14 +935,26 @@ class DnsLayerOrchestrator:
         else:
             tcp_res = await probe_tcp(resolved_ips[0], port=443, timeout=timeout)
 
+        tls_ok = False
+        if tcp_res.result == "ok":
+            tls_status, _ = await _single_tls_handshake(
+                resolved_ips[0], 443, domain, verify=False, timeout=timeout
+            )
+            tls_ok = tls_status == "ok"
+
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        is_proxy_ip = bool(baseline_ips and set(resolved_ips).isdisjoint(baseline_ips))
+        base_p16 = {".".join(ip.split(".")[:2]) for ip in (baseline_ips or ()) if "." in ip}
+        res_p16 = {".".join(ip.split(".")[:2]) for ip in resolved_ips if "." in ip}
+        if base_p16 and res_p16:
+            is_proxy_ip = res_p16.isdisjoint(base_p16)
+        else:
+            is_proxy_ip = bool(baseline_ips and set(resolved_ips).isdisjoint(baseline_ips))
         return {
             "dns_id": srv["id"],
             "name": srv["name"],
             "ip": dns_ip,
             "category": srv.get("category"),
-            "ok": tcp_res.result == "ok",
+            "ok": tls_ok,
             "doh_ok": doh_ok,
             "resolved_ips": resolved_ips,
             "rtt_ms": elapsed_ms,
@@ -2387,6 +2488,8 @@ class RealtimeConnectionMonitor:
                 for ip_val, dom in _WINWS2_IP_HOST_RE.findall(text):
                     if _is_external_ip(ip_val):
                         log_map[ip_val] = dom.lower()
+                if fname == "sing-box.log":
+                    log_map.update(_parse_singbox_dns_ip_map(text))
             with self._lock:
                 self._log_ip_cache[cache_key] = (fsig, log_map)
             new_map.update(log_map)
@@ -2798,6 +2901,30 @@ class RealtimeConnectionMonitor:
             candidates.append((dom, "winws2", f"circular strategy={rot.get('strategy')}"))
             if len(candidates) >= max_domains:
                 break
+
+        if len(candidates) < max_domains:
+            sb_tail = _tail_text(logs_dir / "sing-box.log", max_bytes=65536)
+            for target in _parse_singbox_failed_targets(sb_tail):
+                if _is_ip_literal(target):
+                    with self._lock:
+                        dom = str(self.ip_to_domain.get(target) or "").lower().strip(".")
+                else:
+                    dom = target.lower().strip(".")
+                if (
+                    not dom
+                    or dom in seen
+                    or dom in healthy_domains
+                    or cooldowns.get(dom, 0.0) > now
+                    or _is_rdns_ptr_hostname(dom)
+                    or _is_telemetry_noise_domain(dom)
+                ):
+                    continue
+                if any(dom == pd or dom.endswith("." + pd) for pd in prot):
+                    continue
+                seen.add(dom)
+                candidates.append((dom, "sing-box", "sing-box error"))
+                if len(candidates) >= max_domains:
+                    break
         return candidates
 
     async def auto_heal_connections(
