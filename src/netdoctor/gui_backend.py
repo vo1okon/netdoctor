@@ -2176,19 +2176,40 @@ class GuiBackend:
                 if active_preset_id == "auto":
                     tls_pool = _ordered_pool(list(strategies.values()), Protocol.TLS)
                     quic_pool = _ordered_pool(list(strategies.values()), Protocol.QUIC)
-                    fallback_by_proto = {
-                        Protocol.TLS: tls_pool[0].id if tls_pool else None,
-                        Protocol.QUIC: quic_pool[0].id if quic_pool else None,
+                    pool_by_proto = {
+                        Protocol.TLS: tls_pool,
+                        Protocol.QUIC: quic_pool,
                     }
                     remapped: list[Decision] = []
+                    to_persist: list[Decision] = []
                     for d in decisions:
                         if d.layer == "vpn" and not getattr(d, "pinned", False):
-                            fb_id = fallback_by_proto.get(d.protocol)
+                            proto_pool = pool_by_proto.get(d.protocol, [])
+                            fb_id = proto_pool[0].id if proto_pool else None
                             if fb_id:
-                                remapped.append(d.model_copy(update={"layer": "dpi", "strategy_id": fb_id}))
+                                converted = d.model_copy(
+                                    update={
+                                        "layer": "dpi",
+                                        "strategy_id": fb_id,
+                                        "fallback_strategies": [
+                                            s.id for s in proto_pool if s.id != fb_id and s.args_template
+                                        ][:2],
+                                        "status": "active",
+                                        "consecutive_fails": 0,
+                                    }
+                                )
+                                remapped.append(converted)
+                                to_persist.append(converted)
                             continue
                         remapped.append(d)
                     winws_decisions = remapped
+                    if to_persist:
+                        st = Storage(self.db_path)
+                        try:
+                            for dec in to_persist:
+                                st.save_decision(dec)
+                        finally:
+                            st.close()
 
             if not winws_args:
                 winws_args, hostlists = generate_winws2_config(

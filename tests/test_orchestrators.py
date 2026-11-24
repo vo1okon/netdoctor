@@ -1048,8 +1048,12 @@ def test_youtube_cdn_ag_dns_protection_and_doh_probe_fix(tmp_path: Path, monkeyp
             return [_Ans("104.21.1.2")]
         raise TimeoutError("no udp")
 
+    async def fake_tls_ok(ip: str, port: int, sni: str, verify: bool = False, timeout: float = 2.0) -> tuple[str, float | None]:
+        return "ok", 18.0
+
     monkeypatch.setattr(orch_mod, "probe_dns", fake_probe_dns)
     monkeypatch.setattr(orch_mod, "probe_tcp", fake_probe_tcp)
+    monkeypatch.setattr(orch_mod, "_single_tls_handshake", fake_tls_ok)
     monkeypatch.setattr(dns.asyncresolver.Resolver, "resolve", fake_udp_resolve)
 
     orch = DnsLayerOrchestrator()
@@ -1745,3 +1749,116 @@ def test_run_diag_sync_rotates_fallback_when_bypass_active_and_dpi_still_fails(
     tls_row = next(r for r in rows if r["domain"] == "login.live.com" and r["protocol"] == "tls")
     assert tls_row["strategy_id"] == "tls_alt12_1104_sferum_seqovl"
     assert tls_row["consecutive_fails"] == 1
+
+
+def test_roll_dns_rejects_tcp_ok_tls_blocked_and_excludes_dns_from_catchall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SmartDNS roll must reject DNS servers returning TCP-ok/TLS-blocked IPs (like xbox_dns -> Azure)
+    and winws2 catch-all must exclude layer='dns' domains."""
+    import dns.asyncresolver
+    import netdoctor.orchestrators as orch_mod
+    from netdoctor.config_gen import generate_winws2_config
+    from netdoctor.models import DnsProbeResult, TcpProbeResult
+
+    async def fake_probe_dns(domain: str, doh_url: str = "https://1.1.1.1/dns-query", timeout: float = 3.0, **_kw: Any) -> DnsProbeResult:
+        if "comss.one" in doh_url:
+            return DnsProbeResult(system="ok", doh="ok", system_ips=["20.190.159.10"], doh_ips=["176.12.72.184"])
+        if "176.99.11.77" in doh_url:
+            return DnsProbeResult(system="ok", doh="timeout", system_ips=["20.190.159.10"], doh_ips=[])
+        return DnsProbeResult(system="ok", doh="timeout", system_ips=["20.190.159.10"], doh_ips=[])
+
+    async def fake_udp_resolve(self: Any, qname: str, rdtype: str = "A") -> list[Any]:
+        class _Ans:
+            def __init__(self, addr: str) -> None:
+                self.address = addr
+
+        ns = getattr(self, "nameservers", []) or []
+        if "176.99.11.77" in ns:
+            return [_Ans("40.126.53.10")]
+        if "141.133.184.24" in ns:
+            return [_Ans("176.12.72.184")]
+        raise TimeoutError("no udp")
+
+    async def fake_probe_tcp(ip: str, port: int = 443, timeout: float = 1.8) -> TcpProbeResult:
+        return TcpProbeResult(result="ok", rtt_ms=25.0, target_ip=ip)
+
+    async def fake_tls(ip: str, port: int, sni: str, verify: bool = False, timeout: float = 2.0) -> tuple[str, float | None]:
+        if ip == "176.12.72.184":
+            return "ok", 200.0
+        return "reset", None
+
+    monkeypatch.setattr(orch_mod, "probe_dns", fake_probe_dns)
+    monkeypatch.setattr(orch_mod, "probe_tcp", fake_probe_tcp)
+    monkeypatch.setattr(orch_mod, "_single_tls_handshake", fake_tls)
+    monkeypatch.setattr(dns.asyncresolver.Resolver, "resolve", fake_udp_resolve)
+
+    orch = DnsLayerOrchestrator()
+    dec = asyncio.run(orch.roll_dns_for_domain("login.live.com", "AS12389:home:default"))
+    assert dec.layer == "dns"
+    assert dec.strategy_id == "dns:comss_dns"
+
+    lists_dir = tmp_path / "lists"
+    args, _ = generate_winws2_config(
+        decisions=[dec],
+        strategies={s.id: s for s in DEFAULT_STRATEGIES},
+        lists_dir=lists_dir,
+    )
+    excl_file = lists_dir / "exclude_unlocker_domains.txt"
+    assert excl_file.is_file()
+    assert "login.live.com" in excl_file.read_text(encoding="utf-8").splitlines()
+    assert f"--hostlist-exclude={excl_file.as_posix()}" in args
+
+
+def test_apply_configs_persists_vpn_to_dpi_when_no_vpn(tmp_path: Path) -> None:
+    """In dpi_only / no-VPN mode, non-pinned VPN rules in DB are persisted to DPI while pinned VPN rules stay intact."""
+    from netdoctor.models import NetworkFingerprint, NetworkKind
+
+    db_path = tmp_path / "no_vpn_persist.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    net = NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP")
+    st = Storage(db_path)
+    try:
+        nk = st.upsert_network(net)
+        st.set_setting("stack_mode", "dpi_only")
+        st.upsert_strategies(DEFAULT_STRATEGIES)
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="instagram.com",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="pinned.example",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                pinned=True,
+            )
+        )
+    finally:
+        st.close()
+
+    backend.trigger_apply_configs()
+
+    st2 = Storage(db_path)
+    try:
+        saved = {(d.domain, d.protocol): d for d in st2.get_decisions(nk, active_only=True)}
+        insta = saved[("instagram.com", Protocol.TLS)]
+        assert insta.layer == "dpi"
+        assert insta.strategy_id
+        pinned = saved[("pinned.example", Protocol.TLS)]
+        assert pinned.layer == "vpn"
+    finally:
+        st2.close()

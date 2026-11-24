@@ -5327,7 +5327,8 @@ class NetdoctorGuiApp(tk.Tk):
 
         self.rows_by_iid = new_rows_by_iid
         if prev_selected and prev_selected in self.rows_by_iid:
-            self.domain_tree.selection_set(prev_selected)
+            if self.domain_tree.selection() != (prev_selected,):
+                self.domain_tree.selection_set(prev_selected)
             self.selected_row = self.rows_by_iid[prev_selected]
             self.show_inspector(self.selected_row, sync_controls=False)
         elif prev_selected:
@@ -5350,8 +5351,10 @@ class NetdoctorGuiApp(tk.Tk):
         row = self.rows_by_iid.get(sel[0])
         if row is None:
             return
+        same_row = self.selected_row is not None and row_iid(self.selected_row) == sel[0]
         self.selected_row = row
-        self.show_inspector(row)
+        # Programmatic re-selection on refresh must not overwrite user's in-progress manual layer/strategy choice
+        self.show_inspector(row, sync_controls=not same_row)
 
     def show_inspector(self, row: dict[str, Any] | None, sync_controls: bool = True) -> None:
         w = self.inspector

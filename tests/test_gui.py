@@ -716,6 +716,10 @@ def test_gui_minsize_layout_no_clipping_and_dns_alert(tmp_path: Path) -> None:
         sig_before = app._inspector_sig
         app.show_inspector(app.selected_row, sync_controls=False)
         assert app._inspector_sig == sig_before
+        # Same-row <<TreeviewSelect>> re-selection on refresh preserves manual override edits
+        app.override_layer_var.set("dns")
+        app.on_domain_select()
+        assert app.override_layer_var.get() == "dns"
     finally:
         app.on_close()
 
