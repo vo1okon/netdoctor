@@ -2175,3 +2175,79 @@ def test_collect_fix_candidates_prioritizes_new_domains_without_decision(tmp_pat
     ]
     cands = mon._collect_fix_candidates(connections, tmp_path, max_domains=1)
     assert cands == [("ubisoft.com", "upc.exe", "SYN_SENT stall")]
+
+
+def test_find_best_bypass_tests_clean_direct_excluding_winws2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from netdoctor.models import NetworkFingerprint, NetworkKind
+
+    db_path = tmp_path / "netdoctor.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    storage = Storage(db_path)
+    try:
+        net_key = storage.upsert_network(
+            NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP")
+        )
+        storage.save_decision(
+            Decision(
+                network_key=net_key,
+                domain="account.ubisoft.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_alt1_199_fake_fakedsplit",
+                status="active",
+                consecutive_fails=0,
+            )
+        )
+    finally:
+        storage.close()
+
+    monkeypatch.setattr(
+        backend,
+        "_collect_processes_state",
+        lambda: {"winws2": {"running": True}, "sing-box": {"running": False}},
+    )
+    monkeypatch.setattr("netdoctor.gui_backend._is_admin", lambda: True)
+    reloaded: list[bool] = []
+    monkeypatch.setattr(
+        backend,
+        "reload_winws2",
+        lambda: (reloaded.append(True), {"ok": True})[1],
+    )
+
+    reloaded_before_probe: list[int] = []
+
+    def fake_probe(
+        _domain: str, *, proxy_url: str | None = None, timeout: float = 3.0
+    ) -> dict[str, Any]:
+        assert proxy_url is None
+        reloaded_before_probe.append(len(reloaded))
+        st_check = Storage(db_path)
+        try:
+            cur = next(
+                (
+                    d
+                    for d in st_check.get_decisions(net_key, active_only=False)
+                    if d.domain == "account.ubisoft.com" and d.protocol == Protocol.TLS
+                ),
+                None,
+            )
+        finally:
+            st_check.close()
+        if cur is not None and cur.layer == "direct":
+            return {"ok": True, "latency_ms": 35.0}
+        return {"ok": False, "error": "reset"}
+
+    res = backend.find_best_bypass_for_domain("account.ubisoft.com", probe_fn=fake_probe)
+    assert res["ok"] is True
+    assert res["winner"]["layer"] == "direct"
+    assert reloaded_before_probe == [1]
+    assert all(t["layer"] == "direct" for t in res["tried"])
+

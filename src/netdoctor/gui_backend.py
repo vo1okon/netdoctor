@@ -2208,30 +2208,39 @@ class GuiBackend:
         winner: Decision | None = None
         winner_ms: float | None = None
 
-        # Step A: Direct (skip only if already routed through non-direct bypass while stack is running)
-        if not winws_running or existing is None or existing.layer == "direct":
-            res_direct = _test(proxy_url=None)
-            tried.append(
-                {
-                    "layer": "direct",
-                    "strategy_id": None,
-                    "ok": bool(res_direct.get("ok")),
-                    "latency_ms": res_direct.get("latency_ms"),
-                    "error": res_direct.get("error", ""),
-                }
+        # Step A: Always test clean direct first (excluding domain from winws2 catch-all/preset/old DPI)
+        direct_dec = Decision(
+            network_key=net_key,
+            domain=dom,
+            protocol=Protocol.TLS,
+            layer="direct",
+            strategy_id=None,
+            status="active",
+            consecutive_fails=0,
+        )
+        if winws_running and is_adm and (existing is None or existing.layer != "direct"):
+            _save_and_apply(
+                direct_dec,
+                reload_winws=True,
+                reload_sb=(existing is not None and existing.layer in ("dns", "vpn")),
             )
-            if res_direct.get("ok"):
-                winner_ms = res_direct.get("latency_ms")
-                winner = Decision(
-                    network_key=net_key,
-                    domain=dom,
-                    protocol=Protocol.TLS,
-                    layer="direct",
-                    strategy_id=None,
-                    ttfb_ms=winner_ms,
-                    status="active",
-                    consecutive_fails=0,
-                )
+            if probe_fn is None:
+                time.sleep(0.25)
+
+        res_direct = _test(proxy_url=None)
+        tried.append(
+            {
+                "layer": "direct",
+                "strategy_id": None,
+                "ok": bool(res_direct.get("ok")),
+                "latency_ms": res_direct.get("latency_ms"),
+                "error": res_direct.get("error", ""),
+            }
+        )
+        if res_direct.get("ok"):
+            winner_ms = res_direct.get("latency_ms")
+            direct_dec.ttfb_ms = winner_ms
+            winner = direct_dec
 
         # Step B: Diverse DPI strategy families
         tls_pool = [s for s in _ordered_pool(strategies, Protocol.TLS) if s.args_template]
