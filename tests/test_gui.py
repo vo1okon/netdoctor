@@ -1281,32 +1281,67 @@ def test_gui_vpn_processes_smartdns_split_and_db_cleanup(tmp_path: Path) -> None
         app.update_idletasks()
         app.update()
 
-        # vpn_processes input must live in tab_vpn (not tab_service)
-        cur = app.vpn_processes_entry.master
-        ancestors = []
-        while cur is not None:
-            ancestors.append(cur)
-            cur = cur.master
-        assert app.tab_vpn in ancestors and app.tab_service not in ancestors
+        # Hardcoded game presets must NOT exist in tab_vpn; controls live in Live-Radar & DNS tabs
+        vpn_btn_texts: list[str] = []
+
+        def _collect_vpn_btns(w: tk.Misc) -> None:
+            for ch in w.winfo_children():
+                if isinstance(ch, (tk.Button, gui_mod.RoundedButton)):
+                    vpn_btn_texts.append(str(ch.cget("text")))
+                _collect_vpn_btns(ch)
+
+        _collect_vpn_btns(app.tab_vpn)
+        assert not any(lbl in vpn_btn_texts for lbl in ("+ R6 Siege", "+ Ubisoft", "+ Discord", "Сохранить VPN"))
+
+        assert hasattr(app, "conn_vpn_btn") and hasattr(app, "roll_base_dns_btn")
+        assert hasattr(app, "auto_tune_all_btn")
+        assert not hasattr(app, "dns_split_banner")
+        assert hasattr(app, "smart_dns_pill") and hasattr(app, "active_dns_pill")
 
         snap = backend.get_status_snapshot()
+        snap["base_dns"] = {
+            "id": "quad9",
+            "name": "Quad9",
+            "ip": "9.9.9.9",
+            "category": "security",
+            "alive": True,
+            "ping_ms": 42.0,
+        }
         snap["active_dns"] = {
             "id": "comss_dns",
             "name": "Comss.one DNS",
-            "ip": "91.239.100.100",
+            "ip": "141.133.184.24",
             "category": "ai_bypass",
         }
         snap["active_dns_id"] = "comss_dns"
-        snap["vpn_processes"] = "RainbowSix.exe, upc.exe"
+        snap["vpn_processes"] = "SomeApp.exe"
         app.apply_snapshot(snap)
-        app.render_dns_grid([snap["active_dns"]], "comss_dns")
+        app.render_dns_grid([snap["base_dns"], snap["active_dns"]], "comss_dns")
+        app.populate_connections_table([])
 
-        assert "SmartDNS" in str(app.dns_split_banner.cget("text"))
-        assert "Сплит" in str(app.card_dns_sub.cget("text"))
-        assert "2 прил." in str(app.card_vpn_sub.cget("text"))
+        base_pill = str(app.active_dns_pill.cget("text"))
+        smart_pill = str(app.smart_dns_pill.cget("text"))
+        assert "Обычный / VPN" in base_pill and "Quad9" in base_pill
+        assert "Comss.one DNS" in smart_pill
+        assert "1.1.1.1" not in base_pill and "1.1.1.1" not in smart_pill
+
+        card_badges: list[str] = []
+
+        def _collect_labels(w: tk.Misc) -> None:
+            for ch in w.winfo_children():
+                if isinstance(ch, tk.Label):
+                    card_badges.append(str(ch.cget("text")))
+                _collect_labels(ch)
+
+        _collect_labels(app.dns_grid_frame)
+        assert "✔ Обычный / VPN" in card_badges
+        assert "✦ SmartDNS (ИИ)" in card_badges
+        assert "Quad9" in str(app.card_dns_sub.cget("text"))
+        assert "1 прил." in str(app.card_vpn_sub.cget("text"))
+        assert "В VPN: 1 прил." in str(app._rt_summary_lbl.cget("text"))
 
         # Check all core tabs have unique button texts
-        for tab_widget in (app.tab_home, app.tab_vpn, app.tab_service):
+        for tab_widget in (app.tab_home, app.tab_dns, app.tab_vpn, app.tab_service):
             btn_texts: list[str] = []
 
             def _collect(w: tk.Misc) -> None:

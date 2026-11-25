@@ -7,6 +7,7 @@ import ipaddress
 import os
 import re
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -17,6 +18,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import dns.asyncresolver
+import dns.message
+import dns.rdatatype
+import httpx
 import psutil
 
 from netdoctor.clash_api import ClashApiClient
@@ -627,6 +631,36 @@ def _node_has_healthy_connections(clash_conns: list[dict[str, Any]], node_tag: s
     return False
 
 
+def _node_rx_bytes_snapshot(clash_conns: list[dict[str, Any]], node_tag: str) -> dict[str, int]:
+    """Map active Clash connection IDs on `node_tag` to their cumulative download bytes."""
+    clean_tag = (node_tag or "").strip()
+    snap: dict[str, int] = {}
+    if not clean_tag or not clash_conns:
+        return snap
+    for idx, c in enumerate(clash_conns):
+        if not isinstance(c, dict):
+            continue
+        if clean_tag not in (c.get("chains") or []):
+            continue
+        try:
+            dn = int(c.get("download") or 0)
+        except (TypeError, ValueError):
+            continue
+        cid = str(c.get("id") or f"idx-{idx}")
+        snap[cid] = dn
+    return snap
+
+
+def _node_has_growing_rx(before: dict[str, int], after: dict[str, int]) -> bool:
+    """Return True if any connection on the node received more bytes since `before`."""
+    if not after:
+        return False
+    for cid, dn_after in after.items():
+        if dn_after > before.get(cid, 0):
+            return True
+    return False
+
+
 def _is_external_ip(ip_str: str) -> bool:
     """Return True if ip_str is a routable/external address (keeps RFC 5737 test IPs for unit tests)."""
     clean = ip_str.split("%", 1)[0].strip()
@@ -947,22 +981,217 @@ class DnsLayerOrchestrator:
                 return s
         return servers[0]
 
+    def get_base_dns(self, storage: Storage | None = None, net_key: str | None = None) -> dict[str, Any] | None:
+        """Return configured non-SmartDNS base resolver for this network (or global), if set and valid."""
+        if storage is None:
+            return None
+        servers = self.get_all_dns_servers(storage)
+        base_id = ""
+        if net_key:
+            base_id = storage.get_setting(f"base_dns_id:{net_key}", "").strip()
+        if not base_id:
+            base_id = storage.get_setting("base_dns_id", "").strip()
+        if not base_id:
+            return None
+        for s in servers:
+            if s["id"] == base_id and str(s.get("category") or "").lower() != "ai_bypass":
+                return s
+        return None
+
+    @staticmethod
+    def _extract_doh_a_ips(content: bytes) -> list[str]:
+        msg = dns.message.from_wire(content)
+        ips: list[str] = []
+        for rrset in msg.answer:
+            if rrset.rdtype == dns.rdatatype.A:
+                for item in rrset:
+                    addr = getattr(item, "address", "")
+                    if addr and not is_stub_ip(addr):
+                        ips.append(addr)
+        return ips
+
+    @classmethod
+    async def _probe_doh_realtime(
+        cls,
+        client: httpx.AsyncClient,
+        wire_query: bytes,
+        doh_url: str,
+        timeout: float = 1.8,
+    ) -> tuple[bool, float | None]:
+        """Measure real DoH resolution RTT over a shared HTTP/2 client (preferring warm 2nd-query RTT)."""
+        headers = {
+            "Content-Type": "application/dns-message",
+            "Accept": "application/dns-message",
+        }
+        try:
+            t0 = time.perf_counter()
+            resp = await client.post(doh_url, content=wire_query, headers=headers, timeout=timeout)
+            cold_ms = (time.perf_counter() - t0) * 1000.0
+            if resp.status_code != 200 or not cls._extract_doh_a_ips(resp.content):
+                return False, None
+        except Exception:
+            return False, None
+
+        rtt_ms = cold_ms
+        try:
+            t1 = time.perf_counter()
+            resp2 = await client.post(
+                doh_url,
+                content=wire_query,
+                headers=headers,
+                timeout=min(timeout, 1.2),
+            )
+            warm_ms = (time.perf_counter() - t1) * 1000.0
+            if resp2.status_code == 200 and cls._extract_doh_a_ips(resp2.content):
+                rtt_ms = warm_ms
+        except Exception:
+            pass
+        return True, round(rtt_ms, 1)
+
+    @staticmethod
+    async def _probe_udp_dns(dns_ip: str, timeout: float = 1.2) -> tuple[bool, float | None]:
+        """Measure real UDP/53 DNS A-record resolution RTT for non-DoH servers."""
+        if not dns_ip:
+            return False, None
+        t0 = time.perf_counter()
+        try:
+            resolver = dns.asyncresolver.Resolver(configure=False)
+            resolver.nameservers = [dns_ip]
+            resolver.port = 53
+            resolver.lifetime = min(timeout, 1.2)
+            ans = await resolver.resolve("example.com", "A")
+            resolved_ips = [r.address for r in ans if not is_stub_ip(r.address)]
+            if resolved_ips:
+                return True, round((time.perf_counter() - t0) * 1000.0, 1)
+        except Exception:
+            pass
+        return False, None
+
+    async def roll_base_dns(
+        self,
+        storage: Storage | None = None,
+        probe_fn: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+        timeout: float = 1.8,
+        category: str | None = None,
+    ) -> dict[str, Any]:
+        """Concurrently test ordinary non-SmartDNS resolvers via real DoH/DNS resolution and pick the fastest working."""
+        all_servers = self.get_all_dns_servers(storage)
+        allowed_cats = ("popular", "security", "uncommon", "custom")
+        if category and category in allowed_cats:
+            pool = [s for s in all_servers if s.get("category") == category and not s.get("doh_broken")]
+            if not pool:
+                pool = [s for s in all_servers if s.get("category") in allowed_cats and not s.get("doh_broken")]
+        else:
+            pool = [
+                s
+                for s in all_servers
+                if s.get("category") in allowed_cats
+                and not s.get("doh_broken")
+                and not str(s.get("id") or "").endswith("_family")
+                and "18+" not in str(s.get("description") or "").lower()
+            ]
+        if not pool:
+            raise RuntimeError("Нет доступных кандидатов обычного DNS для проверки")
+
+        sem = asyncio.Semaphore(8)
+
+        async def _probe_with_client(
+            srv: dict[str, Any],
+            client: httpx.AsyncClient | None,
+            wire_query: bytes | None,
+        ) -> dict[str, Any]:
+            async with sem:
+                if probe_fn is not None:
+                    res = dict(await probe_fn(srv))
+                    res.setdefault("dns_id", srv["id"])
+                    res.setdefault("server", srv)
+                    return res
+                doh_url = str(srv.get("doh_url") or "").strip()
+                dns_ip = str(srv.get("ip") or "").strip()
+                if doh_url.startswith("https://") and client is not None and wire_query is not None:
+                    ok, rtt_ms = await self._probe_doh_realtime(client, wire_query, doh_url, timeout=timeout)
+                    return {
+                        "dns_id": srv["id"],
+                        "server": srv,
+                        "ok": ok,
+                        "doh_ok": ok,
+                        "rtt_ms": rtt_ms,
+                    }
+
+                ok, rtt_ms = await self._probe_udp_dns(dns_ip, timeout=timeout)
+                return {
+                    "dns_id": srv["id"],
+                    "server": srv,
+                    "ok": ok,
+                    "doh_ok": False,
+                    "rtt_ms": rtt_ms,
+                }
+
+        if probe_fn is not None:
+            results = await asyncio.gather(*(_probe_with_client(s, None, None) for s in pool))
+        else:
+            ssl_ctx = ssl.create_default_context()
+            wire_query = dns.message.make_query("example.com", dns.rdatatype.A).to_wire()
+            limits = httpx.Limits(max_connections=24, max_keepalive_connections=24)
+            async with httpx.AsyncClient(http2=True, verify=ssl_ctx, timeout=timeout, limits=limits) as client:
+                results = await asyncio.gather(*(_probe_with_client(s, client, wire_query) for s in pool))
+
+        working = [r for r in results if r.get("ok")]
+
+        def _rank_key(r: dict[str, Any]) -> tuple[int, float, str]:
+            srv = r["server"]
+            badges_low = [str(b).lower() for b in (srv.get("badges") or [])]
+            rtt = float(r.get("rtt_ms") if r.get("rtt_ms") is not None else 99999.0)
+            bias = 35.0 if "блокируется" in badges_low else (10.0 if "под угрозой" in badges_low else 0.0)
+            return (
+                0 if r.get("doh_ok") else 1,
+                rtt + bias,
+                str(r.get("dns_id") or ""),
+            )
+
+        working.sort(key=_rank_key)
+        selected: dict[str, Any] | None = None
+        if working:
+            win = working[0]
+            selected = dict(win["server"])
+            selected["ping_ms"] = win.get("rtt_ms")
+            selected["alive"] = True
+            selected["doh_ok"] = bool(win.get("doh_ok"))
+
+        return {
+            "selected": selected,
+            "tested": len(pool),
+            "alive": len(working),
+            "results": working,
+            "all_results": results,
+        }
+
     async def probe_dns_catalog(
         self,
         servers: list[dict[str, Any]],
-        timeout: float = 1.2,
+        timeout: float = 1.5,
     ) -> list[dict[str, Any]]:
-        """Concurrently probe TCP/443 (DoH) or TCP/53 latency for every DNS server in the catalog."""
+        """Concurrently probe TCP reachability and verify real DoH RTT for every DNS server in the catalog."""
         if not servers:
             return []
 
-        sem = asyncio.Semaphore(16)
+        sem = asyncio.Semaphore(10)
+        needs_doh = any(
+            str(s.get("doh_url") or "").strip().startswith("https://") and not s.get("doh_broken")
+            for s in servers
+        )
 
-        async def _probe_one(srv: dict[str, Any]) -> dict[str, Any]:
+        async def _probe_one(
+            srv: dict[str, Any],
+            client: httpx.AsyncClient | None,
+            wire_query: bytes | None,
+        ) -> dict[str, Any]:
             async with sem:
                 ip = str(srv.get("ip") or "").strip()
                 badges = list(srv.get("badges") or [])
-                has_doh = ("DoH" in badges) or bool(srv.get("doh_url"))
+                doh_url = str(srv.get("doh_url") or "").strip()
+                has_https_doh = doh_url.startswith("https://")
+                has_doh = ("DoH" in badges) or bool(doh_url)
                 primary_port = 443 if has_doh else 53
                 enriched = dict(srv)
                 if not ip:
@@ -971,8 +1200,29 @@ class DnsLayerOrchestrator:
                     enriched["probe_port"] = primary_port
                     return enriched
 
-                res = await probe_tcp(ip, port=primary_port, timeout=timeout)
+                res = await probe_tcp(ip, port=primary_port, timeout=min(timeout, 1.0))
                 used_port = primary_port
+                if (
+                    res.result == "ok"
+                    and primary_port == 443
+                    and has_https_doh
+                    and not srv.get("doh_broken")
+                    and client is not None
+                    and wire_query is not None
+                ):
+                    doh_ok, doh_ms = await self._probe_doh_realtime(client, wire_query, doh_url, timeout=timeout)
+                    enriched["alive"] = doh_ok
+                    enriched["ping_ms"] = doh_ms if doh_ok else None
+                    enriched["probe_port"] = 443
+                    return enriched
+
+                if res.result == "ok" and not has_https_doh and not srv.get("doh_broken"):
+                    udp_ok, udp_ms = await self._probe_udp_dns(ip, timeout=timeout)
+                    enriched["alive"] = udp_ok
+                    enriched["ping_ms"] = udp_ms if udp_ok else None
+                    enriched["probe_port"] = 53
+                    return enriched
+
                 if res.result != "ok" and primary_port == 443:
                     res53 = await probe_tcp(ip, port=53, timeout=min(timeout, 0.8))
                     if res53.result == "ok":
@@ -983,7 +1233,14 @@ class DnsLayerOrchestrator:
                 enriched["probe_port"] = used_port
                 return enriched
 
-        return await asyncio.gather(*(_probe_one(s) for s in servers))
+        if not needs_doh:
+            return await asyncio.gather(*(_probe_one(s, None, None) for s in servers))
+
+        ssl_ctx = ssl.create_default_context()
+        wire_query = dns.message.make_query("example.com", dns.rdatatype.A).to_wire()
+        limits = httpx.Limits(max_connections=24, max_keepalive_connections=24)
+        async with httpx.AsyncClient(http2=True, verify=ssl_ctx, timeout=timeout, limits=limits) as client:
+            return await asyncio.gather(*(_probe_one(s, client, wire_query) for s in servers))
 
     async def probe_dns_server_for_domain(
         self,
@@ -1919,6 +2176,8 @@ class VpnLayerOrchestrator:
             except Exception:  # noqa: BLE001
                 clash_conns = []
         active_has_live_traffic = bool(active_leaf and _node_has_healthy_connections(clash_conns, active_leaf))
+        initial_rx = _node_rx_bytes_snapshot(clash_conns, active_leaf) if active_leaf else {}
+        active_rx_growing = False
 
         priority_node = str(policy.get("priority_node") or "").strip()
         has_custom_prio = bool(priority_node) or any(
@@ -2029,11 +2288,21 @@ class VpnLayerOrchestrator:
             )
 
         async def _check_active_node_alive(node: dict[str, Any], active_tag: str) -> bool:
+            nonlocal active_rx_growing
             probe = await _probe_via_clash(node)
             if probe.get("alive"):
                 return True
             if not force and active_has_live_traffic:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.4)
+                if callable(get_conns_fn):
+                    try:
+                        after_payload = await get_conns_fn()
+                        after_raw = (after_payload.get("connections") or []) if isinstance(after_payload, dict) else []
+                        after_conns = [c for c in after_raw if isinstance(c, dict)]
+                        after_rx = _node_rx_bytes_snapshot(after_conns, active_tag)
+                        active_rx_growing = _node_has_growing_rx(initial_rx, after_rx)
+                    except Exception:  # noqa: BLE001
+                        pass
                 ok2, rtt2, err2 = await self._measure_clash_node_delay(clash_client, active_tag, timeout)
                 if ok2:
                     node_for_db = dict(node)
@@ -2058,6 +2327,8 @@ class VpnLayerOrchestrator:
                         "tunnel_verified": True,
                         "node": node,
                     }
+                    return True
+                if active_rx_growing and int(probe.get("consecutive_fails") or 0) < 2:
                     return True
             return False
 
@@ -2183,7 +2454,12 @@ class VpnLayerOrchestrator:
                 winner_tag = str(ranked[0].get("tag") or "").strip()
                 switched = await clash_client.select_outbound(selector_tag, winner_tag)
                 closed = 0
-                if active_leaf and active_leaf != winner_tag and active_leaf not in ("vpn-auto", "direct"):
+                if (
+                    (force or not active_rx_growing)
+                    and active_leaf
+                    and active_leaf != winner_tag
+                    and active_leaf not in ("vpn-auto", "direct")
+                ):
                     closed = await clash_client.close_connections_by_node(active_leaf)
                 self._active_node_tag = winner_tag
                 self._pending_optimal_node = None
@@ -2261,7 +2537,13 @@ class VpnLayerOrchestrator:
             if auto_alive and cooldown_ok:
                 switched = await clash_client.select_outbound(selector_tag, "vpn-auto")
                 closed = 0
-                if not active_alive and active_leaf and active_leaf != auto_leaf and active_leaf not in ("vpn-auto", "direct"):
+                if (
+                    (force or not active_rx_growing)
+                    and not active_alive
+                    and active_leaf
+                    and active_leaf != auto_leaf
+                    and active_leaf not in ("vpn-auto", "direct")
+                ):
                     closed = await clash_client.close_connections_by_node(active_leaf)
                 self._active_node_tag = auto_leaf
                 self._pending_optimal_node = None
@@ -2303,7 +2585,12 @@ class VpnLayerOrchestrator:
             winner_tag = str(ranked[0].get("tag") or "").strip()
             switched = await clash_client.select_outbound(selector_tag, winner_tag)
             closed = 0
-            if active_leaf and active_leaf != winner_tag and active_leaf not in ("vpn-auto", "direct"):
+            if (
+                (force or not active_rx_growing)
+                and active_leaf
+                and active_leaf != winner_tag
+                and active_leaf not in ("vpn-auto", "direct")
+            ):
                 closed = await clash_client.close_connections_by_node(active_leaf)
             self._active_node_tag = winner_tag
             self._pending_optimal_node = None
@@ -2429,6 +2716,39 @@ class VpnLayerOrchestrator:
         }
 
 
+_NON_AUTO_VPN_PROCESSES: frozenset[str] = frozenset(
+    {
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "opera.exe",
+        "brave.exe",
+        "yandex.exe",
+        "browser.exe",
+        "vivaldi.exe",
+        "svchost.exe",
+        "system",
+        "explorer.exe",
+        "searchhost.exe",
+        "onedrive.exe",
+        "msmpeng.exe",
+        "tiworker.exe",
+        "wuauclt.exe",
+        "backgroundtaskhost.exe",
+        "qbittorrent.exe",
+        "utorrent.exe",
+        "bittorrent.exe",
+        "transmission-qt.exe",
+        "crossdeviceservice.exe",
+        "phoneexperiencehost.exe",
+        "widgets.exe",
+        "msedgewebview2.exe",
+        "runtimebroker.exe",
+        "startmenuexperiencehost.exe",
+    }
+)
+
+
 class RealtimeConnectionMonitor:
     """Real-time connection scanner & automatic per-domain strategy orchestrator."""
 
@@ -2450,6 +2770,9 @@ class RealtimeConnectionMonitor:
         self._verdicts_ip_map: dict[str, str] = {}
         self._log_ip_cache: dict[str, tuple[tuple[int, int], dict[str, str]]] = {}
         self._last_scan: tuple[float, str, list[dict[str, Any]]] | None = None
+        self._proc_stall_strikes: dict[str, int] = {}
+        self._last_stalled_direct_procs: dict[str, dict[str, int]] = {}
+        self._manual_vpn_proc_optout: set[str] = set()
 
     def get_recent_connections(self, net_key: str, max_age_sec: float = 2.0) -> list[dict[str, Any]] | None:
         """Return shallow copy of recent scan_active_connections rows if fresh and matching network_key."""
@@ -2691,6 +3014,10 @@ class RealtimeConnectionMonitor:
         decisions_map: dict[tuple[str, str], Decision] = {
             (d.domain.lower(), d.protocol.value): d for d in decisions
         }
+        raw_vpn_procs = storage.get_setting(f"vpn_processes:{resolved_key}", "")
+        if not raw_vpn_procs:
+            raw_vpn_procs = storage.get_setting("vpn_processes", "")
+        vpn_procs_low = {p.lower() for p in parse_process_list(raw_vpn_procs)}
         known_targets = {e["domain"].lower() for e in load_targets_from_yaml(targets_file) if e.get("domain")}
 
         # Tail logs rather than reading multi-MB logs completely on every 3s tick
@@ -2704,6 +3031,7 @@ class RealtimeConnectionMonitor:
         healthy_clash_endpoints: set[tuple[str, int, str]] = set()
         healthy_clash_domains: set[str] = set()
         stalled_clash_endpoints: set[tuple[str, int, str]] = set()
+        stalled_direct_procs: dict[str, dict[str, int]] = {}
         clash_flows: list[dict[str, Any]] = []
         self_pid = os.getpid()
         self_exe_paths: set[str] = set()
@@ -2789,6 +3117,18 @@ class RealtimeConnectionMonitor:
             if is_stalled:
                 stalled_clash_endpoints.add((rip, rport, t_proto))
 
+            if proc_name and rport not in (53, 123, 137, 138, 1900, 5353, 5355) and (
+                t_proto == "udp" or rport not in _WEB_PORTS
+            ):
+                chains = c.get("chains") or []
+                via_direct = (not chains) or any(str(ch).lower() == "direct" for ch in chains)
+                if via_direct:
+                    rec = stalled_direct_procs.setdefault(proc_name, {"stalled": 0, "healthy": 0})
+                    if upload_b > 0 and download_b == 0 and (age_sec is None or age_sec >= 5.0):
+                        rec["stalled"] += 1
+                    elif upload_b > 0 and download_b > 0:
+                        rec["healthy"] += 1
+
             clash_flows.append(
                 {
                     "process": proc_name,
@@ -2844,6 +3184,10 @@ class RealtimeConnectionMonitor:
             if is_unlocker_conn:
                 layer = "unlocker"
                 strategy_id = "hosts/unlocker"
+                health = "protected"
+            elif proc_name.lower() in vpn_procs_low:
+                layer = "vpn"
+                strategy_id = "vpn-proc"
                 health = "protected"
             elif is_healthy_conn:
                 health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
@@ -2965,6 +3309,7 @@ class RealtimeConnectionMonitor:
         health_order = {"needs_fix": 0, "protected": 1, "direct": 2}
         rows_out.sort(key=lambda r: (health_order.get(r["health"], 9), r["process"].lower(), r["domain"]))
         with self._lock:
+            self._last_stalled_direct_procs = {k: dict(v) for k, v in stalled_direct_procs.items()}
             self._last_scan = (time.monotonic(), resolved_key, [dict(r) for r in rows_out])
         return rows_out
 
@@ -3126,7 +3471,12 @@ class RealtimeConnectionMonitor:
                 with self._lock:
                     events = list(self.recent_events)
                 return {"connections": connections, "healed": [], "events": events, "preset_locked": True}
-            vpn_procs = parse_process_list(storage.get_setting("vpn_processes", ""))
+            raw_vpn_procs = storage.get_setting(f"vpn_processes:{net_key}", "")
+            if not raw_vpn_procs:
+                raw_vpn_procs = storage.get_setting("vpn_processes", "")
+            vpn_procs = parse_process_list(raw_vpn_procs)
+            has_real_vpn = storage.has_usable_vpn()
+            can_dns_bypass = storage.get_setting("stack_mode", "hybrid").strip().lower() != "dpi_only"
             candidates = self._collect_fix_candidates(
                 connections,
                 logs_dir,
@@ -3134,18 +3484,44 @@ class RealtimeConnectionMonitor:
                 protected_domains=set(guard["domains"]) if guard["enabled"] else None,
                 vpn_processes=vpn_procs,
             )
+            auto_vpn_procs: list[str] = []
+            if has_real_vpn and can_dns_bypass:
+                prot_low = {p.lower() for p in guard["processes"]} if guard["enabled"] else set()
+                vpn_low = {p.lower() for p in vpn_procs}
+                with self._lock:
+                    proc_stats = dict(self._last_stalled_direct_procs)
+                    optout = set(self._manual_vpn_proc_optout)
+                    for p_name, counts in proc_stats.items():
+                        low = p_name.lower()
+                        if (
+                            not low
+                            or low == "system"
+                            or low in _NON_AUTO_VPN_PROCESSES
+                            or low in _INTERNAL_PROXY_PROCESSES
+                            or low in prot_low
+                            or low in vpn_low
+                            or low in optout
+                        ):
+                            continue
+                        if counts.get("healthy", 0) > 0:
+                            self._proc_stall_strikes.pop(low, None)
+                        elif counts.get("stalled", 0) >= 1:
+                            strikes = self._proc_stall_strikes.get(low, 0) + 1
+                            if counts.get("stalled", 0) >= 2 or strikes >= 2:
+                                self._proc_stall_strikes.pop(low, None)
+                                auto_vpn_procs.append(p_name)
+                            else:
+                                self._proc_stall_strikes[low] = strikes
         finally:
             storage.close()
 
         healed: list[dict[str, Any]] = []
-        if not candidates:
+        if not candidates and not auto_vpn_procs:
             with self._lock:
                 events = list(self.recent_events)
             return {"connections": connections, "healed": healed, "events": events}
 
         bypass = detect_bypass_active()
-        net = await detect_network_fingerprint(timeout=timeout)
-        dpi_orch = DpiLayerOrchestrator()
         any_saved = False
         dpi_or_vpn_changed = False
         winws2_changed = False
@@ -3153,270 +3529,300 @@ class RealtimeConnectionMonitor:
         has_new_domain = False
         bypass_fell = not bypass
 
-        # Load DB state and filter pinned domains BEFORE awaiting network probes concurrently
-        storage = Storage(backend.db_path)
-        try:
-            net_key = storage.upsert_network(net)
-            backend._seed_default_strategies(storage)
-            strategy_pool = storage.get_strategies()
-            has_real_vpn = storage.has_usable_vpn()
-            can_dns_bypass = storage.get_setting("stack_mode", "hybrid").strip().lower() != "dpi_only"
-            active_decisions = {
-                (d.domain.lower(), d.protocol): d for d in storage.get_decisions(net_key, active_only=False)
-            }
-            pinned_domains = {
-                str(r[0]).lower()
-                for r in storage.conn.execute("SELECT DISTINCT domain FROM decisions WHERE pinned = 1").fetchall()
-            }
-        finally:
-            storage.close()
-
-        eligible: list[tuple[str, str, str, Decision | None]] = []
-        now_cd = time.monotonic()
-        with self._lock:
-            for dom, proc_name, reason in candidates:
-                existing = active_decisions.get((dom.lower(), Protocol.TLS))
-                if dom.lower() in pinned_domains or (existing is not None and getattr(existing, "pinned", False)):
-                    # User explicitly pinned this working rule — never churn it automatically!
-                    continue
-                if existing is None:
-                    cd_sec = min(self.cooldown_sec, 6.0)
-                else:
-                    prev_fails = existing.consecutive_fails
-                    cd_sec = min(300.0, self.cooldown_sec * (2 ** min(max(prev_fails, 0), 4)))
-                self.cooldown_until[dom] = now_cd + cd_sec
-                eligible.append((dom, proc_name, reason, existing))
-
-        if not eligible:
+        for proc_to_vpn in auto_vpn_procs:
+            if hasattr(backend, "add_vpn_process"):
+                backend.add_vpn_process(proc_to_vpn, net_key=net_key, apply=False)
+            else:
+                st_vp = Storage(backend.db_path)
+                try:
+                    cur_vp = parse_process_list(st_vp.get_setting(f"vpn_processes:{net_key}", ""))
+                    if all(x.lower() != proc_to_vpn.lower() for x in cur_vp):
+                        cur_vp.append(proc_to_vpn)
+                        st_vp.set_setting(f"vpn_processes:{net_key}", ", ".join(cur_vp))
+                finally:
+                    st_vp.close()
+            any_saved = True
+            dpi_or_vpn_changed = True
+            singbox_changed = True
+            has_new_domain = True
             with self._lock:
-                events = list(self.recent_events)
-            return {"connections": connections, "healed": healed, "events": events}
+                self.auto_healed_count += 1
+            action_txt = "Авто-VPN процесса (UDP/TCP таймаут напрямую) -> vpn/vpn-proc"
+            self.record_event(proc_to_vpn, proc_to_vpn, action_txt, "vpn", "vpn-proc")
+            healed.append(
+                {
+                    "domain": proc_to_vpn,
+                    "process": proc_to_vpn,
+                    "layer": "vpn",
+                    "strategy_id": "vpn-proc",
+                    "reason": "stalled non-web direct traffic",
+                }
+            )
 
-        procs_pre = backend._collect_processes_state() if hasattr(backend, "_collect_processes_state") else {}
-        winws_running_pre = bool((procs_pre.get("winws2") or {}).get("running"))
+        if candidates:
+            net = await detect_network_fingerprint(timeout=timeout)
+            dpi_orch = DpiLayerOrchestrator()
 
-        def _reload_winws2_now() -> dict[str, Any]:
-            if hasattr(backend, "reload_winws2_if_changed"):
-                res = backend.reload_winws2_if_changed(min_interval_sec=0.0, defer_if_active=bool(bypass))
-                return res if isinstance(res, dict) else {"ok": True}
-            if hasattr(backend, "reload_winws2"):
-                res = backend.reload_winws2()
-                return res if isinstance(res, dict) else {"ok": True}
-            if hasattr(backend, "trigger_apply_configs"):
-                backend.trigger_apply_configs()
-            return {"ok": True}
-
-        new_direct_test_doms = [dom for dom, _proc, _reason, existing in eligible if existing is None]
-        pre_excluded_for_direct: set[str] = set()
-        if new_direct_test_doms and winws_running_pre and _is_admin():
-            st_pre = Storage(backend.db_path)
+            # Load DB state and filter pinned domains BEFORE awaiting network probes concurrently
+            storage = Storage(backend.db_path)
             try:
-                for dom in new_direct_test_doms:
-                    st_pre.save_decision(
-                        Decision(
-                            network_key=net_key,
-                            domain=dom,
-                            protocol=Protocol.TLS,
-                            layer="direct",
-                            strategy_id=None,
-                            status="active",
-                            consecutive_fails=0,
-                        )
-                    )
+                net_key = storage.upsert_network(net)
+                backend._seed_default_strategies(storage)
+                strategy_pool = storage.get_strategies()
+                has_real_vpn = storage.has_usable_vpn()
+                can_dns_bypass = storage.get_setting("stack_mode", "hybrid").strip().lower() != "dpi_only"
+                active_decisions = {
+                    (d.domain.lower(), d.protocol): d for d in storage.get_decisions(net_key, active_only=False)
+                }
+                pinned_domains = {
+                    str(r[0]).lower()
+                    for r in storage.conn.execute("SELECT DISTINCT domain FROM decisions WHERE pinned = 1").fetchall()
+                }
             finally:
-                st_pre.close()
-            pre_res = _reload_winws2_now()
-            if not pre_res.get("deferred"):
-                pre_excluded_for_direct.update(d.lower() for d in new_direct_test_doms)
-                await asyncio.sleep(0.25)
+                storage.close()
 
-        probes_list = await asyncio.gather(
-            *(run_domain_probes(dom, timeout=timeout) for dom, _proc, _reason, _ex in eligible)
-        )
-        ordered_tls_ids = [s.id for s in _ordered_pool(strategy_pool, Protocol.TLS) if s.args_template]
-
-        storage = Storage(backend.db_path)
-        try:
-            for (dom, proc_name, reason, existing), probes in zip(eligible, probes_list):
-                if existing is None and probes.tcp.result == "refused":
-                    # Port closed/refused on remote host (not DPI/block); never persist direct/dpi noise
-                    continue
-                report = classify_probes(domain=dom, probes=probes, network=net, bypass_active=bypass)
-                storage.save_verdict(net_key, report, protocol=Protocol.TLS)
-
-                ip = probes.tcp.target_ip or (
-                    probes.dns.doh_ips[0]
-                    if probes.dns.doh_ips
-                    else (probes.dns.system_ips[0] if probes.dns.system_ips else "127.0.0.1")
-                )
-
-                # If bypass is already active and TLS actually failed (not just a QUIC-only timeout) -> promote fallback!
-                tls_failed = any(
-                    v in report.verdicts
-                    for v in (VerdictClass.SNI_DPI, VerdictClass.THROTTLE, VerdictClass.IP_BLOCK, VerdictClass.UNKNOWN)
-                )
-                tls_broken = (tls_failed or "circular" in reason) and (
-                    "SYN_SENT" in reason
-                    or "Clash stall" in reason
-                    or "circular" in reason
-                    or (existing is not None and existing.layer == "dpi" and bypass)
-                )
-                wants_smart_dns = (
-                    not has_real_vpn
-                    and can_dns_bypass
-                    and (VerdictClass.IP_BLOCK in report.verdicts or is_geoblock_or_ai_domain(dom))
-                    and (tls_failed or existing is None or existing.layer != "dns")
-                )
-                if existing is not None and existing.layer == "dns" and bypass and tls_broken and can_dns_bypass:
-                    if existing.fallback_strategies:
-                        new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
-                        action = f"DNS fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+            eligible: list[tuple[str, str, str, Decision | None]] = []
+            now_cd = time.monotonic()
+            with self._lock:
+                for dom, proc_name, reason in candidates:
+                    existing = active_decisions.get((dom.lower(), Protocol.TLS))
+                    if dom.lower() in pinned_domains or (existing is not None and getattr(existing, "pinned", False)):
+                        # User explicitly pinned this working rule — never churn it automatically!
+                        continue
+                    if existing is None:
+                        cd_sec = min(self.cooldown_sec, 6.0)
                     else:
-                        new_dec = await DnsLayerOrchestrator().roll_dns_for_domain(
-                            dom,
-                            network_key=net_key,
-                            storage=storage,
-                            timeout=min(timeout, 1.5),
-                        )
-                        storage.save_decision(new_dec)
-                        action = f"Подбор DNS ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
-                elif wants_smart_dns and (existing is None or existing.layer != "dns"):
-                    new_dec = await DnsLayerOrchestrator().roll_dns_for_domain(
-                        dom,
-                        network_key=net_key,
-                        storage=storage,
-                        timeout=min(timeout, 1.5),
-                    )
-                    storage.save_decision(new_dec)
-                    action = f"SmartDNS ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
-                elif existing is not None and existing.layer == "dpi" and bypass and tls_broken:
-                    recovered_direct = False
-                    if winws_running_pre and _is_admin():
-                        direct_dec = Decision(
-                            network_key=net_key,
-                            domain=dom,
-                            protocol=Protocol.TLS,
-                            layer="direct",
-                            strategy_id=None,
-                            status="active",
-                            consecutive_fails=0,
-                        )
-                        storage.save_decision(direct_dec)
-                        pre_res = _reload_winws2_now()
-                        if not pre_res.get("deferred"):
-                            await asyncio.sleep(0.25)
-                            direct_probes = await run_domain_probes(dom, timeout=timeout)
-                            direct_report = classify_probes(
-                                domain=dom, probes=direct_probes, network=net, bypass_active=False
-                            )
-                            direct_blocked = any(
-                                v in direct_report.verdicts
-                                for v in (
-                                    VerdictClass.SNI_DPI,
-                                    VerdictClass.THROTTLE,
-                                    VerdictClass.IP_BLOCK,
-                                    VerdictClass.PROTOCOL_BLOCK,
-                                    VerdictClass.DNS_POISON,
-                                    VerdictClass.UNKNOWN,
+                        prev_fails = existing.consecutive_fails
+                        cd_sec = min(300.0, self.cooldown_sec * (2 ** min(max(prev_fails, 0), 4)))
+                    self.cooldown_until[dom] = now_cd + cd_sec
+                    eligible.append((dom, proc_name, reason, existing))
+
+            if eligible:
+                procs_pre = backend._collect_processes_state() if hasattr(backend, "_collect_processes_state") else {}
+                winws_running_pre = bool((procs_pre.get("winws2") or {}).get("running"))
+
+                def _reload_winws2_now() -> dict[str, Any]:
+                    if hasattr(backend, "reload_winws2_if_changed"):
+                        res = backend.reload_winws2_if_changed(min_interval_sec=0.0, defer_if_active=bool(bypass))
+                        return res if isinstance(res, dict) else {"ok": True}
+                    if hasattr(backend, "reload_winws2"):
+                        res = backend.reload_winws2()
+                        return res if isinstance(res, dict) else {"ok": True}
+                    if hasattr(backend, "trigger_apply_configs"):
+                        backend.trigger_apply_configs()
+                    return {"ok": True}
+
+                new_direct_test_doms = [dom for dom, _proc, _reason, existing in eligible if existing is None]
+                pre_excluded_for_direct: set[str] = set()
+                if new_direct_test_doms and winws_running_pre and _is_admin():
+                    st_pre = Storage(backend.db_path)
+                    try:
+                        for dom in new_direct_test_doms:
+                            st_pre.save_decision(
+                                Decision(
+                                    network_key=net_key,
+                                    domain=dom,
+                                    protocol=Protocol.TLS,
+                                    layer="direct",
+                                    strategy_id=None,
+                                    status="active",
+                                    consecutive_fails=0,
                                 )
                             )
-                            if not direct_blocked:
-                                new_dec = direct_dec
-                                pre_excluded_for_direct.add(dom.lower())
-                                action = f"Direct работает ({reason}) -> direct/—"
-                                recovered_direct = True
-                    if not recovered_direct:
-                        # If no fallbacks remain and no real VPN is configured, rotate to next untested ordered TLS strategies
-                        if not existing.fallback_strategies and not has_real_vpn and ordered_tls_ids:
-                            if existing.strategy_id in ordered_tls_ids:
-                                idx = ordered_tls_ids.index(existing.strategy_id)
-                                rotated = ordered_tls_ids[idx + 1 :] + ordered_tls_ids[:idx]
-                            else:
-                                rotated = [sid for sid in ordered_tls_ids if sid != existing.strategy_id]
-                            if rotated:
-                                existing.fallback_strategies = rotated[:3]
-                        new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
-                        action = f"Fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
-                else:
-                    new_dec = await dpi_orch.evaluate_domain(
-                        domain=dom,
-                        ip=ip,
-                        verdicts=report.verdicts,
-                        network_key=net_key,
-                        protocol=Protocol.TLS,
-                        candidates=strategy_pool,
-                        live_eval=True,
-                        bin_dir=backend.bin_dir,
-                        vpn_available=has_real_vpn,
-                    )
-                    if (
-                        bypass
-                        and new_dec.layer == "direct"
-                        and existing is not None
-                        and existing.status == "active"
-                        and (
-                            existing.layer in ("dpi", "dns")
-                            or (
-                                existing.layer == "vpn"
-                                and (has_real_vpn or getattr(existing, "pinned", False))
-                            )
-                        )
-                    ):
-                        # Self-probe protection: preserve active bypass rules when probes succeed through them
-                        continue
-                    # Avoid blackholing into a fake/empty VPN when no real VPN node exists
-                    if new_dec.layer == "vpn" and not has_real_vpn and ordered_tls_ids:
-                        first_tls_id = ordered_tls_ids[0]
-                        new_dec = Decision(
-                            network_key=net_key,
-                            domain=dom,
-                            protocol=Protocol.TLS,
-                            layer="dpi",
-                            strategy_id=first_tls_id,
-                            fallback_strategies=[sid for sid in ordered_tls_ids if sid != first_tls_id][:3],
-                        )
-                    storage.save_decision(new_dec)
-                    action = f"Автоподбор ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                    finally:
+                        st_pre.close()
+                    pre_res = _reload_winws2_now()
+                    if not pre_res.get("deferred"):
+                        pre_excluded_for_direct.update(d.lower() for d in new_direct_test_doms)
+                        await asyncio.sleep(0.25)
 
-                any_saved = True
-                decision_changed = (
-                    existing is None
-                    or existing.layer != new_dec.layer
-                    or existing.strategy_id != new_dec.strategy_id
-                    or existing.status != new_dec.status
+                probes_list = await asyncio.gather(
+                    *(run_domain_probes(dom, timeout=timeout) for dom, _proc, _reason, _ex in eligible)
                 )
-                if decision_changed:
-                    if existing is None:
-                        has_new_domain = True
-                    elif existing.layer == "dpi" and bypass and tls_broken:
-                        bypass_fell = True
-                    if new_dec.layer in ("dpi", "vpn", "dns"):
-                        dpi_or_vpn_changed = True
-                    if new_dec.layer == "direct":
-                        if dom.lower() not in pre_excluded_for_direct:
-                            winws2_changed = True
-                    elif new_dec.layer == "dpi" or (
-                        existing is not None and existing.layer == "dpi" and new_dec.layer != "dpi"
-                    ):
-                        winws2_changed = True
-                    if new_dec.layer in ("vpn", "dns") or (
-                        existing is not None and existing.layer in ("vpn", "dns") and new_dec.layer != existing.layer
-                    ):
-                        singbox_changed = True
-                with self._lock:
-                    self.auto_healed_count += 1
-                self.record_event(dom, proc_name, action, new_dec.layer, new_dec.strategy_id)
-                healed.append(
-                    {
-                        "domain": dom,
-                        "process": proc_name,
-                        "layer": new_dec.layer,
-                        "strategy_id": new_dec.strategy_id,
-                        "reason": reason,
-                    }
-                )
-        finally:
-            storage.close()
+                ordered_tls_ids = [s.id for s in _ordered_pool(strategy_pool, Protocol.TLS) if s.args_template]
+
+                storage = Storage(backend.db_path)
+                try:
+                    for (dom, proc_name, reason, existing), probes in zip(eligible, probes_list):
+                        if existing is None and probes.tcp.result == "refused":
+                            # Port closed/refused on remote host (not DPI/block); never persist direct/dpi noise
+                            continue
+                        report = classify_probes(domain=dom, probes=probes, network=net, bypass_active=bypass)
+                        storage.save_verdict(net_key, report, protocol=Protocol.TLS)
+
+                        ip = probes.tcp.target_ip or (
+                            probes.dns.doh_ips[0]
+                            if probes.dns.doh_ips
+                            else (probes.dns.system_ips[0] if probes.dns.system_ips else "127.0.0.1")
+                        )
+
+                        # If bypass is already active and TLS actually failed (not just a QUIC-only timeout) -> promote fallback!
+                        tls_failed = any(
+                            v in report.verdicts
+                            for v in (VerdictClass.SNI_DPI, VerdictClass.THROTTLE, VerdictClass.IP_BLOCK, VerdictClass.UNKNOWN)
+                        )
+                        tls_broken = (tls_failed or "circular" in reason) and (
+                            "SYN_SENT" in reason
+                            or "Clash stall" in reason
+                            or "circular" in reason
+                            or (existing is not None and existing.layer == "dpi" and bypass)
+                        )
+                        wants_smart_dns = (
+                            not has_real_vpn
+                            and can_dns_bypass
+                            and (VerdictClass.IP_BLOCK in report.verdicts or is_geoblock_or_ai_domain(dom))
+                            and (tls_failed or existing is None or existing.layer != "dns")
+                        )
+                        if existing is not None and existing.layer == "dns" and bypass and tls_broken and can_dns_bypass:
+                            if existing.fallback_strategies:
+                                new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
+                                action = f"DNS fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                            else:
+                                new_dec = await DnsLayerOrchestrator().roll_dns_for_domain(
+                                    dom,
+                                    network_key=net_key,
+                                    storage=storage,
+                                    timeout=min(timeout, 1.5),
+                                )
+                                storage.save_decision(new_dec)
+                                action = f"Подбор DNS ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                        elif wants_smart_dns and (existing is None or existing.layer != "dns"):
+                            new_dec = await DnsLayerOrchestrator().roll_dns_for_domain(
+                                dom,
+                                network_key=net_key,
+                                storage=storage,
+                                timeout=min(timeout, 1.5),
+                            )
+                            storage.save_decision(new_dec)
+                            action = f"SmartDNS ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                        elif existing is not None and existing.layer == "dpi" and bypass and tls_broken:
+                            recovered_direct = False
+                            if winws_running_pre and _is_admin():
+                                direct_dec = Decision(
+                                    network_key=net_key,
+                                    domain=dom,
+                                    protocol=Protocol.TLS,
+                                    layer="direct",
+                                    strategy_id=None,
+                                    status="active",
+                                    consecutive_fails=0,
+                                )
+                                storage.save_decision(direct_dec)
+                                pre_res = _reload_winws2_now()
+                                if not pre_res.get("deferred"):
+                                    await asyncio.sleep(0.25)
+                                    direct_probes = await run_domain_probes(dom, timeout=timeout)
+                                    direct_report = classify_probes(
+                                        domain=dom, probes=direct_probes, network=net, bypass_active=False
+                                    )
+                                    direct_blocked = any(
+                                        v in direct_report.verdicts
+                                        for v in (
+                                            VerdictClass.SNI_DPI,
+                                            VerdictClass.THROTTLE,
+                                            VerdictClass.IP_BLOCK,
+                                            VerdictClass.PROTOCOL_BLOCK,
+                                            VerdictClass.DNS_POISON,
+                                            VerdictClass.UNKNOWN,
+                                        )
+                                    )
+                                    if not direct_blocked:
+                                        new_dec = direct_dec
+                                        pre_excluded_for_direct.add(dom.lower())
+                                        action = f"Direct работает ({reason}) -> direct/—"
+                                        recovered_direct = True
+                            if not recovered_direct:
+                                # If no fallbacks remain and no real VPN is configured, rotate to next untested ordered TLS strategies
+                                if not existing.fallback_strategies and not has_real_vpn and ordered_tls_ids:
+                                    if existing.strategy_id in ordered_tls_ids:
+                                        idx = ordered_tls_ids.index(existing.strategy_id)
+                                        rotated = ordered_tls_ids[idx + 1 :] + ordered_tls_ids[:idx]
+                                    else:
+                                        rotated = [sid for sid in ordered_tls_ids if sid != existing.strategy_id]
+                                    if rotated:
+                                        existing.fallback_strategies = rotated[:3]
+                                new_dec = promote_fallback_on_failure(storage, existing, vpn_available=has_real_vpn)
+                                action = f"Fallback ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+                        else:
+                            new_dec = await dpi_orch.evaluate_domain(
+                                domain=dom,
+                                ip=ip,
+                                verdicts=report.verdicts,
+                                network_key=net_key,
+                                protocol=Protocol.TLS,
+                                candidates=strategy_pool,
+                                live_eval=True,
+                                bin_dir=backend.bin_dir,
+                                vpn_available=has_real_vpn,
+                            )
+                            if (
+                                bypass
+                                and new_dec.layer == "direct"
+                                and existing is not None
+                                and existing.status == "active"
+                                and (
+                                    existing.layer in ("dpi", "dns")
+                                    or (
+                                        existing.layer == "vpn"
+                                        and (has_real_vpn or getattr(existing, "pinned", False))
+                                    )
+                                )
+                            ):
+                                # Self-probe protection: preserve active bypass rules when probes succeed through them
+                                continue
+                            # Avoid blackholing into a fake/empty VPN when no real VPN node exists
+                            if new_dec.layer == "vpn" and not has_real_vpn and ordered_tls_ids:
+                                first_tls_id = ordered_tls_ids[0]
+                                new_dec = Decision(
+                                    network_key=net_key,
+                                    domain=dom,
+                                    protocol=Protocol.TLS,
+                                    layer="dpi",
+                                    strategy_id=first_tls_id,
+                                    fallback_strategies=[sid for sid in ordered_tls_ids if sid != first_tls_id][:3],
+                                )
+                            storage.save_decision(new_dec)
+                            action = f"Автоподбор ({reason}) -> {new_dec.layer}/{new_dec.strategy_id or '—'}"
+
+                        any_saved = True
+                        decision_changed = (
+                            existing is None
+                            or existing.layer != new_dec.layer
+                            or existing.strategy_id != new_dec.strategy_id
+                            or existing.status != new_dec.status
+                        )
+                        if decision_changed:
+                            if existing is None:
+                                has_new_domain = True
+                            elif existing.layer == "dpi" and bypass and tls_broken:
+                                bypass_fell = True
+                            if new_dec.layer in ("dpi", "vpn", "dns"):
+                                dpi_or_vpn_changed = True
+                            if new_dec.layer == "direct":
+                                if dom.lower() not in pre_excluded_for_direct:
+                                    winws2_changed = True
+                            elif new_dec.layer == "dpi" or (
+                                existing is not None and existing.layer == "dpi" and new_dec.layer != "dpi"
+                            ):
+                                winws2_changed = True
+                            if new_dec.layer in ("vpn", "dns") or (
+                                existing is not None and existing.layer in ("vpn", "dns") and new_dec.layer != existing.layer
+                            ):
+                                singbox_changed = True
+                        with self._lock:
+                            self.auto_healed_count += 1
+                        self.record_event(dom, proc_name, action, new_dec.layer, new_dec.strategy_id)
+                        healed.append(
+                            {
+                                "domain": dom,
+                                "process": proc_name,
+                                "layer": new_dec.layer,
+                                "strategy_id": new_dec.strategy_id,
+                                "reason": reason,
+                            }
+                        )
+                finally:
+                    storage.close()
 
         if any_saved:
             self.invalidate_scan_cache()

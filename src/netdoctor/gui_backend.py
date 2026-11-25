@@ -51,6 +51,7 @@ from netdoctor.orchestrators import (
     RealtimeConnectionMonitor,
     _INTERNAL_PROXY_PROCESSES,
     _is_external_ip,
+    _node_has_healthy_connections,
     _parse_clash_conn_age_sec,
     build_unlocker_protection_context,
     is_dns_infra_domain,
@@ -713,13 +714,14 @@ class GuiBackend:
             vpn_health_map = storage.get_vpn_node_health_map()
             vpn_policy = storage.get_vpn_selection_policy()
             active_dns = self.orchestrator.dns.get_active_dns(storage)
+            base_dns = self.orchestrator.dns.get_base_dns(storage, net_key=net_key)
             all_dns = self.orchestrator.dns.get_all_dns_servers(storage)
             game_filter = storage.get_setting("game_filter", "0") == "1"
             auto_start_protection = storage.get_setting("auto_start_protection", "0") == "1"
             auto_heal_enabled = storage.get_setting("auto_heal_enabled", "1") != "0"
             byedpi_fallback = storage.get_setting("byedpi_fallback", "0") == "1"
             winws2_debug_log = storage.get_setting("winws2_debug_log", "0") == "1"
-            vpn_processes = parse_process_list(storage.get_setting("vpn_processes", ""))
+            vpn_processes = self.get_vpn_processes(storage, net_key=net_key)
             stack_mode = storage.get_setting("stack_mode", "hybrid").strip() or "hybrid"
             if stack_mode not in ("hybrid", "dpi_only"):
                 stack_mode = "hybrid"
@@ -829,6 +831,8 @@ class GuiBackend:
             "live_connections_count": orchestrators["realtime"]["active_connections"],
             "active_dns": self._merge_dns_ping_cache([active_dns])[0],
             "active_dns_id": active_dns["id"],
+            "base_dns": self._merge_dns_ping_cache([base_dns])[0] if base_dns else None,
+            "base_dns_id": str(base_dns["id"]) if base_dns else "",
             "dns_alert": dns_alert,
             "dns_servers_count": len(all_dns),
             "game_filter": game_filter,
@@ -1075,7 +1079,18 @@ class GuiBackend:
                             and active_leaf != top_tag
                             and active_leaf not in ("vpn-auto", "direct")
                         ):
-                            clash_client.close_connections_by_node_sync(active_leaf)
+                            has_healthy_conns = False
+                            try:
+                                raw_c = (clash_client.get_connections_sync() or {}).get("connections") or []
+                                has_healthy_conns = _node_has_healthy_connections(
+                                    [c for c in raw_c if isinstance(c, dict)],
+                                    active_leaf,
+                                )
+                            except Exception:  # noqa: BLE001
+                                has_healthy_conns = False
+                            is_quar = bool(active_entry and active_entry.get("cb_state") == "open")
+                            if not has_healthy_conns or is_quar:
+                                clash_client.close_connections_by_node_sync(active_leaf)
                         self.orchestrator.vpn._active_node_tag = top_tag
                         self.orchestrator.vpn._last_switch_ts = time.monotonic()
                         health["best_node"] = top_tag
@@ -1145,6 +1160,7 @@ class GuiBackend:
             servers = self.orchestrator.dns.get_all_dns_servers(storage)
             active = self.orchestrator.dns.get_active_dns(storage)
             net_key, _, _, _ = self._resolve_network_info(storage)
+            base_dns = self.orchestrator.dns.get_base_dns(storage, net_key=net_key)
             decisions = storage.get_decisions(net_key, active_only=True)
         finally:
             storage.close()
@@ -1160,12 +1176,26 @@ class GuiBackend:
             item["assigned_domains"] = sorted(set(assigned_map.get(str(item["id"]), [])))
         active_enriched = self._merge_dns_ping_cache([active])[0]
         active_enriched["assigned_domains"] = sorted(set(assigned_map.get(str(active_enriched["id"]), [])))
+        base_enriched = self._merge_dns_ping_cache([base_dns])[0] if base_dns else None
         return {
             "active_dns_id": active_enriched["id"],
             "active_dns": active_enriched,
+            "base_dns_id": str(base_enriched["id"]) if base_enriched else "",
+            "base_dns": base_enriched,
             "categories": list(DNS_CATEGORIES),
             "servers": enriched,
         }
+
+    def get_base_dns(self, storage: Storage | None = None, net_key: str | None = None) -> dict[str, Any] | None:
+        """Return currently configured base non-SmartDNS resolver for the active or specified network."""
+        own_st = storage is None
+        st = storage if storage is not None else Storage(self.db_path)
+        try:
+            nk = net_key or self._resolve_network_info(st)[0]
+            return self.orchestrator.dns.get_base_dns(st, net_key=nk)
+        finally:
+            if own_st:
+                st.close()
 
     def select_dns_server(self, dns_id: str) -> dict[str, Any]:
         """Select a built-in or custom DNS server, persist it, and regenerate sing-box.json."""
@@ -1177,6 +1207,9 @@ class GuiBackend:
             if match is None:
                 raise ValueError(f"Unknown DNS server ID: {clean_id}")
             storage.set_setting("active_dns_id", clean_id)
+            if str(match.get("category") or "").strip().lower() != "ai_bypass":
+                net_key, _, _, _ = self._resolve_network_info(storage)
+                storage.set_setting(f"base_dns_id:{net_key}", clean_id)
         finally:
             storage.close()
 
@@ -1283,6 +1316,61 @@ class GuiBackend:
         selected["ping_ms"] = best.get("ping_ms")
         selected["alive"] = best.get("alive")
         return selected
+
+    def roll_base_dns_sync(self, category: str | None = None) -> dict[str, Any]:
+        """Probe ordinary non-SmartDNS resolvers via real DoH/DNS resolution and apply the fastest working one."""
+        storage = Storage(self.db_path)
+        try:
+            net_key, _, _, _ = self._resolve_network_info(storage)
+            if category is not None:
+                roll_res = _run_coro_sync(self.orchestrator.dns.roll_base_dns(storage, category=category))
+            else:
+                roll_res = _run_coro_sync(self.orchestrator.dns.roll_base_dns(storage))
+            selected = roll_res.get("selected")
+            active_dns = self.orchestrator.dns.get_active_dns(storage)
+            active_is_smart = str(active_dns.get("category") or "").strip().lower() == "ai_bypass"
+            with self._lock:
+                for item in (roll_res.get("all_results") or roll_res.get("results") or []):
+                    srv = item.get("server")
+                    sid = str(item.get("dns_id") or (srv.get("id") if isinstance(srv, dict) else "") or "")
+                    if sid and isinstance(srv, dict):
+                        cached = dict(srv)
+                        cached["alive"] = bool(item.get("ok"))
+                        cached["ping_ms"] = item.get("rtt_ms")
+                        self._cached_dns_pings[sid] = cached
+                if selected is not None:
+                    self._cached_dns_pings[str(selected["id"])] = dict(selected)
+            if selected is not None:
+                sel_id = str(selected["id"])
+                storage.set_setting(f"base_dns_id:{net_key}", sel_id)
+                if not active_is_smart:
+                    storage.set_setting("active_dns_id", sel_id)
+        finally:
+            storage.close()
+
+        if not selected:
+            return {
+                "ok": False,
+                "selected": None,
+                "active_dns": active_dns,
+                "tested": int(roll_res.get("tested") or 0),
+                "alive": 0,
+                "mode": "smartdns_split" if active_is_smart else "general",
+                "error": "Ни один обычный DNS-сервер не ответил в текущей сети",
+            }
+
+        self.trigger_apply_configs()
+        self._reload_running_services(singbox=True)
+        self.flush_windows_dns_cache()
+        return {
+            "ok": True,
+            "selected": selected,
+            "active_dns": active_dns,
+            "tested": int(roll_res.get("tested") or 0),
+            "alive": int(roll_res.get("alive") or 0),
+            "mode": "smartdns_split" if active_is_smart else "general",
+            "network_key": net_key,
+        }
 
     def roll_dns_for_domain_sync(self, domain: str) -> dict[str, Any]:
         """Roll all relevant bypass DNS servers for a specific domain, save best DNS decision, and apply configs."""
@@ -1431,27 +1519,93 @@ class GuiBackend:
         self._reload_running_services(winws2=True, singbox=True)
         return {"guard": guard, "applied": applied}
 
-    def get_vpn_processes(self, storage: Storage | None = None) -> list[str]:
-        """Return list of user-configured `.exe` processes forced through `vpn-select`."""
+    def get_vpn_processes(
+        self,
+        storage: Storage | None = None,
+        net_key: str | None = None,
+    ) -> list[str]:
+        """Return list of `.exe` processes forced through `vpn-select` for the active or specified network."""
         own_st = storage is None
         st = storage if storage is not None else Storage(self.db_path)
         try:
-            return parse_process_list(st.get_setting("vpn_processes", ""))
+            nk = net_key or self._resolve_network_info(st)[0]
+            per_net = st.get_setting(f"vpn_processes:{nk}", None)
+            raw = per_net if per_net is not None else st.get_setting("vpn_processes", "")
+            return parse_process_list(raw)
         finally:
             if own_st:
                 st.close()
 
-    def set_vpn_processes(self, raw_text: str) -> dict[str, Any]:
-        """Persist comma/newline-separated `.exe` names routed via VPN, rebuild configs, and reload sing-box."""
+    def set_vpn_processes(
+        self,
+        raw_text: str,
+        *,
+        net_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist `.exe` names routed via VPN for the current network, rebuild configs, and reload sing-box."""
         procs = parse_process_list(raw_text)
         storage = Storage(self.db_path)
         try:
-            storage.set_setting("vpn_processes", ", ".join(procs))
+            nk = net_key or self._resolve_network_info(storage)[0]
+            prev = self.get_vpn_processes(storage, net_key=nk)
+            prev_low = {p.lower() for p in prev}
+            new_low = {p.lower() for p in procs}
+            with self.orchestrator.monitor._lock:
+                self.orchestrator.monitor._manual_vpn_proc_optout.update(prev_low - new_low)
+                self.orchestrator.monitor._manual_vpn_proc_optout.difference_update(new_low)
+            storage.set_setting(f"vpn_processes:{nk}", ", ".join(procs))
         finally:
             storage.close()
         applied = self.trigger_apply_configs()
         self._reload_running_services(singbox=True)
-        return {"vpn_processes": procs, "applied": applied}
+        return {"vpn_processes": procs, "network_key": nk, "applied": applied}
+
+    def add_vpn_process(
+        self,
+        proc_name: str,
+        *,
+        net_key: str | None = None,
+        apply: bool = False,
+    ) -> list[str]:
+        """Ensure `proc_name` is included in per-network `vpn_processes` (clear manual opt-out)."""
+        parsed = parse_process_list(proc_name)
+        if not parsed:
+            return self.get_vpn_processes(net_key=net_key)
+        clean = parsed[0]
+        storage = Storage(self.db_path)
+        try:
+            nk = net_key or self._resolve_network_info(storage)[0]
+            cur = self.get_vpn_processes(storage, net_key=nk)
+            if all(p.lower() != clean.lower() for p in cur):
+                cur.append(clean)
+                storage.set_setting(f"vpn_processes:{nk}", ", ".join(cur))
+            with self.orchestrator.monitor._lock:
+                self.orchestrator.monitor._manual_vpn_proc_optout.discard(clean.lower())
+        finally:
+            storage.close()
+        if apply:
+            self.trigger_apply_configs()
+            self._reload_running_services(singbox=True)
+        return cur
+
+    def toggle_vpn_process(self, proc_name: str) -> dict[str, Any]:
+        """Toggle whether a process `.exe` routes via `vpn-select` in the active network."""
+        parsed = parse_process_list(proc_name)
+        if not parsed:
+            raise ValueError("Не указано имя процесса (.exe)")
+        clean = parsed[0]
+        cur = self.get_vpn_processes()
+        low = clean.lower()
+        enabled_now = not any(p.lower() == low for p in cur)
+        updated = [*cur, clean] if enabled_now else [p for p in cur if p.lower() != low]
+        res = self.set_vpn_processes(", ".join(updated))
+        return {
+            "enabled": enabled_now,
+            "process": clean,
+            "vpn_processes": res["vpn_processes"],
+            "network_key": res["network_key"],
+            "applied": res["applied"],
+        }
 
     def get_auto_heal_enabled(self, storage: Storage | None = None) -> bool:
         """Return True if Live-Radar real-time auto-heal is enabled."""
@@ -1499,6 +1653,95 @@ class GuiBackend:
         applied = self.trigger_apply_configs()
         self._reload_running_services(winws2=True, singbox=True)
         return {"ok": True, "removed": removed, "network_key": net_key, "applied": applied}
+
+    def auto_tune_all_sync(
+        self,
+        *,
+        domains: list[str] | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        """One-click full-stack recovery & tuning: reset broken state, pick best DoH DNS, re-probe VPN, re-diagnose core domains, reload & test."""
+        target_domains = list(
+            domains
+            or [
+                "discord.com",
+                "discord.gg",
+                "discordapp.com",
+                "youtube.com",
+                "googlevideo.com",
+                "telegram.org",
+                "instagram.com",
+                "x.com",
+                "rutracker.org",
+            ]
+        )
+        storage = Storage(self.db_path)
+        try:
+            net_key, _, _, _ = self._resolve_network_info(storage)
+            reset = storage.reset_unhealthy_state(net_key)
+            roll_res = _run_coro_sync(self.orchestrator.dns.roll_base_dns(storage, timeout=timeout))
+            selected_dns = roll_res.get("selected")
+            active_dns = self.orchestrator.dns.get_active_dns(storage)
+            active_is_smart = str(active_dns.get("category") or "").strip().lower() == "ai_bypass"
+            active_is_weak_non_doh = (
+                not str(active_dns.get("doh_url") or "").strip().startswith("https://")
+                or bool(active_dns.get("doh_broken"))
+            )
+            with self._lock:
+                for item in (roll_res.get("all_results") or roll_res.get("results") or []):
+                    srv = item.get("server")
+                    sid = str(item.get("dns_id") or (srv.get("id") if isinstance(srv, dict) else "") or "")
+                    if sid and isinstance(srv, dict):
+                        cached = dict(srv)
+                        cached["alive"] = bool(item.get("ok"))
+                        cached["ping_ms"] = item.get("rtt_ms")
+                        self._cached_dns_pings[sid] = cached
+                if selected_dns is not None:
+                    self._cached_dns_pings[str(selected_dns["id"])] = dict(selected_dns)
+            if selected_dns is not None:
+                sel_id = str(selected_dns["id"])
+                storage.set_setting(f"base_dns_id:{net_key}", sel_id)
+                if (not active_is_smart) or active_is_weak_non_doh:
+                    storage.set_setting("active_dns_id", sel_id)
+            has_vpn_nodes = bool(storage.get_all_subscription_nodes())
+        finally:
+            storage.close()
+
+        vpn_alive = 0
+        vpn_best: str | None = None
+        if has_vpn_nodes:
+            try:
+                probed_vpn = self.probe_all_vpn_nodes()
+                alive_vpn = [n for n in probed_vpn if n.get("alive") and not n.get("is_placeholder")]
+                vpn_alive = len(alive_vpn)
+                if alive_vpn:
+                    vpn_best = str(alive_vpn[0].get("tag") or "") or None
+            except Exception:  # noqa: BLE001
+                pass
+
+        diag_rows = self.run_diag_sync(domains=target_domains, live_eval=False, timeout=timeout)
+        self._reload_running_services(winws2=True, singbox=True)
+        self.flush_windows_dns_cache()
+
+        proc_state = self._collect_processes_state()
+        conn_report: dict[str, Any] | None = None
+        if (proc_state.get("winws2") or {}).get("running") or (proc_state.get("sing-box") or {}).get("running"):
+            conn_report = self.run_connectivity_tests(
+                include_key_services=True,
+                include_picked_domains=False,
+                timeout=min(timeout + 1.0, 3.0),
+            )
+
+        return {
+            "ok": True,
+            "network_key": net_key,
+            "reset": reset,
+            "base_dns": selected_dns,
+            "vpn_alive": vpn_alive,
+            "vpn_best": vpn_best,
+            "diagnosed_count": len(diag_rows),
+            "connectivity": conn_report,
+        }
 
     def get_domain_rows(self, net_key: str | None = None) -> list[dict[str, Any]]:
         """Query decisions joined with verdicts and strategies for the active or specified network."""
@@ -2498,6 +2741,7 @@ class GuiBackend:
                 vpn_nodes = [VpnNode(**n) for n in storage.get_all_subscription_nodes()]
                 game_filter = storage.get_setting("game_filter", "0") == "1"
                 active_dns = self.orchestrator.dns.get_active_dns(storage)
+                base_dns = self.orchestrator.dns.get_base_dns(storage, net_key=net_key)
                 dns_catalog_map = {s["id"]: s for s in self.orchestrator.dns.get_all_dns_servers(storage)}
                 byedpi_fallback = storage.get_setting("byedpi_fallback", "0") == "1"
                 stack_mode = storage.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
@@ -2508,7 +2752,7 @@ class GuiBackend:
                     tun_stack = "gvisor"
                 active_preset_id, active_preset_name, active_preset = self._resolve_active_zapret_preset(storage)
                 base_preset_id, base_preset_name, base_preset = self._resolve_base_zapret_preset(storage)
-                vpn_processes = parse_process_list(storage.get_setting("vpn_processes", ""))
+                vpn_processes = self.get_vpn_processes(storage, net_key=net_key)
                 vpn_policy = storage.get_vpn_selection_policy()
                 health_map = storage.get_vpn_node_health_map()
                 quarantined_tags = {
@@ -2751,6 +2995,7 @@ class GuiBackend:
                 bypass_ips=exclude_ips,
                 primary_is_smartdns=primary_is_smartdns,
                 smartdns_domains=list(AI_GEOBLOCK_DOMAINS),
+                base_dns=base_dns,
             )
             sb_hash = hashlib.sha256(singbox_file.read_bytes()).hexdigest()
             sb_exe = self.bin_dir.resolve() / "sing-box.exe"
@@ -2786,6 +3031,7 @@ class GuiBackend:
                 "tun_stack": tun_stack,
                 "winws2_iface": effective_iface,
                 "vpn_processes": vpn_processes,
+                "base_dns": base_dns,
             }
 
     def get_tg_ws_secret(self, storage: Storage | None = None) -> str:

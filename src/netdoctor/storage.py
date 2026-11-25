@@ -1154,5 +1154,35 @@ class Storage:
             )
         return int(cur.rowcount or 0)
 
+    def reset_unhealthy_state(self, network_key: str) -> dict[str, int]:
+        """Clear stale/failing unpinned decisions and reset quarantined VPN nodes for a fresh auto-tune."""
+        stale_removed = self.cleanup_stale_decisions(network_key)
+        with self.conn:
+            cur_fail = self.conn.execute(
+                """
+                DELETE FROM decisions
+                WHERE network_key = ?
+                  AND COALESCE(pinned, 0) = 0
+                  AND (consecutive_fails >= 2 OR status != 'active')
+                """,
+                (network_key,),
+            )
+            cur_vpn = self.conn.execute(
+                """
+                UPDATE vpn_node_health
+                SET cb_state = 'closed',
+                    consecutive_fails = 0,
+                    quarantined_until = '',
+                    protocol_ok = 1,
+                    last_error = ''
+                WHERE cb_state != 'closed' OR consecutive_fails > 0
+                """
+            )
+        return {
+            "stale_removed": int(stale_removed),
+            "failing_removed": int(cur_fail.rowcount or 0),
+            "vpn_reset": int(cur_vpn.rowcount or 0),
+        }
+
     def close(self) -> None:
         self.conn.close()

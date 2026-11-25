@@ -1455,6 +1455,7 @@ def generate_singbox_config(
     bypass_ips: list[str] | None = None,
     primary_is_smartdns: bool = False,
     smartdns_domains: list[str] | None = None,
+    base_dns: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate sing-box 1.12+/1.14+ JSON configuration combining global + per-domain DoH/bypass DNS rules, Telegram proxy route, multi-VPN regional/auto/AI urltest/selector outbounds, and Clash API."""
     vpn_nodes = vpn_nodes or []
@@ -1587,6 +1588,66 @@ def generate_singbox_config(
             seen_vpn_procs.add(clean_p.lower())
             vpn_proc_list.append(clean_p)
 
+    has_usable_vpn = any(getattr(n, "enabled", True) and not is_placeholder_node(n) for n in vpn_nodes)
+
+    def _build_catalog_dns_entry(
+        srv: dict[str, Any],
+        tag: str,
+        *,
+        allow_broken_doh: bool = True,
+    ) -> dict[str, Any] | None:
+        badges = list(srv.get("badges") or [])
+        doh_url = str(srv.get("doh_url") or "")
+        srv_https = ("DoH" in badges) or doh_url.startswith("https://")
+        if not allow_broken_doh and bool(srv.get("doh_broken")):
+            srv_https = False
+        srv_path = "/dns-query"
+        srv_port: int | None = None
+        srv_sni: str | None = None
+        parsed_host: str | None = None
+        if doh_url.startswith("https://"):
+            parsed = urllib.parse.urlparse(doh_url)
+            if parsed.path:
+                srv_path = parsed.path
+            if parsed.port:
+                srv_port = parsed.port
+            parsed_host = parsed.hostname
+            if parsed_host and not _is_ip_address(parsed_host):
+                srv_sni = parsed_host
+
+        srv_ip = str(srv.get("ip") or "").strip()
+        if not _is_ip_address(srv_ip):
+            host_to_resolve = srv_ip or parsed_host
+            if host_to_resolve:
+                if _is_ip_address(host_to_resolve):
+                    srv_ip = host_to_resolve
+                else:
+                    if srv_https and not srv_sni:
+                        srv_sni = host_to_resolve
+                    cat_ip: str | None = None
+                    for cat_srv in (catalog_map or {}).values():
+                        cat_url = str(cat_srv.get("doh_url") or "")
+                        if cat_url.startswith("https://"):
+                            parsed_cat = urllib.parse.urlparse(cat_url)
+                            if (parsed_cat.hostname or "").lower() == host_to_resolve.lower() and _is_ip_address(
+                                str(cat_srv.get("ip") or "")
+                            ):
+                                cat_ip = str(cat_srv["ip"]).strip()
+                                break
+                    srv_ip = cat_ip or _resolve_host_ipv4(host_to_resolve) or ""
+        if not srv_ip:
+            return None
+        if not extra_dns_servers_sni and parsed_host is None:
+            srv_sni = None
+        return _build_singbox_dns_server_entry(
+            tag=tag,
+            server=srv_ip,
+            dns_type="https" if srv_https else "udp",
+            doh_path=srv_path,
+            tls_sni=srv_sni if srv_https else None,
+            server_port=srv_port,
+        )
+
     # 1. DNS configuration (sing-box 1.12+ / 1.14+ typed server format)
     primary_dns_entry = _build_singbox_dns_server_entry(
         tag="dns-doh",
@@ -1600,16 +1661,32 @@ def generate_singbox_config(
         primary_dns_entry,
         {"type": "local", "tag": "dns-local"},
     ]
+    vpn_dns_tag = "dns-doh"
+    vpn_outbound_resolver = "dns-doh"
     if primary_is_smartdns:
-        dns_servers.append(
-            _build_singbox_dns_server_entry(
-                tag="dns-public-doh",
-                server="1.1.1.1",
-                dns_type="https",
-                doh_path="/dns-query",
-                tls_sni="cloudflare-dns.com",
+        base_entry: dict[str, Any] | None = None
+        if isinstance(base_dns, dict) and str(base_dns.get("category") or "").strip().lower() != "ai_bypass":
+            base_entry = _build_catalog_dns_entry(base_dns, "dns-base", allow_broken_doh=False)
+        if base_entry is not None:
+            dns_servers.append(base_entry)
+            vpn_dns_tag = "dns-base"
+            vpn_outbound_resolver = "dns-base"
+        elif has_usable_vpn:
+            dns_servers.append(
+                {
+                    "type": "https",
+                    "tag": "dns-vpn",
+                    "server": "9.9.9.9",
+                    "path": "/dns-query",
+                    "tls": {"enabled": True, "server_name": "dns.quad9.net"},
+                    "detour": "vpn-select",
+                }
             )
-        )
+            vpn_dns_tag = "dns-vpn"
+            vpn_outbound_resolver = "dns-local"
+        else:
+            vpn_dns_tag = "dns-local"
+            vpn_outbound_resolver = "dns-local"
     dns_rules: list[dict[str, Any]] = []
 
     if bypass_list:
@@ -1624,7 +1701,7 @@ def generate_singbox_config(
         dns_rules.append(
             {
                 "process_name": vpn_proc_list,
-                "server": "dns-public-doh",
+                "server": vpn_dns_tag,
             }
         )
 
@@ -1636,61 +1713,13 @@ def generate_singbox_config(
                 doh_domains = sorted(set(doh_domains).union(per_dns_domains[dns_id]))
                 continue
             tag = f"dns-{dns_id}"
-            badges = list(srv.get("badges") or [])
-            doh_url = str(srv.get("doh_url") or "")
-            srv_https = ("DoH" in badges) or doh_url.startswith("https://")
-            srv_path = "/dns-query"
-            srv_port: int | None = None
-            srv_sni: str | None = None
-            parsed_host: str | None = None
-            if doh_url.startswith("https://"):
-                parsed = urllib.parse.urlparse(doh_url)
-                if parsed.path:
-                    srv_path = parsed.path
-                if parsed.port:
-                    srv_port = parsed.port
-                parsed_host = parsed.hostname
-                if parsed_host and not _is_ip_address(parsed_host):
-                    srv_sni = parsed_host
-
-            srv_ip = str(srv.get("ip") or "").strip()
-            if not _is_ip_address(srv_ip):
-                host_to_resolve = srv_ip or parsed_host
-                if host_to_resolve:
-                    if _is_ip_address(host_to_resolve):
-                        srv_ip = host_to_resolve
-                    else:
-                        if srv_https and not srv_sni:
-                            srv_sni = host_to_resolve
-                        cat_ip: str | None = None
-                        for cat_srv in catalog_map.values():
-                            cat_url = str(cat_srv.get("doh_url") or "")
-                            if cat_url.startswith("https://"):
-                                parsed_cat = urllib.parse.urlparse(cat_url)
-                                if (parsed_cat.hostname or "").lower() == host_to_resolve.lower() and _is_ip_address(
-                                    str(cat_srv.get("ip") or "")
-                                ):
-                                    cat_ip = str(cat_srv["ip"]).strip()
-                                    break
-                        srv_ip = cat_ip or _resolve_host_ipv4(host_to_resolve) or ""
-            if not srv_ip:
+            srv_entry = _build_catalog_dns_entry(srv, tag)
+            if srv_entry is None:
                 # Unresolvable DNS id falls back to default dns-doh
                 doh_domains = sorted(set(doh_domains).union(per_dns_domains[dns_id]))
                 continue
 
-            if not extra_dns_servers_sni and parsed_host is None:
-                srv_sni = None
-
-            dns_servers.append(
-                _build_singbox_dns_server_entry(
-                    tag=tag,
-                    server=srv_ip,
-                    dns_type="https" if srv_https else "udp",
-                    doh_path=srv_path,
-                    tls_sni=srv_sni if srv_https else None,
-                    server_port=srv_port,
-                )
-            )
+            dns_servers.append(srv_entry)
             dns_rules.append(
                 {
                     "domain_suffix": sorted(set(per_dns_domains[dns_id])),
@@ -1707,11 +1736,11 @@ def generate_singbox_config(
             }
         )
         non_smart_vpn_doms = [d for d in vpn_select_domains if d not in smart_doms]
-        if non_smart_vpn_doms:
+        if non_smart_vpn_doms and vpn_dns_tag != "dns-local":
             dns_rules.append(
                 {
                     "domain_suffix": non_smart_vpn_doms,
-                    "server": "dns-public-doh",
+                    "server": vpn_dns_tag,
                 }
             )
         if smart_doms:
@@ -1833,7 +1862,7 @@ def generate_singbox_config(
                     ob.pop(awg_key, None)
             srv_host = str(ob.get("server") or node.server or "").strip()
             if srv_host and not _is_ip_address(srv_host) and "domain_resolver" not in ob:
-                ob["domain_resolver"] = "dns-doh"
+                ob["domain_resolver"] = vpn_outbound_resolver
             if ob.get("type") == "vless" and "packet_encoding" not in ob:
                 ob["packet_encoding"] = "xudp"
             outbounds.append(ob)

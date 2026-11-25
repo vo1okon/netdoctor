@@ -1378,17 +1378,41 @@ def test_generate_singbox_vpn_processes_and_smartdns_split(tmp_path: Path) -> No
         ],
         vpn_nodes=[node],
         output_path=tmp_path / "sb.json",
-        doh_server="91.239.100.100",
+        doh_server="141.133.184.24",
         vpn_processes=["RainbowSix.exe", "upc.exe"],
         bypass_ips=["198.51.100.55"],
         primary_is_smartdns=True,
         smartdns_domains=["gemini.google.com", "chatgpt.com"],
+        base_dns={
+            "id": "quad9",
+            "name": "Quad9",
+            "ip": "9.9.9.9",
+            "category": "security",
+            "badges": ["DoH"],
+            "doh_url": "https://dns.quad9.net/dns-query",
+        },
     )
     vless_ob = next(o for o in sb_cfg["outbounds"] if o.get("tag") == "FI-VLESS")
     assert vless_ob["packet_encoding"] == "xudp"
     assert sb_cfg["dns"]["final"] == "dns-local"
-    assert any(s["tag"] == "dns-public-doh" for s in sb_cfg["dns"]["servers"])
-    assert {"process_name": ["RainbowSix.exe", "upc.exe"], "server": "dns-public-doh"} in sb_cfg["dns"]["rules"]
+    assert any(s["tag"] == "dns-base" and s["server"] == "9.9.9.9" for s in sb_cfg["dns"]["servers"])
+    assert not any(s.get("server") == "1.1.1.1" for s in sb_cfg["dns"]["servers"])
+    assert {"process_name": ["RainbowSix.exe", "upc.exe"], "server": "dns-base"} in sb_cfg["dns"]["rules"]
+
+    # When base_dns is None and VPN is present, VPN DNS falls back to tunneled dns-vpn (detour: vpn-select)
+    sb_fallback_dns = generate_singbox_config(
+        decisions=[],
+        vpn_nodes=[node],
+        doh_server="141.133.184.24",
+        vpn_processes=["AnyGame.exe"],
+        primary_is_smartdns=True,
+        smartdns_domains=["gemini.google.com"],
+        base_dns=None,
+    )
+    dns_vpn_srv = next(s for s in sb_fallback_dns["dns"]["servers"] if s["tag"] == "dns-vpn")
+    assert dns_vpn_srv["detour"] == "vpn-select"
+    assert not any(s.get("server") == "1.1.1.1" for s in sb_fallback_dns["dns"]["servers"])
+    assert {"process_name": ["AnyGame.exe"], "server": "dns-vpn"} in sb_fallback_dns["dns"]["rules"]
 
     rules = sb_cfg["route"]["rules"]
     vpn_proc_idx = next(i for i, r in enumerate(rules) if r.get("process_name") == ["RainbowSix.exe", "upc.exe"])
@@ -1574,6 +1598,372 @@ def test_backend_persists_vpn_processes_and_auto_heal(tmp_path: Path) -> None:
     snap = backend.get_status_snapshot()
     assert snap["auto_heal_enabled"] is False
     assert snap["vpn_processes"] == "RainbowSix.exe, upc.exe"
+
+
+def test_roll_base_dns_skips_blocked_and_smartdns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "roll_base.sqlite"
+    st, _nk = _seed_storage(db_path)
+    st.set_setting("active_dns_id", "comss_dns")
+    st.close()
+
+    dns_orch = orch_mod.DnsLayerOrchestrator()
+    probed_ids: list[str] = []
+
+    # 1. General roll skips *_family & SmartDNS, and prefers fast clean 50ms over slow 550ms & biased 40ms blocked
+    async def _fake_probe(srv: dict[str, Any]) -> dict[str, Any]:
+        sid = str(srv["id"])
+        probed_ids.append(sid)
+        if sid == "cloudflare":
+            return {"ok": True, "doh_ok": True, "rtt_ms": 40.0}  # +35 bias -> 75.0
+        if sid == "dnssb":
+            return {"ok": True, "doh_ok": True, "rtt_ms": 50.0}  # +0 bias -> 50.0 (wins!)
+        if sid == "libredns":
+            return {"ok": True, "doh_ok": True, "rtt_ms": 550.0}
+        return {"ok": False, "doh_ok": False, "rtt_ms": None}
+
+    roll = asyncio.run(dns_orch.roll_base_dns(probe_fn=_fake_probe))
+    assert "comss_dns" not in probed_ids
+    assert "adguard_family" not in probed_ids
+    assert "yandex_family" not in probed_ids
+    assert roll["selected"] is not None and roll["selected"]["id"] == "dnssb"
+
+    # Soft bias must NEVER push a 550ms server ahead of a fast 40ms working server when clean servers fail
+    async def _fake_probe_blocked_vs_slow(srv: dict[str, Any]) -> dict[str, Any]:
+        sid = str(srv["id"])
+        if sid == "cloudflare":
+            return {"ok": True, "doh_ok": True, "rtt_ms": 40.0}
+        if sid == "libredns":
+            return {"ok": True, "doh_ok": True, "rtt_ms": 550.0}
+        return {"ok": False, "doh_ok": False, "rtt_ms": None}
+
+    roll_fast = asyncio.run(dns_orch.roll_base_dns(probe_fn=_fake_probe_blocked_vs_slow))
+    assert roll_fast["selected"] is not None and roll_fast["selected"]["id"] == "cloudflare"
+
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        bin_dir=tmp_path / "bin",
+        logs_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(backend.orchestrator.dns, "roll_base_dns", lambda *_a, **_kw: asyncio.sleep(0, result=roll))
+    monkeypatch.setattr(backend, "flush_windows_dns_cache", lambda: {"ok": True, "output": "ok"})
+    res = backend.roll_base_dns_sync()
+    assert res["ok"] is True
+    assert res["mode"] == "smartdns_split"
+    assert res["selected"]["id"] == "dnssb"
+    assert backend._cached_dns_pings["dnssb"]["ping_ms"] == 50.0
+    assert backend._cached_dns_pings["libredns"]["ping_ms"] == 550.0
+    assert backend._cached_dns_pings["quad9"]["alive"] is False
+    snap = backend.get_status_snapshot()
+    assert snap["active_dns_id"] == "comss_dns"
+    assert snap["base_dns_id"] == "dnssb"
+
+
+def test_auto_heal_promotes_stalled_nonweb_process_to_vpn_per_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "autovpn.sqlite"
+    st, nk1 = _seed_storage(db_path)
+    try:
+        st.save_subscription(
+            "sub1",
+            "https://sub.example/1",
+            [
+                {
+                    "tag": "FI-Real",
+                    "protocol": "vless",
+                    "server": "198.51.100.10",
+                    "server_port": 443,
+                    "raw_outbound": {"type": "vless", "server": "198.51.100.10", "server_port": 443, "uuid": "u"},
+                }
+            ],
+        )
+        nk2 = st.upsert_network(NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="OtherISP", gateway_mac="11:22:33:44:55:66"))
+    finally:
+        st.close()
+
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        bin_dir=tmp_path / "bin",
+        logs_dir=tmp_path / "logs",
+    )
+    old_ts = (datetime.now(timezone.utc) - timedelta(seconds=12)).isoformat().replace("+00:00", "Z")
+    fake_clash_conns = [
+        {
+            "id": "game-u1",
+            "upload": 1500,
+            "download": 0,
+            "start": old_ts,
+            "chains": ["direct"],
+            "metadata": {"network": "udp", "destinationIP": "198.51.100.70", "destinationPort": "6015", "processPath": r"C:\Games\AnyGame.exe"},
+        },
+        {
+            "id": "game-u2",
+            "upload": 1500,
+            "download": 0,
+            "start": old_ts,
+            "chains": ["direct"],
+            "metadata": {"network": "udp", "destinationIP": "198.51.100.71", "destinationPort": "6016", "processPath": r"C:\Games\AnyGame.exe"},
+        },
+        {
+            "id": "br-1",
+            "upload": 1500,
+            "download": 0,
+            "start": old_ts,
+            "chains": ["direct"],
+            "metadata": {"network": "udp", "destinationIP": "198.51.100.72", "destinationPort": "3478", "processPath": r"C:\Browsers\chrome.exe"},
+        },
+    ]
+    monkeypatch.setattr(backend, "_collect_processes_state", lambda: {"winws2": {"running": True}, "sing-box": {"running": True}})
+    monkeypatch.setattr(backend.clash_api, "get_connections_sync", lambda: {"connections": fake_clash_conns})
+    monkeypatch.setattr(orch_mod.RealtimeConnectionMonitor, "_read_inet_connections", staticmethod(lambda: []))
+    monkeypatch.setattr(orch_mod, "detect_bypass_active", lambda: True)
+    monkeypatch.setattr(orch_mod, "_is_admin", lambda: False)
+
+    res = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
+    assert any(h.get("process") == "AnyGame.exe" and h.get("layer") == "vpn" for h in res["healed"])
+
+    # Per-network isolation + manual opt-out
+    st2 = Storage(db_path)
+    try:
+        assert backend.get_vpn_processes(st2, net_key=nk1) == ["AnyGame.exe"]
+        assert backend.get_vpn_processes(st2, net_key=nk2) == []
+    finally:
+        st2.close()
+
+    toggled = backend.toggle_vpn_process("AnyGame.exe")
+    assert toggled["enabled"] is False
+    assert toggled["vpn_processes"] == []
+    # Re-scanning after manual opt-out must NOT re-add AnyGame.exe
+    res2 = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
+    assert not any(h.get("process") == "AnyGame.exe" for h in res2["healed"])
+
+
+def test_auto_tune_all_sync_cleans_broken_state_and_picks_fast_dns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "autotune.sqlite"
+    st, nk = _seed_storage(db_path)
+    try:
+        st.set_setting("active_dns_id", "stormycloud")
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="discord.com",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                consecutive_fails=3,
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="discord.gg",
+                protocol=Protocol.TLS,
+                layer="direct",
+                strategy_id=None,
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="pinned.example",
+                protocol=Protocol.TLS,
+                layer="direct",
+                strategy_id=None,
+                pinned=True,
+                consecutive_fails=5,
+            )
+        )
+        st.upsert_vpn_node_health(
+            {
+                "node_tag": "NL-Test",
+                "subscription_id": "sub1",
+                "cb_state": "open",
+                "consecutive_fails": 4,
+                "quarantined_until": "2099-01-01T00:00:00Z",
+                "protocol_ok": False,
+                "last_error": "protocol_block",
+            }
+        )
+        st.save_subscription(
+            "sub1",
+            "https://sub.example/1",
+            [
+                {
+                    "tag": "NL-Test",
+                    "protocol": "vless",
+                    "server": "198.51.100.10",
+                    "server_port": 443,
+                    "raw_outbound": {"type": "vless", "server": "198.51.100.10", "server_port": 443, "uuid": "u"},
+                }
+            ],
+        )
+    finally:
+        st.close()
+
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        bin_dir=tmp_path / "bin",
+        logs_dir=tmp_path / "logs",
+    )
+    fake_roll = {
+        "selected": {
+            "id": "yandex",
+            "name": "Яндекс DNS",
+            "ip": "77.88.8.8",
+            "category": "popular",
+            "ping_ms": 22.0,
+            "alive": True,
+            "doh_ok": True,
+        },
+        "tested": 10,
+        "alive": 5,
+        "results": [],
+        "all_results": [
+            {
+                "dns_id": "yandex",
+                "server": {"id": "yandex", "name": "Яндекс DNS", "ip": "77.88.8.8", "category": "popular"},
+                "ok": True,
+                "doh_ok": True,
+                "rtt_ms": 22.0,
+            }
+        ],
+    }
+    monkeypatch.setattr(backend.orchestrator.dns, "roll_base_dns", lambda *_a, **_kw: asyncio.sleep(0, result=fake_roll))
+    monkeypatch.setattr(backend, "probe_all_vpn_nodes", lambda: [{"tag": "NL-Test", "alive": True, "is_placeholder": False}])
+    monkeypatch.setattr(backend, "run_diag_sync", lambda **_kw: [{"domain": "discord.com", "protocol": "tls"}])
+    monkeypatch.setattr(backend, "_reload_running_services", lambda **_kw: {})
+    monkeypatch.setattr(backend, "flush_windows_dns_cache", lambda: {"ok": True, "output": "ok"})
+
+    res = backend.auto_tune_all_sync()
+    assert res["ok"] is True
+    assert res["reset"]["stale_removed"] >= 1
+    assert res["reset"]["failing_removed"] >= 1
+    assert res["reset"]["vpn_reset"] == 1
+    assert res["base_dns"]["id"] == "yandex"
+    assert res["vpn_alive"] == 1
+    assert res["vpn_best"] == "NL-Test"
+
+    st_after = Storage(db_path)
+    try:
+        assert st_after.get_setting("active_dns_id") == "yandex"
+        assert st_after.get_setting(f"base_dns_id:{nk}") == "yandex"
+        decs = {(d.domain, d.protocol): d for d in st_after.get_decisions(nk, active_only=False)}
+        assert ("discord.com", Protocol.TLS) not in decs
+        assert ("discord.gg", Protocol.TLS) not in decs
+        assert ("pinned.example", Protocol.TLS) in decs
+        health = st_after.get_vpn_node_health_map()
+        assert health["NL-Test"]["cb_state"] == "closed"
+        assert health["NL-Test"]["consecutive_fails"] == 0
+    finally:
+        st_after.close()
+
+
+def test_reconcile_active_node_preserves_growing_rx_game_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, _nk = _seed_storage(tmp_path / "rx_guard.db")
+    try:
+        nodes = [
+            {
+                "tag": "NodeA",
+                "display_name": "NodeA",
+                "protocol": "vless",
+                "server": "198.51.100.1",
+                "server_port": 443,
+                "region": "eu",
+                "priority": 100,
+                "enabled": True,
+            },
+            {
+                "tag": "NodeB",
+                "display_name": "NodeB",
+                "protocol": "vless",
+                "server": "198.51.100.2",
+                "server_port": 443,
+                "region": "eu",
+                "priority": 100,
+                "enabled": True,
+            },
+        ]
+        st.save_subscription("s1", "https://sub.example/rx", nodes)
+        st.set_vpn_selection_policy(mode="auto")
+
+        class _GrowingRxClash:
+            def __init__(self) -> None:
+                self.sel_now = "NodeA"
+                self.select_calls: list[tuple[str, str]] = []
+                self.closed_nodes: list[str] = []
+                self.rx_sequence = [5000, 9500, 14000, 18500, 18500, 18500]
+                self.rx_idx = 0
+
+            async def get_proxies(self) -> dict[str, Any]:
+                return {
+                    "vpn-select": {"type": "Selector", "now": self.sel_now, "all": ["vpn-auto", "NodeA", "NodeB"]},
+                    "vpn-auto": {"type": "URLTest", "now": "NodeB", "all": ["NodeA", "NodeB"]},
+                    "NodeA": {"type": "SOCKS"},
+                    "NodeB": {"type": "SOCKS"},
+                }
+
+            async def get_connections(self) -> dict[str, Any]:
+                val = self.rx_sequence[min(self.rx_idx, len(self.rx_sequence) - 1)]
+                self.rx_idx += 1
+                return {"connections": [{"chains": ["NodeA", "vpn-select"], "upload": 4000, "download": val, "id": "r6-udp"}]}
+
+            async def measure_node_delay(self, tag: str, **_kw: Any) -> dict[str, Any]:
+                if tag == "NodeA":
+                    return {"ok": False, "delay_ms": None, "error": "x509 fail"}
+                return {"ok": True, "delay_ms": 40.0, "error": None}
+
+            async def select_outbound(self, selector: str, target: str) -> bool:
+                self.select_calls.append((selector, target))
+                self.sel_now = target
+                return True
+
+            async def close_connections_by_node(self, tag: str) -> int:
+                self.closed_nodes.append(tag)
+                return 1
+
+        async def _no_sleep(_sec: float) -> None:
+            return None
+
+        async def _fast_tcp_timeout(ip: str, port: int = 443, timeout: float = 1.0) -> TcpProbeResult:
+            return TcpProbeResult(result="timeout", target_ip=ip)
+
+        monkeypatch.setattr(orch_mod.asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(orch_mod, "probe_tcp", _fast_tcp_timeout)
+        orch = VpnLayerOrchestrator()
+        clash = _GrowingRxClash()
+
+        # Tick 1 (fails=1, RX growing 5000 -> 9500): keep live match node untouched
+        res1 = asyncio.run(orch.reconcile_active_node(st, nodes, clash_client=clash, force=False))  # type: ignore[arg-type]
+        assert res1["ok"] is True
+        assert res1["selected"] == "NodeA"
+        assert clash.select_calls == []
+        assert clash.closed_nodes == []
+
+        # Tick 2 (fails=2, RX still growing 14000 -> 18500): switch new connections away from NodeA, DO NOT kill NodeA sockets
+        res2 = asyncio.run(orch.reconcile_active_node(st, nodes, clash_client=clash, force=False))  # type: ignore[arg-type]
+        assert res2["selected"] == "NodeB"
+        assert clash.select_calls in ([("vpn-select", "vpn-auto")], [("vpn-select", "NodeB")])
+        assert clash.closed_nodes == []
+
+        # Tick 3 (NodeA frozen at 18500 -> 18500 and failing): failover closes dead NodeA sockets
+        clash.sel_now = "NodeA"
+        clash.select_calls.clear()
+        res3 = asyncio.run(orch.reconcile_active_node(st, nodes, clash_client=clash, force=False))  # type: ignore[arg-type]
+        assert res3["selected"] == "NodeB"
+        assert clash.closed_nodes == ["NodeA"]
+    finally:
+        st.close()
+
 
 
 
