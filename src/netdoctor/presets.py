@@ -452,6 +452,7 @@ def compile_zapret_preset(
     exclude_domains: list[str] | None = None,
     iface: int | str | None = None,
     game_filter: bool = True,
+    exclude_filename: str = "exclude_unlocker_domains.txt",
 ) -> list[str]:
     """Compile a built-in or user-supplied Zapret2 preset text into verified winws2 arguments.
 
@@ -490,7 +491,7 @@ def compile_zapret_preset(
     excluded_doms = sorted({d.strip().lower() for d in (exclude_domains or []) if d and d.strip()})
     exclude_hostlist_path: Path | None = None
     if excluded_doms:
-        exclude_hostlist_path = lists_path / "exclude_unlocker_domains.txt"
+        exclude_hostlist_path = lists_path / (exclude_filename or "exclude_unlocker_domains.txt")
         exclude_hostlist_path.write_text("\n".join(excluded_doms) + "\n", encoding="utf-8")
 
     # Case: User pasted ONLY `--lua-desync=...` (snippet mode) -> wrap into full working winws2 config!
@@ -853,8 +854,9 @@ def merge_winws2_base_preset(auto_args: list[str], base_args: list[str]) -> list
         return False
 
     vpn_ip_pass: list[list[str]] = []
-    auto_specific: list[list[str]] = []
     unlocker_dom_pass: list[list[str]] = []
+    base_dom_pass: list[list[str]] = []
+    auto_specific: list[list[str]] = []
     auto_generic_udp: list[list[str]] = []
 
     for prof in _split_profiles(auto_prof):
@@ -862,16 +864,14 @@ def merge_winws2_base_preset(auto_args: list[str], base_args: list[str]) -> list
             vpn_ip_pass.append(prof)
         elif _is_pass_profile(prof, "exclude_unlocker_domains.txt"):
             unlocker_dom_pass.append(prof)
-        elif any(t.startswith("--filter-l7=") for t in prof) or (
-            any(t.startswith("--filter-udp=") for t in prof)
-            and not any(t.startswith(("--hostlist=", "--ipset=")) for t in prof)
-        ):
-            auto_generic_udp.append(prof)
-        else:
+        elif any(t.startswith(("--hostlist=", "--ipset=")) for t in prof):
             auto_specific.append(prof)
+        else:
+            auto_generic_udp.append(prof)
 
     had_auto_vpn_pass = bool(vpn_ip_pass)
     had_auto_unlocker_pass = bool(unlocker_dom_pass)
+    had_auto_base_pass = False
     rest_base: list[list[str]] = []
     for prof in _split_profiles(base_prof):
         if _is_pass_profile(prof, "exclude_vpn_ips.txt"):
@@ -882,12 +882,18 @@ def merge_winws2_base_preset(auto_args: list[str], base_args: list[str]) -> list
             if not had_auto_unlocker_pass:
                 unlocker_dom_pass.append(prof)
             continue
+        if _is_pass_profile(prof, "exclude_base_preset_domains.txt"):
+            if not had_auto_base_pass:
+                base_dom_pass.append(prof)
+                had_auto_base_pass = True
+            continue
         rest_base.append(prof)
 
     ordered_profiles = [
         *vpn_ip_pass,
-        *auto_specific,
         *unlocker_dom_pass,
+        *auto_specific,
+        *base_dom_pass,
         *auto_generic_udp,
         *rest_base,
     ]

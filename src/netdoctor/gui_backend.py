@@ -1731,6 +1731,24 @@ class GuiBackend:
                 include_picked_domains=False,
                 timeout=min(timeout + 1.0, 3.0),
             )
+            failing_doms = list(
+                dict.fromkeys(
+                    str(r.get("domain") or "").strip().lower()
+                    for r in (conn_report.get("results") or [])
+                    if not r.get("ok") and str(r.get("domain") or "").strip()
+                )
+            )
+            if failing_doms:
+                for fail_dom in failing_doms[:4]:
+                    try:
+                        self.find_best_bypass_for_domain(fail_dom, timeout=min(timeout + 1.0, 3.0))
+                    except Exception:  # noqa: BLE001
+                        pass
+                conn_report = self.run_connectivity_tests(
+                    include_key_services=True,
+                    include_picked_domains=False,
+                    timeout=min(timeout + 1.0, 3.0),
+                )
 
         return {
             "ok": True,
@@ -2901,6 +2919,7 @@ class GuiBackend:
                             exclude_domains=base_exclude,
                             iface=effective_iface,
                             game_filter=game_filter,
+                            exclude_filename="exclude_base_preset_domains.txt",
                         )
                         winws_args = merge_winws2_base_preset(auto_args, base_args)
                     except Exception as exc:  # noqa: BLE001

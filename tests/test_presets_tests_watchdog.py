@@ -1989,14 +1989,28 @@ def test_base_zapret_preset_merges_with_auto_orchestrator_decisions(tmp_path: Pa
 
     args = res["applied"]["winws2_args"]
     # DB per-domain hostlist profile must precede the base preset profiles (separated by --new)
-    custom_hostlist_idx = next(i for i, tok in enumerate(args) if tok.startswith("--hostlist=") and "custom-site" not in tok and "exclude_unlocker" not in tok)
-    new_after_idx = next(i for i, tok in enumerate(args[custom_hostlist_idx + 1 :], start=custom_hostlist_idx + 1) if tok == "--new")
+    custom_hostlist_idx = next(
+        i
+        for i, tok in enumerate(args)
+        if tok.startswith("--hostlist=")
+        and "custom-site" not in tok
+        and "exclude_unlocker" not in tok
+        and "exclude_base_preset" not in tok
+    )
+    base_excl_tok_idx = next(
+        i
+        for i, tok in enumerate(args)
+        if tok.startswith(("--hostlist=", "--hostlist-exclude=")) and "exclude_base_preset_domains.txt" in tok
+    )
     base_desync_idx = next(i for i, tok in enumerate(args) if tok == "--lua-desync=multisplit:pos=1")
-    assert custom_hostlist_idx < new_after_idx < base_desync_idx
+    assert custom_hostlist_idx < base_excl_tok_idx <= base_desync_idx
 
-    excl = (lists_dir / "exclude_unlocker_domains.txt").read_text(encoding="utf-8").splitlines()
-    assert "custom-site.example" in excl
-    assert "vpn-site.example" in excl
+    unlocker_path = lists_dir / "exclude_unlocker_domains.txt"
+    unlocker_excl = unlocker_path.read_text(encoding="utf-8").splitlines() if unlocker_path.is_file() else []
+    assert "custom-site.example" not in unlocker_excl
+    base_excl = (lists_dir / "exclude_base_preset_domains.txt").read_text(encoding="utf-8").splitlines()
+    assert "custom-site.example" in base_excl
+    assert "vpn-site.example" in base_excl
 
 
 def test_merge_winws2_base_preset_orders_vpn_pass_first_and_strips_game_filter(tmp_path: Path) -> None:

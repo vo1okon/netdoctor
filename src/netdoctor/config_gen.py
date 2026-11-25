@@ -600,16 +600,21 @@ def generate_winws2_config(
         if srv_clean and "." in srv_clean and "/" not in srv_clean and not _is_ip_address(srv_clean):
             vpn_hostnames.add(srv_clean)
 
+    dpi_domains = {
+        d.domain.strip().lower()
+        for d in decisions
+        if d.layer == "dpi" and d.status == "active" and d.domain and d.domain.strip()
+    }
     direct_domains = {
         d.domain.strip().lower()
         for d in decisions
         if d.layer == "direct" and d.status == "active" and d.domain and d.domain.strip()
-    }
+    } - dpi_domains
     dns_domains = {
         d.domain.strip().lower()
         for d in decisions
         if d.layer == "dns" and d.status == "active" and d.domain and d.domain.strip()
-    }
+    } - dpi_domains
     catchall_excluded_domains = sorted(set(excluded_set) | vpn_hostnames | direct_domains | dns_domains)
     exclude_hostlist_path: Path | None = None
     if catchall_excluded_domains:
