@@ -15,7 +15,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Iterable, NamedTuple
 
 import dns.resolver
 
@@ -996,8 +996,11 @@ DEFAULT_GAME_PROCESSES: tuple[str, ...] = (
     "VALORANT.exe",
     "RiotClientServices.exe",
     "RainbowSix.exe",
+    "RainbowSix_DX12.exe",
     "RainbowSix_Vulkan.exe",
     "RainbowSix_BE.exe",
+    "BEService.exe",
+    "BEService_x64.exe",
     "r5apex.exe",
     "r5apex_dx12.exe",
     "FortniteClient-Win64-Shipping.exe",
@@ -1169,6 +1172,60 @@ DEFAULT_GAME_PROCESSES: tuple[str, ...] = (
     "Sky.exe",
 )
 
+_GAME_PROCESS_EXACT_LOW: frozenset[str] = frozenset(p.lower() for p in DEFAULT_GAME_PROCESSES)
+_GAME_PROCESS_SUBSTR_HINTS: tuple[str, ...] = (
+    "rainbowsix",
+    "beservice",
+    "battleye",
+    "uplaywebcore",
+    "valorant",
+    "riotclient",
+    "cs2.exe",
+    "csgo.exe",
+    "r5apex",
+    "fortnite",
+    "tslgame",
+    "tarkov",
+    "overwatch",
+    "helldivers",
+    "warframe",
+    "dota2",
+    "deadlock",
+    "destiny2",
+    "eldenring",
+    "rustclient",
+    "pubg",
+    "roblox",
+    "minecraft",
+)
+
+
+def parse_process_list(raw: str | None) -> list[str]:
+    """Parse a comma/newline/semicolon-separated process list into unique executable names."""
+    if not raw:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in re.split(r"[,;\r\n]+", str(raw)):
+        name = Path(part.strip().replace("\\", "/")).name.strip()
+        low = name.lower()
+        if name and low not in seen:
+            seen.add(low)
+            out.append(name)
+    return out
+
+
+def is_game_process(proc_name: str, extra_processes: Iterable[str] = ()) -> bool:
+    """Return True if proc_name matches a known game/anti-cheat process or launcher."""
+    low = Path((proc_name or "").strip().replace("\\", "/")).name.lower()
+    if not low:
+        return False
+    if low in _GAME_PROCESS_EXACT_LOW:
+        return True
+    if any(low == str(p).strip().lower() for p in extra_processes if p):
+        return True
+    return any(hint in low for hint in _GAME_PROCESS_SUBSTR_HINTS)
+
 GAME_BYPASS_PORTS: tuple[int, ...] = (25565, 19132, 19133, 3074, 2099, 5223, 6667, 6672, 27900, 27901, 28910)
 
 GAME_BYPASS_PORT_RANGES: tuple[str, ...] = (
@@ -1258,7 +1315,7 @@ def generate_xray_bridge_config(
                 "listen": "127.0.0.1",
                 "port": socks_port,
                 "protocol": "socks",
-                "settings": {"auth": "noauth", "udp": True},
+                "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"},
             }
         )
 
@@ -1394,6 +1451,10 @@ def generate_singbox_config(
     vpn_selection_mode: str = "auto",
     preferred_vpn_node: str | None = None,
     xray_bridge_ports: dict[str, int] | None = None,
+    vpn_processes: list[str] | None = None,
+    bypass_ips: list[str] | None = None,
+    primary_is_smartdns: bool = False,
+    smartdns_domains: list[str] | None = None,
 ) -> dict[str, Any]:
     """Generate sing-box 1.12+/1.14+ JSON configuration combining global + per-domain DoH/bypass DNS rules, Telegram proxy route, multi-VPN regional/auto/AI urltest/selector outbounds, and Clash API."""
     vpn_nodes = vpn_nodes or []
@@ -1518,6 +1579,14 @@ def generate_singbox_config(
                             primary_tls_sni = parsed_cand.hostname
                             break
 
+    vpn_proc_list: list[str] = []
+    seen_vpn_procs: set[str] = set()
+    for p in vpn_processes or []:
+        clean_p = Path(str(p or "").strip().replace("\\", "/")).name.strip()
+        if clean_p and clean_p.lower() not in seen_vpn_procs:
+            seen_vpn_procs.add(clean_p.lower())
+            vpn_proc_list.append(clean_p)
+
     # 1. DNS configuration (sing-box 1.12+ / 1.14+ typed server format)
     primary_dns_entry = _build_singbox_dns_server_entry(
         tag="dns-doh",
@@ -1531,6 +1600,16 @@ def generate_singbox_config(
         primary_dns_entry,
         {"type": "local", "tag": "dns-local"},
     ]
+    if primary_is_smartdns:
+        dns_servers.append(
+            _build_singbox_dns_server_entry(
+                tag="dns-public-doh",
+                server="1.1.1.1",
+                dns_type="https",
+                doh_path="/dns-query",
+                tls_sni="cloudflare-dns.com",
+            )
+        )
     dns_rules: list[dict[str, Any]] = []
 
     if bypass_list:
@@ -1538,6 +1617,14 @@ def generate_singbox_config(
             {
                 "domain_suffix": bypass_list,
                 "server": "dns-local",
+            }
+        )
+
+    if primary_is_smartdns and vpn_proc_list:
+        dns_rules.append(
+            {
+                "process_name": vpn_proc_list,
+                "server": "dns-public-doh",
             }
         )
 
@@ -1611,7 +1698,30 @@ def generate_singbox_config(
                 }
             )
 
-    if doh_domains:
+    if primary_is_smartdns:
+        smart_doms = sorted(
+            {
+                d.strip().lower().lstrip(".")
+                for d in [*doh_domains, *(smartdns_domains or [])]
+                if d and d.strip()
+            }
+        )
+        non_smart_vpn_doms = [d for d in vpn_select_domains if d not in smart_doms]
+        if non_smart_vpn_doms:
+            dns_rules.append(
+                {
+                    "domain_suffix": non_smart_vpn_doms,
+                    "server": "dns-public-doh",
+                }
+            )
+        if smart_doms:
+            dns_rules.append(
+                {
+                    "domain_suffix": smart_doms,
+                    "server": "dns-doh",
+                }
+            )
+    elif doh_domains:
         dns_rules.append(
             {
                 "domain_suffix": doh_domains,
@@ -1622,7 +1732,7 @@ def generate_singbox_config(
     dns_config: dict[str, Any] = {
         "servers": dns_servers,
         "rules": dns_rules,
-        "final": "dns-doh",
+        "final": "dns-local" if primary_is_smartdns else "dns-doh",
     }
 
     # 2. Inbounds (sing-box 1.12+ address array + route action sniff)
@@ -1635,9 +1745,10 @@ def generate_singbox_config(
                 "tag": "tun-in",
                 "interface_name": "netdoctor-tun",
                 "address": ["172.19.0.1/30"],
-                "mtu": 9000,
+                "mtu": 1500,
                 "auto_route": True,
                 "strict_route": False,
+                "endpoint_independent_nat": True,
                 "stack": resolved_stack,
                 "route_exclude_address": [
                     "127.0.0.0/8",
@@ -1723,6 +1834,8 @@ def generate_singbox_config(
             srv_host = str(ob.get("server") or node.server or "").strip()
             if srv_host and not _is_ip_address(srv_host) and "domain_resolver" not in ob:
                 ob["domain_resolver"] = "dns-doh"
+            if ob.get("type") == "vless" and "packet_encoding" not in ob:
+                ob["packet_encoding"] = "xudp"
             outbounds.append(ob)
 
         raw_prio = getattr(node, "priority", 100)
@@ -1851,8 +1964,14 @@ def generate_singbox_config(
         # Scope process bypass to TUN only so mixed-in explicit proxy probes from python/pythonw still test VPN routes
         proc_bypass_rule["inbound"] = ["tun-in"]
 
+    vpn_proc_low = {p.lower() for p in vpn_proc_list}
+    game_procs = (
+        [p for p in DEFAULT_GAME_PROCESSES if p.lower() not in vpn_proc_low]
+        if vpn_proc_list
+        else list(DEFAULT_GAME_PROCESSES)
+    )
     game_proc_subrules: list[dict[str, Any]] = [
-        {"process_name": list(DEFAULT_GAME_PROCESSES)},
+        {"process_name": game_procs},
         {"port": [53, 80, 443, 8080, 8443], "invert": True},
     ]
     game_port_rule: dict[str, Any] = {
@@ -1870,15 +1989,47 @@ def generate_singbox_config(
         "outbound": "direct",
     }
 
+    normalized_bypass_cidrs: list[str] = []
+    seen_cidrs: set[str] = set()
+    for raw_ip in bypass_ips or []:
+        cand = str(raw_ip or "").strip()
+        if not cand:
+            continue
+        try:
+            net_obj = ipaddress.ip_network(cand, strict=False)
+            cidr = str(net_obj)
+        except ValueError:
+            continue
+        if cidr not in seen_cidrs:
+            seen_cidrs.add(cidr)
+            normalized_bypass_cidrs.append(cidr)
+
     route_rules: list[dict[str, Any]] = [
         {"port": [53, 80, 443, 8080, 8443], "action": "sniff", "timeout": "100ms"},
         {"protocol": "dns", "action": "hijack-dns"},
         # Prevent routing loops and preserve external unlocker / IDE apps (Antigravity, xray, happ, etc.)
         proc_bypass_rule,
-        # Keep multiplayer game streams direct while preserving DPI/VPN for web/mod ports (80/443/8080/8443)
-        game_proc_rule,
-        game_port_rule,
     ]
+    if vpn_proc_list:
+        vpn_proc_rule: dict[str, Any] = {
+            "process_name": vpn_proc_list,
+            "outbound": "vpn-select",
+        }
+        if enable_tun:
+            vpn_proc_rule["inbound"] = ["tun-in"]
+        route_rules.append(vpn_proc_rule)
+
+    # Keep multiplayer game streams direct while preserving DPI/VPN for web/mod ports (80/443/8080/8443)
+    route_rules.append(game_proc_rule)
+    route_rules.append(game_port_rule)
+
+    if normalized_bypass_cidrs:
+        route_rules.append(
+            {
+                "ip_cidr": normalized_bypass_cidrs,
+                "outbound": "direct",
+            }
+        )
 
     if bypass_list:
         route_rules.append(

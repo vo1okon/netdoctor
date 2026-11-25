@@ -1999,6 +1999,79 @@ def test_base_zapret_preset_merges_with_auto_orchestrator_decisions(tmp_path: Pa
     assert "vpn-site.example" in excl
 
 
+def test_merge_winws2_base_preset_orders_vpn_pass_first_and_strips_game_filter(tmp_path: Path) -> None:
+    from netdoctor.presets import merge_winws2_base_preset
+
+    bin_dir = tmp_path / "bin"
+    (bin_dir / "lua").mkdir(parents=True, exist_ok=True)
+    for lua_name in ("zapret-lib.lua", "zapret-antidpi.lua", "zapret-auto.lua"):
+        (bin_dir / "lua" / lua_name).write_text("function pass(ctx) end\nfunction fake(ctx) end\n", encoding="utf-8")
+    lists_dir = tmp_path / "lists"
+    lists_dir.mkdir(parents=True, exist_ok=True)
+    (lists_dir / "ipset-amazon.txt").write_text("18.0.0.0/8\n", encoding="utf-8")
+    (lists_dir / "list-general.txt").write_text("example.com\n", encoding="utf-8")
+
+    auto_args = [
+        "--lua-init=@lua/zapret-lib.lua",
+        "--filter-tcp=80,443",
+        f"--hostlist={(lists_dir / 'list-general.txt').as_posix()}",
+        "--lua-desync=fake:blob=tls_google",
+        "--new",
+        "--filter-udp=443",
+        "--filter-l7=discord,stun",
+        "--lua-desync=fake:blob=stun_pat",
+    ]
+    base_content = "\n".join(
+        [
+            "--wf-tcp-out=80,443",
+            "--wf-udp-out=443,50000-50099,1024-65535",
+            "--filter-udp=5000-5500,7000-8000",
+            "--lua-desync=fake:repeats=6",
+            "--new",
+            "--filter-udp=443-65535",
+            "--ipset=ipset-amazon.txt",
+            "--lua-desync=fake:repeats=10",
+            "--new",
+            "--filter-tcp=80,443",
+            "--hostlist=list-general.txt",
+            "--lua-desync=fake:repeats=2",
+        ]
+    )
+    compiled_base = compile_zapret_preset(
+        base_content,
+        bin_dir=bin_dir,
+        lists_dir=lists_dir,
+        vpn_server_ips=["198.51.100.10"],
+        exclude_domains=["antigravity.dev"],
+        game_filter=False,
+    )
+    assert "--wf-udp-out=443,50000-50099" in compiled_base
+    assert "--filter-udp=5000-5500,7000-8000" not in compiled_base
+    assert all("ipset-amazon.txt" not in tok for tok in compiled_base)
+
+    merged = merge_winws2_base_preset(auto_args, compiled_base)
+    profiles: list[list[str]] = []
+    cur: list[str] = []
+    for tok in merged:
+        if tok == "--new":
+            if cur:
+                profiles.append(cur)
+                cur = []
+        elif cur or tok.startswith(("--filter-", "--hostlist", "--ipset", "--lua-desync")):
+            cur.append(tok)
+    if cur:
+        profiles.append(cur)
+
+    # First two profiles MUST be TCP+UDP pass for exclude_vpn_ips.txt
+    assert any("exclude_vpn_ips.txt" in t for t in profiles[0]) and "--lua-desync=pass" in profiles[0]
+    assert any("exclude_vpn_ips.txt" in t for t in profiles[1]) and "--lua-desync=pass" in profiles[1]
+    # Generic stun/discord profile must come AFTER exclude_unlocker_domains.txt pass profiles
+    unlocker_last_idx = max(i for i, p in enumerate(profiles) if any("exclude_unlocker_domains.txt" in t for t in p))
+    stun_idx = next(i for i, p in enumerate(profiles) if "--filter-l7=discord,stun" in p)
+    assert unlocker_last_idx < stun_idx
+
+
+
 
 
 

@@ -1237,3 +1237,86 @@ def test_gui_redesign_widgets_tooltips_and_deduplication(tmp_path: Path) -> None
             assert len(btn_texts) == len(set(btn_texts)), f"Duplicate buttons in {tab_widget}: {btn_texts}"
     finally:
         app.on_close()
+
+
+def test_gui_vpn_processes_smartdns_split_and_db_cleanup(tmp_path: Path) -> None:
+    db_path = tmp_path / "gui_features.db"
+    net_key = _seed_sample_db(db_path)
+    st = Storage(db_path)
+    try:
+        st.save_decision(Decision(network_key=net_key, domain="stale-direct.example", protocol=Protocol.TLS, layer="direct"))
+        st.save_decision(Decision(network_key=net_key, domain="1.2.3.4.in-addr.arpa", protocol=Protocol.TLS, layer="dpi", strategy_id="z2_multisplit_sni"))
+        st.save_decision(Decision(network_key=net_key, domain="keep-pinned.example", protocol=Protocol.TLS, layer="direct", pinned=True))
+    finally:
+        st.close()
+
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=tmp_path / "logs",
+        bin_dir=tmp_path / "bin",
+    )
+    cleaned = backend.cleanup_stale_db_rules()
+    assert cleaned["ok"] is True and cleaned["removed"] == 2
+
+    st2 = Storage(db_path)
+    try:
+        left_domains = {d.domain for d in st2.get_decisions(net_key, active_only=False)}
+        assert "stale-direct.example" not in left_domains
+        assert "1.2.3.4.in-addr.arpa" not in left_domains
+        assert "keep-pinned.example" in left_domains
+    finally:
+        st2.close()
+
+    try:
+        app = NetdoctorGuiApp(backend=backend, auto_start=False, enable_tray=False)
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+
+    try:
+        app.geometry("1280x840+40+40")
+        app.attributes("-alpha", 0.0)
+        app.deiconify()
+        app.update_idletasks()
+        app.update()
+
+        # vpn_processes input must live in tab_vpn (not tab_service)
+        cur = app.vpn_processes_entry.master
+        ancestors = []
+        while cur is not None:
+            ancestors.append(cur)
+            cur = cur.master
+        assert app.tab_vpn in ancestors and app.tab_service not in ancestors
+
+        snap = backend.get_status_snapshot()
+        snap["active_dns"] = {
+            "id": "comss_dns",
+            "name": "Comss.one DNS",
+            "ip": "91.239.100.100",
+            "category": "ai_bypass",
+        }
+        snap["active_dns_id"] = "comss_dns"
+        snap["vpn_processes"] = "RainbowSix.exe, upc.exe"
+        app.apply_snapshot(snap)
+        app.render_dns_grid([snap["active_dns"]], "comss_dns")
+
+        assert "SmartDNS" in str(app.dns_split_banner.cget("text"))
+        assert "Сплит" in str(app.card_dns_sub.cget("text"))
+        assert "2 прил." in str(app.card_vpn_sub.cget("text"))
+
+        # Check all core tabs have unique button texts
+        for tab_widget in (app.tab_home, app.tab_vpn, app.tab_service):
+            btn_texts: list[str] = []
+
+            def _collect(w: tk.Misc) -> None:
+                for ch in w.winfo_children():
+                    if isinstance(ch, (tk.Button, gui_mod.RoundedButton)):
+                        btn_texts.append(str(ch.cget("text")))
+                    _collect(ch)
+
+            _collect(tab_widget)
+            assert len(btn_texts) == len(set(btn_texts)), f"Duplicate buttons in {tab_widget}: {btn_texts}"
+    finally:
+        app.on_close()
+

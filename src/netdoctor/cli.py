@@ -24,7 +24,7 @@ from netdoctor.config_gen import (
 )
 from netdoctor.dynamics import run_canary_cycle
 from netdoctor.gui import _has_console_window, launch_gui
-from netdoctor.gui_backend import elevate_gui, launch_gui_detached
+from netdoctor.gui_backend import GuiBackend, elevate_gui, launch_gui_detached
 from netdoctor.models import Protocol, VerdictClass, VpnNode
 from netdoctor.orchestrators import (
     DnsLayerOrchestrator,
@@ -314,118 +314,146 @@ def cmd_apply(
         console.print(f"[red]Invalid network interface index (iface={iface}): no such adapter.[/red]")
         raise typer.Exit(code=1)
 
-    storage = Storage(db_path)
-    try:
-        storage.upsert_strategies(DEFAULT_STRATEGIES)
-        strategies = {s.id: s for s in storage.get_strategies()}
-        if profile is not None and profile not in strategies:
-            console.print(f"[red]Unknown strategy profile: {profile}[/red]")
-            raise typer.Exit(code=1)
-        row = storage.conn.execute("SELECT network_key FROM networks ORDER BY last_seen DESC LIMIT 1").fetchone()
-        net_key = row["network_key"] if row else "AS12389:home:default"
-        decisions = storage.get_decisions(net_key, active_only=True)
-        if profile is not None:
-            decisions = [d for d in decisions if d.strategy_id == profile]
-        raw_nodes = storage.get_all_subscription_nodes()
-        vpn_nodes = [VpnNode(**n) for n in raw_nodes]
-        game_filter = storage.get_setting("game_filter", "0") == "1"
-        stack_mode = storage.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
-        dns_orch = DnsLayerOrchestrator()
-        active_dns = dns_orch.get_active_dns(storage)
-        dns_catalog_map = {s["id"]: s for s in dns_orch.get_all_dns_servers(storage)}
-        vpn_policy = storage.get_vpn_selection_policy()
-        health_map = storage.get_vpn_node_health_map()
-        vpn_orch = VpnLayerOrchestrator()
-        quarantined_tags = {
-            tag
-            for tag, rec in health_map.items()
-            if str(rec.get("cb_state") or "") == "open"
-            and not vpn_orch._is_quarantine_expired(str(rec.get("quarantined_until") or ""))
-        }
-        guard = build_unlocker_protection_context(storage=storage)
-    finally:
-        storage.close()
-
-    if guard["enabled"]:
-        prot_doms = set(guard["domains"])
-        explicit_per_dns = {
-            d.domain.lower()
-            for d in decisions
-            if d.layer == "dns" and isinstance(d.strategy_id, str) and d.strategy_id.startswith("dns:")
-        }
-        decisions = [
-            d
-            for d in decisions
-            if not (
-                d.layer in ("dpi", "vpn")
-                and any(
-                    d.domain.lower() == pd or d.domain.lower().endswith("." + pd)
-                    for pd in prot_doms
-                )
-            )
-        ]
-        exclude_domains = [dom for dom in guard["domains"] if dom not in explicit_per_dns]
-        exclude_ips = list(guard["proxy_ips"])
-        extra_procs = list(guard["processes"])
-    else:
-        exclude_domains = []
-        exclude_ips = []
-        extra_procs = []
-
-    vpn_ips = [n.server for n in vpn_nodes if n.server] + exclude_ips
-    effective_iface = iface if iface is not None else detect_physical_egress_iface()
-    winws_args, hostlists = generate_winws2_config(
-        decisions=decisions,
-        strategies=strategies,
-        lists_dir=lists_dir,
-        vpn_server_ips=vpn_ips,
-        iface=effective_iface,
-        game_filter=game_filter,
-        exclude_domains=exclude_domains,
-        expand_cdn_domains=True,
-        enable_tcp_in=True,
-    )
-
     cfg_path = Path(configs_dir)
-    cfg_path.mkdir(parents=True, exist_ok=True)
-    winws_preset_file = cfg_path / "winws2_preset.txt"
-    winws_preset_file.write_text("\n".join(winws_args) + "\n", encoding="utf-8")
-
-    badges = list(active_dns.get("badges") or [])
-    doh_url = str(active_dns.get("doh_url") or "")
-    use_https = ("DoH" in badges) or doh_url.startswith("https://")
-    dns_type = "https" if use_https else "udp"
-    parsed_doh = urllib.parse.urlparse(doh_url) if doh_url.startswith("https://") else None
-    doh_path = (parsed_doh.path or "/dns-query") if parsed_doh else "/dns-query"
-    doh_tls_sni = parsed_doh.hostname if (parsed_doh and parsed_doh.hostname) else None
-
-    has_real_vpn = stack_mode != "dpi_only" and has_usable_vpn_nodes(vpn_nodes)
-    singbox_decisions = (
-        decisions
-        if has_real_vpn
-        else [d for d in decisions if not (d.layer == "vpn" and not getattr(d, "pinned", False))]
-    )
-
     singbox_file = cfg_path / "sing-box.json"
-    generate_singbox_config(
-        decisions=singbox_decisions,
-        vpn_nodes=vpn_nodes,
-        output_path=singbox_file,
-        doh_server=str(active_dns.get("ip") or doh_tls_sni or "1.1.1.1"),
-        dns_type=dns_type,
-        doh_path=doh_path,
-        dns_catalog=dns_catalog_map,
-        bypass_domains=exclude_domains,
-        extra_bypass_processes=extra_procs,
-        quarantined_tags=quarantined_tags,
-        use_wireguard_endpoints=True,
-        doh_tls_sni=doh_tls_sni,
-        vpn_selection_mode=vpn_policy["mode"],
-        preferred_vpn_node=vpn_policy["priority_node"] or None,
-    )
+    winws_preset_file = cfg_path / "winws2_preset.txt"
 
-    console.print(f"[green]Generated winws2 preset:[/green] {winws_preset_file} ({len(hostlists)} hostlists)")
-    console.print(f"[green]Generated sing-box config:[/green] {singbox_file} ({len(vpn_nodes)} VPN nodes in urltest)")
+    if profile is None:
+        backend = GuiBackend(
+            db_path=db_path,
+            configs_dir=configs_dir,
+            lists_dir=lists_dir,
+            bin_dir=bin_dir,
+            logs_dir=logs_dir,
+        )
+        applied = backend.trigger_apply_configs(iface=iface)
+        winws_args = list(applied["winws2_args"])
+        hostlists_cnt = int(applied["hostlists_count"])
+        vpn_nodes_cnt = int(applied["vpn_nodes_count"])
+        xray_bridge_cnt = int(applied.get("xray_bridge_count") or 0)
+        xray_file = Path(str(applied["xray_config"])) if applied.get("xray_config") else None
+        st_flags = Storage(db_path)
+        try:
+            stack_mode = st_flags.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
+            byedpi_fallback = st_flags.get_setting("byedpi_fallback", "0") == "1"
+            tg_secret = backend.get_tg_ws_secret(st_flags)
+        finally:
+            st_flags.close()
+    else:
+        storage = Storage(db_path)
+        try:
+            storage.upsert_strategies(DEFAULT_STRATEGIES)
+            strategies = {s.id: s for s in storage.get_strategies()}
+            if profile not in strategies:
+                console.print(f"[red]Unknown strategy profile: {profile}[/red]")
+                raise typer.Exit(code=1)
+            row = storage.conn.execute("SELECT network_key FROM networks ORDER BY last_seen DESC LIMIT 1").fetchone()
+            net_key = row["network_key"] if row else "AS12389:home:default"
+            decisions = storage.get_decisions(net_key, active_only=True)
+            decisions = [d for d in decisions if d.strategy_id == profile]
+            raw_nodes = storage.get_all_subscription_nodes()
+            vpn_nodes = [VpnNode(**n) for n in raw_nodes]
+            game_filter = storage.get_setting("game_filter", "0") == "1"
+            byedpi_fallback = storage.get_setting("byedpi_fallback", "0") == "1"
+            stack_mode = storage.get_setting("stack_mode", "hybrid").strip().lower() or "hybrid"
+            tg_secret = GuiBackend(db_path=db_path, configs_dir=configs_dir, lists_dir=lists_dir, bin_dir=bin_dir, logs_dir=logs_dir).get_tg_ws_secret(storage)
+            dns_orch = DnsLayerOrchestrator()
+            active_dns = dns_orch.get_active_dns(storage)
+            dns_catalog_map = {s["id"]: s for s in dns_orch.get_all_dns_servers(storage)}
+            vpn_policy = storage.get_vpn_selection_policy()
+            health_map = storage.get_vpn_node_health_map()
+            vpn_orch = VpnLayerOrchestrator()
+            quarantined_tags = {
+                tag
+                for tag, rec in health_map.items()
+                if str(rec.get("cb_state") or "") == "open"
+                and not vpn_orch._is_quarantine_expired(str(rec.get("quarantined_until") or ""))
+            }
+            guard = build_unlocker_protection_context(storage=storage)
+        finally:
+            storage.close()
+
+        if guard["enabled"]:
+            prot_doms = set(guard["domains"])
+            explicit_per_dns = {
+                d.domain.lower()
+                for d in decisions
+                if d.layer == "dns" and isinstance(d.strategy_id, str) and d.strategy_id.startswith("dns:")
+            }
+            decisions = [
+                d
+                for d in decisions
+                if not (
+                    d.layer in ("dpi", "vpn")
+                    and any(
+                        d.domain.lower() == pd or d.domain.lower().endswith("." + pd)
+                        for pd in prot_doms
+                    )
+                )
+            ]
+            exclude_domains = [dom for dom in guard["domains"] if dom not in explicit_per_dns]
+            exclude_ips = list(guard["proxy_ips"])
+            extra_procs = list(guard["processes"])
+        else:
+            exclude_domains = []
+            exclude_ips = []
+            extra_procs = []
+
+        vpn_ips = [n.server for n in vpn_nodes if n.server] + exclude_ips
+        effective_iface = iface if iface is not None else detect_physical_egress_iface()
+        winws_args, hostlists = generate_winws2_config(
+            decisions=decisions,
+            strategies=strategies,
+            lists_dir=lists_dir,
+            vpn_server_ips=vpn_ips,
+            iface=effective_iface,
+            game_filter=game_filter,
+            exclude_domains=exclude_domains,
+            expand_cdn_domains=True,
+            enable_tcp_in=True,
+        )
+
+        cfg_path.mkdir(parents=True, exist_ok=True)
+        winws_preset_file.write_text("\n".join(winws_args) + "\n", encoding="utf-8")
+
+        badges = list(active_dns.get("badges") or [])
+        doh_url = str(active_dns.get("doh_url") or "")
+        use_https = ("DoH" in badges) or doh_url.startswith("https://")
+        dns_type = "https" if use_https else "udp"
+        parsed_doh = urllib.parse.urlparse(doh_url) if doh_url.startswith("https://") else None
+        doh_path = (parsed_doh.path or "/dns-query") if parsed_doh else "/dns-query"
+        doh_tls_sni = parsed_doh.hostname if (parsed_doh and parsed_doh.hostname) else None
+
+        has_real_vpn = stack_mode != "dpi_only" and has_usable_vpn_nodes(vpn_nodes)
+        singbox_decisions = (
+            decisions
+            if has_real_vpn
+            else [d for d in decisions if not (d.layer == "vpn" and not getattr(d, "pinned", False))]
+        )
+
+        generate_singbox_config(
+            decisions=singbox_decisions,
+            vpn_nodes=vpn_nodes,
+            output_path=singbox_file,
+            doh_server=str(active_dns.get("ip") or doh_tls_sni or "1.1.1.1"),
+            dns_type=dns_type,
+            doh_path=doh_path,
+            dns_catalog=dns_catalog_map,
+            bypass_domains=exclude_domains,
+            extra_bypass_processes=extra_procs,
+            quarantined_tags=quarantined_tags,
+            use_wireguard_endpoints=True,
+            doh_tls_sni=doh_tls_sni,
+            vpn_selection_mode=vpn_policy["mode"],
+            preferred_vpn_node=vpn_policy["priority_node"] or None,
+        )
+        hostlists_cnt = len(hostlists)
+        vpn_nodes_cnt = len(vpn_nodes)
+        xray_bridge_cnt = 0
+        xray_file = None
+
+    console.print(f"[green]Generated winws2 preset:[/green] {winws_preset_file} ({hostlists_cnt} hostlists)")
+    console.print(f"[green]Generated sing-box config:[/green] {singbox_file} ({vpn_nodes_cnt} VPN nodes in urltest)")
 
     if no_start:
         return
@@ -479,13 +507,23 @@ def cmd_apply(
                     "--port",
                     "10808",
                     "--secret",
-                    "0123456789abcdef0123456789abcdef",
+                    "0123456789abcdef0123456789abcdef" if profile is not None else tg_secret,
                 ],
                 tg_script.parent.parent,
             )
         )
     elif tg_exe.is_file():
         specs.append(("tg-ws-proxy", [str(tg_exe)], tg_exe.parent))
+
+    ciadpi_exe = bin_path / "ciadpi.exe"
+    if byedpi_fallback and ciadpi_exe.is_file():
+        specs.append(
+            (
+                "byedpi",
+                [str(ciadpi_exe), "--ip", "127.0.0.1", "--port", "10809", "--disorder", "1", "--tlsrec", "1+s"],
+                bin_path,
+            )
+        )
 
     live_winws_args = _resolve_winws2_live_args(winws_args, lists_path, bin_path=bin_path)
     specs.append(
@@ -495,7 +533,11 @@ def cmd_apply(
             bin_path,
         )
     )
-    specs.append(("sing-box", [str(singbox_exe), "run", "-c", str(singbox_file.resolve())], bin_path))
+    if stack_mode != "dpi_only":
+        xray_exe = bin_path / "xray.exe"
+        if xray_bridge_cnt > 0 and xray_exe.is_file() and xray_file is not None and xray_file.is_file():
+            specs.append(("xray", [str(xray_exe), "run", "-c", str(xray_file.resolve())], bin_path))
+        specs.append(("sing-box", [str(singbox_exe), "run", "-c", str(singbox_file.resolve())], bin_path))
 
     sup = ProcessSupervisor(bin_dir=bin_path, logs_dir=logs_path)
     stop_requested = False

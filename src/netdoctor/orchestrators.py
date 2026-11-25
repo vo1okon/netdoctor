@@ -21,6 +21,7 @@ import psutil
 
 from netdoctor.clash_api import ClashApiClient
 from netdoctor.classifier import classify_probes
+from netdoctor.config_gen import is_game_process, parse_process_list
 from netdoctor.dynamics import parse_circular_rotations, promote_fallback_on_failure
 from netdoctor.models import (
     Decision,
@@ -382,12 +383,17 @@ _TELEMETRY_NOISE_SUFFIXES: tuple[str, ...] = (
 _RDNS_PTR_SUFFIXES: tuple[str, ...] = (
     "1e100.net",
     "akamaitechnologies.com",
+    "deploy.static.akamaitechnologies.com",
+    "akamaiedge.net",
+    "edgekey.net",
     "bc.googleusercontent.com",
+    "fastly.net",
     "compute.amazonaws.com",
     "compute-1.amazonaws.com",
     "in-addr.arpa",
     "ip6.arpa",
 )
+_WEB_PORTS: frozenset[int] = frozenset({80, 443, 8080, 8443})
 _RDNS_PTR_PREFIX_RE = re.compile(
     r"^(?:a\d+-\d+-\d+-\d+|ec2-\d+-\d+-\d+-\d+|server-\d+-\d+-\d+-\d+|(?:\d{1,3}-){3}\d{1,3})\.",
     re.IGNORECASE,
@@ -431,24 +437,49 @@ def _is_ip_literal(value: str) -> bool:
         return False
 
 
-def _parse_singbox_failed_ips(sb_tail: str) -> set[str]:
-    failed: set[str] = set()
+_SINGBOX_IP_PORT_RE = re.compile(
+    r"(?:\[([0-9a-fA-F:]+)\]|(\d{1,3}(?:\.\d{1,3}){3})):(\d{1,5})\b"
+)
+
+
+def _parse_singbox_failed_endpoints(sb_tail: str) -> tuple[set[str], set[tuple[str, int]]]:
+    """Extract failed external IPs and `(ip, port)` endpoints from sing-box error log lines."""
+    ip_only: set[str] = set()
+    endpoints: set[tuple[str, int]] = set()
     if not sb_tail:
-        return failed
+        return ip_only, endpoints
     clean_tail = _ANSI_RE.sub("", sb_tail)
     for m in _SINGBOX_CONN_ERR_RE.finditer(clean_tail):
+        line_text = m.group(0)
+        port = 0
         ip_cand = m.group(1) or m.group(2)
         if not ip_cand:
-            dial_m = _SINGBOX_DIAL_IP_RE.search(m.group(0))
+            dial_m = _SINGBOX_DIAL_IP_RE.search(line_text)
             if dial_m:
                 ip_cand = dial_m.group(1) or dial_m.group(2)
         if not ip_cand:
-            arrow_m = _SINGBOX_ARROW_IP_RE.search(m.group(0))
+            arrow_m = _SINGBOX_ARROW_IP_RE.search(line_text)
             if arrow_m:
                 ip_cand = arrow_m.group(1) or arrow_m.group(2)
         if ip_cand and _is_external_ip(ip_cand):
-            failed.add(ip_cand)
-    return failed
+            for pm in _SINGBOX_IP_PORT_RE.finditer(line_text):
+                p_ip = pm.group(1) or pm.group(2)
+                if p_ip == ip_cand:
+                    try:
+                        port = int(pm.group(3) or 0)
+                    except (TypeError, ValueError):
+                        port = 0
+                    break
+            if port > 0:
+                endpoints.add((ip_cand, port))
+            else:
+                ip_only.add(ip_cand)
+    return ip_only, endpoints
+
+
+def _parse_singbox_failed_ips(sb_tail: str) -> set[str]:
+    ip_only, endpoints = _parse_singbox_failed_endpoints(sb_tail)
+    return ip_only | {ip for ip, _port in endpoints}
 
 
 _SINGBOX_DNS_CNAME_RE = re.compile(
@@ -509,28 +540,46 @@ def _parse_singbox_failed_targets(sb_tail: str) -> list[str]:
         cand: str | None = None
         m = _SINGBOX_CONN_ERR_RE.search(line)
         if m:
+            line_text = m.group(0)
             ip_cand = m.group(1) or m.group(2)
             if not ip_cand:
-                dial_m = _SINGBOX_DIAL_IP_RE.search(m.group(0))
+                dial_m = _SINGBOX_DIAL_IP_RE.search(line_text)
                 if dial_m:
                     ip_cand = dial_m.group(1) or dial_m.group(2)
             if not ip_cand:
-                arrow_m = _SINGBOX_ARROW_IP_RE.search(m.group(0))
+                arrow_m = _SINGBOX_ARROW_IP_RE.search(line_text)
                 if arrow_m:
                     ip_cand = arrow_m.group(1) or arrow_m.group(2)
-            if ip_cand and _is_external_ip(ip_cand):
+            port_val = 0
+            if ip_cand:
+                for pm in _SINGBOX_IP_PORT_RE.finditer(line_text):
+                    if (pm.group(1) or pm.group(2)) == ip_cand:
+                        try:
+                            port_val = int(pm.group(3) or 0)
+                        except (TypeError, ValueError):
+                            port_val = 0
+                        break
+            if ip_cand and _is_external_ip(ip_cand) and (port_val == 0 or port_val in _WEB_PORTS):
                 cand = ip_cand
-            else:
-                host_m = _SINGBOX_OPEN_HOST_RE.search(m.group(0))
+            elif not (ip_cand and port_val > 0 and port_val not in _WEB_PORTS):
+                host_m = _SINGBOX_OPEN_HOST_RE.search(line_text)
                 if host_m:
                     host_val = host_m.group(1).lower().rstrip(".")
-                    if host_val and not _is_ip_literal(host_val):
+                    try:
+                        host_port = int(host_m.group(2) or 0)
+                    except (TypeError, ValueError):
+                        host_port = 0
+                    if host_val and not _is_ip_literal(host_val) and (host_port == 0 or host_port in _WEB_PORTS):
                         cand = host_val
         if cand is None:
             cm = _SINGBOX_CLOSED_ERR_RE.search(line)
             if cm:
                 ip_cand = cm.group(1) or cm.group(2)
-                if ip_cand and _is_external_ip(ip_cand):
+                try:
+                    cport = int(cm.group(3) or 0)
+                except (TypeError, ValueError):
+                    cport = 0
+                if ip_cand and _is_external_ip(ip_cand) and (cport == 0 or cport in _WEB_PORTS):
                     cand = ip_cand
         if cand and cand not in seen:
             seen.add(cand)
@@ -2650,7 +2699,7 @@ class RealtimeConnectionMonitor:
             str(ev["domain"]).lower() for ev in rotations[-20:] if ev.get("domain")
         }
         sb_tail = _tail_text(logs_dir / "sing-box.log", max_bytes=131072)
-        failed_ips = _parse_singbox_failed_ips(sb_tail)
+        failed_ip_only, failed_endpoints = _parse_singbox_failed_endpoints(sb_tail)
 
         healthy_clash_endpoints: set[tuple[str, int, str]] = set()
         healthy_clash_domains: set[str] = set()
@@ -2800,7 +2849,12 @@ class RealtimeConnectionMonitor:
                 health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
             elif is_telemetry:
                 health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
-            elif sock_status in ("SYN_SENT", "STALLED") or endpoint_stalled or rip in failed_ips:
+            elif (rport in _WEB_PORTS) and (
+                sock_status in ("SYN_SENT", "STALLED")
+                or endpoint_stalled
+                or (rip, rport) in failed_endpoints
+                or rip in failed_ip_only
+            ):
                 health = "needs_fix"
             elif dec is not None and dec.status != "active":
                 health = "needs_fix"
@@ -2934,6 +2988,7 @@ class RealtimeConnectionMonitor:
         logs_dir: Path,
         max_domains: int,
         protected_domains: set[str] | None = None,
+        vpn_processes: list[str] | None = None,
     ) -> list[tuple[str, str, str]]:
         """Return list of (domain, process_name, reason) eligible for real-time healing."""
         now = time.monotonic()
@@ -2959,9 +3014,18 @@ class RealtimeConnectionMonitor:
         )
         for conn in ordered_conns:
             dom = str(conn.get("domain") or "")
+            proc_name = str(conn.get("process") or "")
+            proto_val = str(conn.get("protocol") or "").lower()
+            try:
+                rport_val = int(conn.get("remote_port") or 0)
+            except (TypeError, ValueError):
+                rport_val = 0
             if (
                 conn.get("layer") == "unlocker"
                 or conn.get("health") != "needs_fix"
+                or (proto_val and proto_val not in ("tls", "http"))
+                or (rport_val > 0 and rport_val not in _WEB_PORTS)
+                or is_game_process(proc_name, extra_processes=vpn_processes or ())
                 or not dom
                 or dom == "—"
                 or _is_rdns_ptr_hostname(dom)
@@ -3062,11 +3126,13 @@ class RealtimeConnectionMonitor:
                 with self._lock:
                     events = list(self.recent_events)
                 return {"connections": connections, "healed": [], "events": events, "preset_locked": True}
+            vpn_procs = parse_process_list(storage.get_setting("vpn_processes", ""))
             candidates = self._collect_fix_candidates(
                 connections,
                 logs_dir,
                 max_domains_per_tick,
                 protected_domains=set(guard["domains"]) if guard["enabled"] else None,
+                vpn_processes=vpn_procs,
             )
         finally:
             storage.close()
@@ -3172,6 +3238,9 @@ class RealtimeConnectionMonitor:
         storage = Storage(backend.db_path)
         try:
             for (dom, proc_name, reason, existing), probes in zip(eligible, probes_list):
+                if existing is None and probes.tcp.result == "refused":
+                    # Port closed/refused on remote host (not DPI/block); never persist direct/dpi noise
+                    continue
                 report = classify_probes(domain=dom, probes=probes, network=net, bypass_active=bypass)
                 storage.save_verdict(net_key, report, protocol=Protocol.TLS)
 
@@ -3358,7 +3427,9 @@ class RealtimeConnectionMonitor:
             is_adm = _is_admin()
             urgent_reload = bool(has_new_domain or bypass_fell)
             defer_active = bool(bypass)
-            if ((procs.get("winws2") or {}).get("running")) and is_adm:
+            reloaded_any = False
+            if winws2_changed and ((procs.get("winws2") or {}).get("running")) and is_adm:
+                reloaded_any = True
                 if hasattr(backend, "reload_winws2_if_changed"):
                     w_res = backend.reload_winws2_if_changed(
                         min_interval_sec=0.0 if urgent_reload else 20.0,
@@ -3368,10 +3439,9 @@ class RealtimeConnectionMonitor:
                         reload_deferred.append("winws2")
                 else:
                     backend.reload_winws2()
-            else:
-                backend.trigger_apply_configs()
 
             if singbox_changed and ((procs.get("sing-box") or {}).get("running")) and is_adm:
+                reloaded_any = True
                 if hasattr(backend, "reload_singbox_if_changed"):
                     sb_res = backend.reload_singbox_if_changed(
                         min_interval_sec=0.0 if urgent_reload else 15.0,
@@ -3381,6 +3451,9 @@ class RealtimeConnectionMonitor:
                         reload_deferred.append("sing-box")
                 else:
                     backend.reload_singbox()
+
+            if not reloaded_any:
+                backend.trigger_apply_configs()
 
         if any_saved:
             # Re-scan after healing so returned connections reflect new strategies

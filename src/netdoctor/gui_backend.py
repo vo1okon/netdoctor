@@ -36,11 +36,14 @@ from netdoctor.config_gen import (
     generate_singbox_config,
     generate_winws2_config,
     generate_xray_bridge_config,
+    is_game_process,
     needs_xray_bridge,
+    parse_process_list,
 )
 from netdoctor.dynamics import promote_fallback_on_failure, run_canary_cycle
 from netdoctor.models import Decision, Protocol, Strategy, VerdictClass, VpnNode
 from netdoctor.orchestrators import (
+    AI_GEOBLOCK_DOMAINS,
     ANTIGRAVITY_CRITICAL_DOMAINS,
     DNS_CATEGORIES,
     SERVICE_PRESETS,
@@ -425,29 +428,7 @@ def launch_gui_detached(
 _WEB_KEEPALIVE_PORTS: frozenset[int] = frozenset({53, 80, 443, 8080, 8443})
 _ACTIVE_FLOW_IDLE_SEC: float = 15.0
 _ACTIVE_SESSION_GRACE_SEC: float = 60.0
-_GAME_PROCESS_HINTS: tuple[str, ...] = (
-    "javaw.exe",
-    "java.exe",
-    "minecraft",
-    "cs2.exe",
-    "dota2.exe",
-    "valorant",
-    "roblox",
-    "r5apex.exe",
-    "gta5.exe",
-    "overwatch.exe",
-    "rustclient.exe",
-    "fortnite",
-    "escapefromtarkov",
-    "deadlock",
-    "wow.exe",
-    "league of legends.exe",
-)
-
-
-def _is_game_process(proc_name: str) -> bool:
-    low = (proc_name or "").strip().lower()
-    return bool(low and any(hint in low for hint in _GAME_PROCESS_HINTS))
+_LOCAL_UDP_NOISE_PORTS: frozenset[int] = frozenset({137, 138, 1900, 5353, 5355})
 
 
 class GuiBackend:
@@ -735,8 +716,10 @@ class GuiBackend:
             all_dns = self.orchestrator.dns.get_all_dns_servers(storage)
             game_filter = storage.get_setting("game_filter", "0") == "1"
             auto_start_protection = storage.get_setting("auto_start_protection", "0") == "1"
+            auto_heal_enabled = storage.get_setting("auto_heal_enabled", "1") != "0"
             byedpi_fallback = storage.get_setting("byedpi_fallback", "0") == "1"
             winws2_debug_log = storage.get_setting("winws2_debug_log", "0") == "1"
+            vpn_processes = parse_process_list(storage.get_setting("vpn_processes", ""))
             stack_mode = storage.get_setting("stack_mode", "hybrid").strip() or "hybrid"
             if stack_mode not in ("hybrid", "dpi_only"):
                 stack_mode = "hybrid"
@@ -850,6 +833,8 @@ class GuiBackend:
             "dns_servers_count": len(all_dns),
             "game_filter": game_filter,
             "auto_start_protection": auto_start_protection,
+            "auto_heal_enabled": auto_heal_enabled,
+            "vpn_processes": ", ".join(vpn_processes),
             "byedpi_fallback": byedpi_fallback,
             "winws2_debug_log": winws2_debug_log,
             "stack_mode": stack_mode,
@@ -1197,6 +1182,7 @@ class GuiBackend:
 
         self.trigger_apply_configs()
         self._reload_running_services(singbox=True)
+        self.flush_windows_dns_cache()
         return self._merge_dns_ping_cache([match])[0]
 
     def add_custom_dns(
@@ -1445,6 +1431,47 @@ class GuiBackend:
         self._reload_running_services(winws2=True, singbox=True)
         return {"guard": guard, "applied": applied}
 
+    def get_vpn_processes(self, storage: Storage | None = None) -> list[str]:
+        """Return list of user-configured `.exe` processes forced through `vpn-select`."""
+        own_st = storage is None
+        st = storage if storage is not None else Storage(self.db_path)
+        try:
+            return parse_process_list(st.get_setting("vpn_processes", ""))
+        finally:
+            if own_st:
+                st.close()
+
+    def set_vpn_processes(self, raw_text: str) -> dict[str, Any]:
+        """Persist comma/newline-separated `.exe` names routed via VPN, rebuild configs, and reload sing-box."""
+        procs = parse_process_list(raw_text)
+        storage = Storage(self.db_path)
+        try:
+            storage.set_setting("vpn_processes", ", ".join(procs))
+        finally:
+            storage.close()
+        applied = self.trigger_apply_configs()
+        self._reload_running_services(singbox=True)
+        return {"vpn_processes": procs, "applied": applied}
+
+    def get_auto_heal_enabled(self, storage: Storage | None = None) -> bool:
+        """Return True if Live-Radar real-time auto-heal is enabled."""
+        own_st = storage is None
+        st = storage if storage is not None else Storage(self.db_path)
+        try:
+            return st.get_setting("auto_heal_enabled", "1") != "0"
+        finally:
+            if own_st:
+                st.close()
+
+    def set_auto_heal_enabled(self, enabled: bool) -> dict[str, Any]:
+        """Persist Live-Radar auto-heal toggle state across restarts."""
+        storage = Storage(self.db_path)
+        try:
+            storage.set_setting("auto_heal_enabled", "1" if enabled else "0")
+        finally:
+            storage.close()
+        return {"auto_heal_enabled": bool(enabled)}
+
     def flush_windows_dns_cache(self) -> dict[str, Any]:
         """Clear OS DNS resolver cache (`ipconfig /flushdns`) so DNS changes take effect immediately."""
         try:
@@ -1460,6 +1487,18 @@ class GuiBackend:
             return {"ok": res.returncode == 0, "output": out or "DNS cache flushed"}
         except OSError as exc:
             return {"ok": False, "output": str(exc)}
+
+    def cleanup_stale_db_rules(self) -> dict[str, Any]:
+        """Remove stale unpinned direct/rDNS decisions for the active network and rebuild configs."""
+        storage = Storage(self.db_path)
+        try:
+            net_key, _, _, _ = self._resolve_network_info(storage)
+            removed = storage.cleanup_stale_decisions(net_key)
+        finally:
+            storage.close()
+        applied = self.trigger_apply_configs()
+        self._reload_running_services(winws2=True, singbox=True)
+        return {"ok": True, "removed": removed, "network_key": net_key, "applied": applied}
 
     def get_domain_rows(self, net_key: str | None = None) -> list[dict[str, Any]]:
         """Query decisions joined with verdicts and strategies for the active or specified network."""
@@ -2469,6 +2508,7 @@ class GuiBackend:
                     tun_stack = "gvisor"
                 active_preset_id, active_preset_name, active_preset = self._resolve_active_zapret_preset(storage)
                 base_preset_id, base_preset_name, base_preset = self._resolve_base_zapret_preset(storage)
+                vpn_processes = parse_process_list(storage.get_setting("vpn_processes", ""))
                 vpn_policy = storage.get_vpn_selection_policy()
                 health_map = storage.get_vpn_node_health_map()
                 quarantined_tags = {
@@ -2485,13 +2525,15 @@ class GuiBackend:
                         for d in decisions
                         if d.layer == "dns" and isinstance(d.strategy_id, str) and d.strategy_id.startswith("dns:")
                     }
-                    # Purge conflicting DPI/VPN overrides from DB for hosts/Antigravity-managed domains
+                    # Purge non-pinned conflicting DPI/VPN overrides from DB for hosts/Antigravity-managed domains
                     cleaned_any = False
                     with storage.conn:
                         for d in decisions:
                             low = d.domain.lower()
-                            if d.layer in ("dpi", "vpn") and any(
-                                low == pd or low.endswith("." + pd) for pd in prot_doms
+                            if (
+                                not getattr(d, "pinned", False)
+                                and d.layer in ("dpi", "vpn")
+                                and any(low == pd or low.endswith("." + pd) for pd in prot_doms)
                             ):
                                 storage.conn.execute(
                                     "DELETE FROM decisions WHERE network_key = ? AND domain = ? AND protocol = ?",
@@ -2539,11 +2581,13 @@ class GuiBackend:
                     winws_args = []
             self._last_preset_error = preset_error
 
-            has_real_vpn = stack_mode != "dpi_only" and has_usable_vpn_nodes(vpn_nodes)
+            has_vpn_nodes = has_usable_vpn_nodes(vpn_nodes)
+            has_real_vpn = stack_mode != "dpi_only" and has_vpn_nodes
             singbox_decisions = decisions
             winws_decisions = decisions
             if not has_real_vpn:
-                # Never route non-pinned rules into sing-box VPN when no usable VPN exists
+                # Never route non-pinned rules into sing-box VPN when no usable VPN exists;
+                # persist vpn->dpi only when no usable VPN nodes exist at all so toggling dpi_only preserves DB rules.
                 singbox_decisions = [
                     d for d in decisions if not (d.layer == "vpn" and not getattr(d, "pinned", False))
                 ]
@@ -2573,7 +2617,8 @@ class GuiBackend:
                                     }
                                 )
                                 remapped.append(converted)
-                                to_persist.append(converted)
+                                if not has_vpn_nodes:
+                                    to_persist.append(converted)
                             continue
                         remapped.append(d)
                     winws_decisions = remapped
@@ -2652,7 +2697,7 @@ class GuiBackend:
             xray_bridge_ports: dict[str, int] = {}
             xray_valid = True
             xray_err = ""
-            if xray_exe.is_file() and any(needs_xray_bridge(n) for n in vpn_nodes):
+            if stack_mode != "dpi_only" and xray_exe.is_file() and any(needs_xray_bridge(n) for n in vpn_nodes):
                 _xcfg, candidate_ports = generate_xray_bridge_config(
                     vpn_nodes,
                     output_path=xray_file,
@@ -2680,6 +2725,7 @@ class GuiBackend:
             else:
                 xray_file.unlink(missing_ok=True)
 
+            primary_is_smartdns = str(active_dns.get("category") or "").strip().lower() == "ai_bypass"
             singbox_file = self.configs_dir / "sing-box.json"
             generate_singbox_config(
                 decisions=singbox_decisions,
@@ -2701,6 +2747,10 @@ class GuiBackend:
                 vpn_selection_mode=vpn_policy["mode"],
                 preferred_vpn_node=vpn_policy["priority_node"] or None,
                 xray_bridge_ports=xray_bridge_ports or None,
+                vpn_processes=vpn_processes,
+                bypass_ips=exclude_ips,
+                primary_is_smartdns=primary_is_smartdns,
+                smartdns_domains=list(AI_GEOBLOCK_DOMAINS),
             )
             sb_hash = hashlib.sha256(singbox_file.read_bytes()).hexdigest()
             sb_exe = self.bin_dir.resolve() / "sing-box.exe"
@@ -2735,6 +2785,7 @@ class GuiBackend:
                 "preset_compile_error": preset_error,
                 "tun_stack": tun_stack,
                 "winws2_iface": effective_iface,
+                "vpn_processes": vpn_processes,
             }
 
     def get_tg_ws_secret(self, storage: Storage | None = None) -> str:
@@ -3415,8 +3466,9 @@ class GuiBackend:
             }
 
     def _scan_psutil_stateful_connections(self) -> list[dict[str, Any]]:
-        """Inspect host TCP ESTABLISHED & connected UDP sockets via psutil for active game/voice/non-web traffic."""
+        """Inspect host TCP ESTABLISHED & UDP sockets via psutil for active game/voice/non-web traffic."""
         found: list[dict[str, Any]] = []
+        vpn_procs = self.get_vpn_processes()
         for c in RealtimeConnectionMonitor._read_inet_connections():
             sock_type = getattr(c, "type", socket.SOCK_STREAM)
             is_tcp = sock_type == socket.SOCK_STREAM
@@ -3425,14 +3477,6 @@ class GuiBackend:
                 if str(getattr(c, "status", "") or "") != "ESTABLISHED":
                     continue
             elif not is_udp:
-                continue
-
-            raddr = getattr(c, "raddr", None)
-            if not raddr:
-                continue
-            rip = str(getattr(raddr, "ip", None) or (raddr[0] if len(raddr) >= 1 else ""))
-            rport = int(getattr(raddr, "port", None) or (raddr[1] if len(raddr) >= 2 else 0))
-            if not rip or not _is_external_ip(rip) or rport <= 0:
                 continue
 
             pid = getattr(c, "pid", None)
@@ -3444,7 +3488,31 @@ class GuiBackend:
             ):
                 continue
 
-            if rport in _WEB_KEEPALIVE_PORTS and not _is_game_process(proc_name):
+            is_game_proc = is_game_process(proc_name, extra_processes=vpn_procs)
+            raddr = getattr(c, "raddr", None)
+            if not raddr:
+                # Windows games (Rainbow Six, Apex, etc.) typically use unconnected UDP sockets (raddr is empty)
+                if is_udp and is_game_proc:
+                    laddr = getattr(c, "laddr", None)
+                    lport = int(getattr(laddr, "port", 0) if laddr else 0)
+                    lip = str(getattr(laddr, "ip", "") or (laddr[0] if laddr and len(laddr) >= 1 else ""))
+                    if lport > 0 and lport not in _LOCAL_UDP_NOISE_PORTS and lip not in ("127.0.0.1", "::1"):
+                        found.append(
+                            {
+                                "process": proc_name,
+                                "remote": f"*:{lport}",
+                                "port": lport,
+                                "stateful": True,
+                                "flowing": True,
+                            }
+                        )
+                continue
+            rip = str(getattr(raddr, "ip", None) or (raddr[0] if len(raddr) >= 1 else ""))
+            rport = int(getattr(raddr, "port", None) or (raddr[1] if len(raddr) >= 2 else 0))
+            if not rip or not _is_external_ip(rip) or rport <= 0:
+                continue
+
+            if rport in _WEB_KEEPALIVE_PORTS and not is_game_proc:
                 continue
 
             found.append(
@@ -3463,6 +3531,7 @@ class GuiBackend:
         procs = self._collect_processes_state()
         sb_running = bool((procs.get("sing-box") or {}).get("running"))
         winws_running = bool((procs.get("winws2") or {}).get("running"))
+        vpn_procs = self.get_vpn_processes()
         protected: list[dict[str, Any]] = []
         now = time.monotonic()
 
@@ -3523,7 +3592,11 @@ class GuiBackend:
                         dn = int(c.get("download") or 0)
                     except (TypeError, ValueError):
                         continue
-                    if up <= 0 or dn <= 0:
+                    is_game_proc = is_game_process(proc_name, extra_processes=vpn_procs)
+                    if is_game_proc:
+                        if up <= 0 and dn <= 0:
+                            continue
+                    elif up <= 0 or dn <= 0:
                         continue
 
                     total = up + dn
@@ -3546,7 +3619,7 @@ class GuiBackend:
                             self._clash_conn_traffic[conn_id] = (total, now)
                             actively_flowing = True
 
-                    is_stateful = (rport not in _WEB_KEEPALIVE_PORTS) or _is_game_process(proc_name)
+                    is_stateful = (rport not in _WEB_KEEPALIVE_PORTS) or is_game_proc
                     if is_stateful:
                         self._last_stateful_session_ts = now
                     if is_stateful or actively_flowing:
@@ -3759,6 +3832,7 @@ class GuiBackend:
                     network_changed = True
                     clear_vpn_dns_cache()
                     clear_network_fingerprint_cache()
+                    self.flush_windows_dns_cache()
                     if sb_running and stack_mode != "dpi_only":
                         sb_net_res = self.reload_singbox()
                         if sb_net_res.get("ok") and "sing-box" not in restarted:
@@ -4371,6 +4445,23 @@ class GuiBackend:
         finally:
             storage.close()
         applied = self.trigger_apply_configs()
+        procs = self._collect_processes_state()
+        stack_active = bool(
+            (procs.get("winws2") or {}).get("running")
+            or (procs.get("sing-box") or {}).get("running")
+        )
+        if stack_active and _is_admin():
+            sup = ProcessSupervisor(bin_dir=self.bin_dir, logs_dir=self.logs_dir)
+            ciadpi_exe = self.bin_dir.resolve() / "ciadpi.exe"
+            if enabled and ciadpi_exe.is_file():
+                if not bool((procs.get("byedpi") or {}).get("running")):
+                    sup.start_process(
+                        "byedpi",
+                        [str(ciadpi_exe), "--ip", "127.0.0.1", "--port", "10809", "--disorder", "1", "--tlsrec", "1+s"],
+                        cwd=self.bin_dir.resolve(),
+                    )
+            elif not enabled:
+                sup.stop_process("byedpi")
         self._reload_running_services(singbox=True)
         return {"byedpi_fallback": bool(enabled), "applied": applied}
 

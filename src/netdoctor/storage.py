@@ -225,9 +225,28 @@ class Storage:
 
     def upsert_network(self, net: NetworkFingerprint) -> str:
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        target_net = net
+        if target_net.asn == 0 and target_net.gateway_mac:
+            existing_row = self.conn.execute(
+                """
+                SELECT network_key, asn, isp
+                FROM networks
+                WHERE kind = ? AND gateway_mac = ? AND asn > 0
+                ORDER BY last_seen DESC
+                LIMIT 1
+                """,
+                (target_net.kind.value, target_net.gateway_mac),
+            ).fetchone()
+            if existing_row is not None:
+                target_net = target_net.model_copy(
+                    update={
+                        "asn": int(existing_row["asn"]),
+                        "isp": target_net.isp if target_net.isp and target_net.isp != "Unknown ISP" else str(existing_row["isp"] or "Unknown ISP"),
+                    }
+                )
         with self.conn:
             row = self.conn.execute(
-                "SELECT first_seen FROM networks WHERE network_key = ?", (net.key,)
+                "SELECT first_seen FROM networks WHERE network_key = ?", (target_net.key,)
             ).fetchone()
             first_seen = row["first_seen"] if row else now
             self.conn.execute(
@@ -238,16 +257,24 @@ class Storage:
                     last_seen = excluded.last_seen,
                     isp = excluded.isp
                 """,
-                (net.key, net.asn, net.kind.value, net.isp, net.gateway_mac, first_seen, now),
+                (
+                    target_net.key,
+                    target_net.asn,
+                    target_net.kind.value,
+                    target_net.isp,
+                    target_net.gateway_mac,
+                    first_seen,
+                    now,
+                ),
             )
-            if net.asn > 0 and net.gateway_mac:
+            if target_net.asn > 0 and target_net.gateway_mac:
                 existing_cnt = int(
                     self.conn.execute(
-                        "SELECT COUNT(*) FROM decisions WHERE network_key = ?", (net.key,)
+                        "SELECT COUNT(*) FROM decisions WHERE network_key = ?", (target_net.key,)
                     ).fetchone()[0]
                 )
                 if existing_cnt == 0:
-                    legacy_key = f"AS0:{net.kind.value}:{net.gateway_mac}"
+                    legacy_key = f"AS0:{target_net.kind.value}:{target_net.gateway_mac}"
                     self.conn.execute(
                         """
                         INSERT OR IGNORE INTO decisions (
@@ -273,9 +300,9 @@ class Storage:
                               )
                           )
                         """,
-                        (net.key, legacy_key, legacy_key),
+                        (target_net.key, legacy_key, legacy_key),
                     )
-        return net.key
+        return target_net.key
 
     def save_verdict(
         self,
@@ -1100,6 +1127,32 @@ class Storage:
                     """,
                     (round(float(success_rate), 1), now, now, preset_id.strip()),
                 )
+
+    def cleanup_stale_decisions(self, network_key: str) -> int:
+        """Delete stale non-pinned direct/rDNS/DNS-infra decisions from a network bucket."""
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                DELETE FROM decisions
+                WHERE network_key = ?
+                  AND COALESCE(pinned, 0) = 0
+                  AND (
+                      layer = 'direct'
+                      OR domain LIKE '%.in-addr.arpa'
+                      OR domain LIKE '%.ip6.arpa'
+                      OR domain LIKE '%.1e100.net'
+                      OR domain LIKE '%.akamaitechnologies.com'
+                      OR domain LIKE '%.bc.googleusercontent.com'
+                      OR domain LIKE '%.compute.amazonaws.com'
+                      OR domain LIKE '%.compute-1.amazonaws.com'
+                      OR domain LIKE 'ec2-%'
+                      OR domain LIKE 'server-%'
+                      OR domain LIKE '%.local'
+                  )
+                """,
+                (network_key,),
+            )
+        return int(cur.rowcount or 0)
 
     def close(self) -> None:
         self.conn.close()

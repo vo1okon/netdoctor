@@ -638,9 +638,10 @@ def test_xray_bridge_config_and_singbox_mtu_and_scoped_sniff(tmp_path: Path) -> 
     assert obs["PL-TLS"]["type"] == "vless"
     assert obs["FI-Hy2"]["type"] == "hysteria2"
 
-    # TUN MTU & scoped sniff
+    # TUN MTU, endpoint_independent_nat & scoped sniff
     tun_in = next(i for i in sb_cfg["inbounds"] if i.get("type") == "tun")
-    assert tun_in["mtu"] == 9000
+    assert tun_in["mtu"] == 1500
+    assert tun_in["endpoint_independent_nat"] is True
     assert sb_cfg["route"]["rules"][0] == {
         "port": [53, 80, 443, 8080, 8443],
         "action": "sniff",
@@ -1338,6 +1339,242 @@ def test_auto_heal_immediate_on_new_domain_or_down_bypass(
         st2.close()
     asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
     assert seen_w_calls == [{"min_interval_sec": 0.0, "defer_if_active": False}]
+
+
+def test_generate_singbox_vpn_processes_and_smartdns_split(tmp_path: Path) -> None:
+    for exe in ("RainbowSix.exe", "RainbowSix_DX12.exe", "BEService.exe", "BEService_x64.exe"):
+        assert exe in DEFAULT_GAME_PROCESSES
+
+    node = VpnNode(
+        tag="FI-VLESS",
+        protocol="vless",
+        server="198.51.100.10",
+        server_port=443,
+        raw_outbound={"type": "vless", "server": "198.51.100.10", "server_port": 443, "uuid": "11111111-1111-1111-1111-111111111111"},
+    )
+    xcfg, _ = generate_xray_bridge_config(
+        [
+            VpnNode(
+                tag="R-Node",
+                protocol="vless",
+                server="198.51.100.11",
+                server_port=443,
+                raw_outbound={
+                    "type": "vless",
+                    "server": "198.51.100.11",
+                    "server_port": 443,
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                    "tls": {"enabled": True, "reality": {"enabled": True, "public_key": "pk", "short_id": "aa"}},
+                },
+            )
+        ]
+    )
+    assert xcfg["inbounds"][0]["settings"]["ip"] == "127.0.0.1"
+
+    sb_cfg = generate_singbox_config(
+        decisions=[
+            Decision(network_key="AS8402:home:m", domain="gemini.google.com", protocol=Protocol.TLS, layer="dns"),
+            Decision(network_key="AS8402:home:m", domain="blocked.example", protocol=Protocol.TLS, layer="vpn", strategy_id="vpn-select"),
+        ],
+        vpn_nodes=[node],
+        output_path=tmp_path / "sb.json",
+        doh_server="91.239.100.100",
+        vpn_processes=["RainbowSix.exe", "upc.exe"],
+        bypass_ips=["198.51.100.55"],
+        primary_is_smartdns=True,
+        smartdns_domains=["gemini.google.com", "chatgpt.com"],
+    )
+    vless_ob = next(o for o in sb_cfg["outbounds"] if o.get("tag") == "FI-VLESS")
+    assert vless_ob["packet_encoding"] == "xudp"
+    assert sb_cfg["dns"]["final"] == "dns-local"
+    assert any(s["tag"] == "dns-public-doh" for s in sb_cfg["dns"]["servers"])
+    assert {"process_name": ["RainbowSix.exe", "upc.exe"], "server": "dns-public-doh"} in sb_cfg["dns"]["rules"]
+
+    rules = sb_cfg["route"]["rules"]
+    vpn_proc_idx = next(i for i, r in enumerate(rules) if r.get("process_name") == ["RainbowSix.exe", "upc.exe"])
+    game_proc_idx = next(
+        i
+        for i, r in enumerate(rules)
+        if r.get("type") == "logical" and any("process_name" in sr for sr in r.get("rules", []))
+    )
+    assert vpn_proc_idx < game_proc_idx
+    assert rules[vpn_proc_idx]["outbound"] == "vpn-select"
+    game_list = next(sr["process_name"] for sr in rules[game_proc_idx]["rules"] if "process_name" in sr)
+    assert "RainbowSix.exe" not in game_list
+    assert "upc.exe" not in game_list
+    assert {"ip_cidr": ["198.51.100.55/32"], "outbound": "direct"} in rules
+
+
+def test_storage_as0_reuse_and_cleanup_stale_decisions(tmp_path: Path) -> None:
+    st = Storage(tmp_path / "net.db")
+    try:
+        st.upsert_network(
+            NetworkFingerprint(asn=8402, kind=NetworkKind.HOME, isp="Beeline", gateway_mac="aa:bb:cc:dd:ee:ff")
+        )
+        reused_key = st.upsert_network(
+            NetworkFingerprint(asn=0, kind=NetworkKind.HOME, isp="Unknown ISP", gateway_mac="aa:bb:cc:dd:ee:ff")
+        )
+        assert reused_key == "AS8402:home:aa:bb:cc:dd:ee:ff"
+
+        st.save_decision(Decision(network_key=reused_key, domain="junk.example", protocol=Protocol.TLS, layer="direct"))
+        st.save_decision(Decision(network_key=reused_key, domain="1.2.3.4.in-addr.arpa", protocol=Protocol.TLS, layer="dpi", strategy_id="s1"))
+        st.save_decision(Decision(network_key=reused_key, domain="pinned.example", protocol=Protocol.TLS, layer="direct", pinned=True))
+        st.save_decision(Decision(network_key=reused_key, domain="youtube.com", protocol=Protocol.TLS, layer="dpi", strategy_id="s1"))
+        deleted = st.cleanup_stale_decisions(reused_key)
+        assert deleted == 2
+        left = {d.domain for d in st.get_decisions(reused_key, active_only=False)}
+        assert left == {"pinned.example", "youtube.com"}
+    finally:
+        st.close()
+
+
+def test_trigger_apply_configs_preserves_pinned_and_dpi_only_vpn_rules(tmp_path: Path) -> None:
+    db_path = tmp_path / "db.sqlite"
+    st, nk = _seed_storage(db_path)
+    try:
+        st.save_subscription(
+            "sub1",
+            "https://sub.example/1",
+            [
+                {
+                    "tag": "FI-Real",
+                    "protocol": "vless",
+                    "server": "198.51.100.10",
+                    "server_port": 443,
+                    "raw_outbound": {"type": "vless", "server": "198.51.100.10", "server_port": 443, "uuid": "u"},
+                }
+            ],
+        )
+        st.set_setting("stack_mode", "dpi_only")
+        st.save_decision(
+            Decision(network_key=nk, domain="r6-api.example", protocol=Protocol.TLS, layer="vpn", strategy_id="vpn-select", pinned=False)
+        )
+        st.save_decision(
+            Decision(network_key=nk, domain="antigravity.dev", protocol=Protocol.TLS, layer="vpn", strategy_id="vpn-select", pinned=True)
+        )
+    finally:
+        st.close()
+
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        bin_dir=tmp_path / "bin",
+        logs_dir=tmp_path / "logs",
+    )
+    backend.trigger_apply_configs()
+
+    st2 = Storage(db_path)
+    try:
+        decs = {d.domain: d for d in st2.get_decisions(nk, active_only=False)}
+        assert decs["r6-api.example"].layer == "vpn"
+        assert decs["antigravity.dev"].layer == "vpn"
+        assert decs["antigravity.dev"].pinned is True
+    finally:
+        st2.close()
+
+
+def test_auto_heal_skips_games_udp_refused_and_honors_unconnected_udp_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "ah.sqlite"
+    st, _nk = _seed_storage(db_path)
+    st.set_setting("vpn_processes", "CustomGame.exe")
+    st.close()
+
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        bin_dir=tmp_path / "bin",
+        logs_dir=tmp_path / "logs",
+    )
+
+    conns = [
+        {"domain": "match.ubi.com", "protocol": "udp", "remote_port": 3074, "process": "RainbowSix.exe", "health": "needs_fix", "layer": "direct"},
+        {"domain": "api.ubi.com", "protocol": "tls", "remote_port": 443, "process": "RainbowSix_DX12.exe", "health": "needs_fix", "layer": "direct"},
+        {"domain": "e1.akamaiedge.net", "protocol": "tls", "remote_port": 443, "process": "chrome.exe", "health": "needs_fix", "layer": "direct"},
+        {"domain": "refused.example", "protocol": "tls", "remote_port": 443, "process": "chrome.exe", "health": "needs_fix", "layer": "direct"},
+    ]
+    cands = backend.orchestrator.monitor._collect_fix_candidates(
+        conns, tmp_path / "logs", 5, vpn_processes=["CustomGame.exe"]
+    )
+    assert cands == [("refused.example", "chrome.exe", "degraded/unprotected")]
+
+    # Unconnected UDP socket for RainbowSix.exe must protect winws2 reload
+    monkeypatch.setattr(
+        orch_mod.RealtimeConnectionMonitor,
+        "_read_inet_connections",
+        staticmethod(
+            lambda: [
+                SimpleNamespace(type=sock_mod.SOCK_DGRAM, status="", raddr=(), laddr=SimpleNamespace(ip="0.0.0.0", port=6015), pid=9001),
+            ]
+        ),
+    )
+    monkeypatch.setattr(backend.orchestrator.monitor, "_resolve_pid_name", lambda pid: "RainbowSix.exe")
+    ps_conns = backend._scan_psutil_stateful_connections()
+    assert any(c["process"] == "rainbowsix.exe" and c["port"] == 6015 for c in ps_conns)
+
+    # 1-way UDP upload for game process in Clash API must count as active working connection
+    monkeypatch.setattr(backend, "_collect_processes_state", lambda: {"sing-box": {"running": True}, "winws2": {"running": True}})
+    monkeypatch.setattr(
+        backend.clash_api,
+        "get_connections_sync",
+        lambda: {
+            "connections": [
+                {
+                    "id": "r6-1way",
+                    "upload": 2048,
+                    "download": 0,
+                    "metadata": {"destinationIP": "198.51.100.77", "destinationPort": "3074", "processPath": r"C:\Games\RainbowSix_DX12.exe"},
+                }
+            ]
+        },
+    )
+    assert backend._active_working_connections(service="sing-box")
+
+    # Refused TCP probe must NOT pollute decisions DB
+    monkeypatch.setattr(orch_mod, "detect_bypass_active", lambda: True)
+    monkeypatch.setattr(backend.orchestrator.monitor, "scan_active_connections", lambda *a, **kw: conns)
+    async def _fake_net(*a: Any, **kw: Any) -> NetworkFingerprint:
+        return NetworkFingerprint(asn=8402, kind=NetworkKind.HOME, isp="Beeline", gateway_mac="aa:bb")
+    async def _fake_probes(dom: str, timeout: float = 2.0) -> ProbesSummary:
+        return ProbesSummary(
+            domain=dom,
+            dns=DnsProbeResult(domain=dom, system_ips=["198.51.100.88"], doh_ips=["198.51.100.88"]),
+            tcp=TcpProbeResult(target_ip="198.51.100.88", result="refused"),
+            tls=TlsProbeResult(result="timeout"),
+            quic=QuicProbeResult(result="timeout"),
+            stall=StallProbeResult(result="skipped"),
+        )
+    monkeypatch.setattr(orch_mod, "detect_network_fingerprint", _fake_net)
+    monkeypatch.setattr(orch_mod, "run_domain_probes", _fake_probes)
+    monkeypatch.setattr(orch_mod, "_is_admin", lambda: False)
+    res = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
+    assert res["healed"] == []
+
+
+def test_backend_persists_vpn_processes_and_auto_heal(tmp_path: Path) -> None:
+    db_path = tmp_path / "settings.sqlite"
+    st, _nk = _seed_storage(db_path)
+    st.close()
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        bin_dir=tmp_path / "bin",
+        logs_dir=tmp_path / "logs",
+    )
+    ah = backend.set_auto_heal_enabled(False)
+    assert ah["auto_heal_enabled"] is False
+    assert backend.get_auto_heal_enabled() is False
+
+    vp = backend.set_vpn_processes("C:\\Games\\RainbowSix.exe, upc.exe; RainbowSix.exe")
+    assert vp["vpn_processes"] == ["RainbowSix.exe", "upc.exe"]
+    snap = backend.get_status_snapshot()
+    assert snap["auto_heal_enabled"] is False
+    assert snap["vpn_processes"] == "RainbowSix.exe, upc.exe"
+
 
 
 

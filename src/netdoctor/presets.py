@@ -558,7 +558,7 @@ def compile_zapret_preset(
             wrapped[insert_idx:insert_idx] = blob_args
         return wrapped
 
-    extra_list_dirs = [Path(r"C:\vso\Dev\lists")]
+    extra_list_dirs: list[Path] = []
 
     # Split into global header + individual profiles separated by --new
     global_tokens: list[str] = []
@@ -641,7 +641,14 @@ def compile_zapret_preset(
             has_wf_iface = True
             compiled_global.append(f"--wf-iface={iface}" if iface is not None else tok)
         elif tok.startswith("--wf-"):
-            compiled_global.append(tok)
+            if not game_filter and tok.startswith("--wf-udp-out="):
+                raw_ports = [p.strip() for p in tok[len("--wf-udp-out=") :].split(",") if p.strip()]
+                filtered_ports = [p for p in raw_ports if p != "1024-65535"]
+                if not filtered_ports:
+                    continue
+                compiled_global.append(f"--wf-udp-out={','.join(filtered_ports)}")
+            else:
+                compiled_global.append(tok)
         else:
             compiled_global.append(tok)
 
@@ -747,6 +754,19 @@ def compile_zapret_preset(
             continue
         if not any(t.startswith("--lua-desync=") for t in out_prof):
             continue
+        if not game_filter:
+            prof_joined = " ".join(out_prof).lower()
+            is_game_port_udp = any(
+                t.startswith(("--filter-udp=5000-5500", "--filter-udp=7000-8000")) for t in out_prof
+            )
+            is_wide_game_ipset_udp = any(
+                t.startswith("--filter-udp=") and ("65535" in t or "1024-" in t or "443-" in t) for t in out_prof
+            ) and any(
+                g in prof_joined
+                for g in ("ipset-amazon", "ipset-ovh", "ipset-roblox", "ipset-lol", "ipset-tankix")
+            )
+            if is_game_port_udp or is_wide_game_ipset_udp:
+                continue
         compiled_profiles.append(out_prof)
 
     if not compiled_profiles:
@@ -807,11 +827,75 @@ def merge_winws2_base_preset(auto_args: list[str], base_args: list[str]) -> list
                 seen_keys.add(key)
                 other_globals.append(tok)
 
-    merged_profiles: list[str] = list(auto_prof)
-    if base_prof:
-        if merged_profiles and base_prof[0] != "--new":
+    def _split_profiles(prof_tokens: list[str]) -> list[list[str]]:
+        out: list[list[str]] = []
+        cur: list[str] = []
+        for tok in prof_tokens:
+            if tok == "--new":
+                if cur:
+                    out.append(cur)
+                    cur = []
+            else:
+                cur.append(tok)
+        if cur:
+            out.append(cur)
+        return out
+
+    def _is_pass_profile(prof: list[str], target_name: str) -> bool:
+        has_pass = any(t == "--lua-desync=pass" for t in prof)
+        if not has_pass:
+            return False
+        for tok in prof:
+            if tok.startswith(("--hostlist=", "--ipset=")):
+                val = tok.split("=", 1)[1].replace("\\", "/")
+                if val.rsplit("/", 1)[-1].lower() == target_name:
+                    return True
+        return False
+
+    vpn_ip_pass: list[list[str]] = []
+    auto_specific: list[list[str]] = []
+    unlocker_dom_pass: list[list[str]] = []
+    auto_generic_udp: list[list[str]] = []
+
+    for prof in _split_profiles(auto_prof):
+        if _is_pass_profile(prof, "exclude_vpn_ips.txt"):
+            vpn_ip_pass.append(prof)
+        elif _is_pass_profile(prof, "exclude_unlocker_domains.txt"):
+            unlocker_dom_pass.append(prof)
+        elif any(t.startswith("--filter-l7=") for t in prof) or (
+            any(t.startswith("--filter-udp=") for t in prof)
+            and not any(t.startswith(("--hostlist=", "--ipset=")) for t in prof)
+        ):
+            auto_generic_udp.append(prof)
+        else:
+            auto_specific.append(prof)
+
+    had_auto_vpn_pass = bool(vpn_ip_pass)
+    had_auto_unlocker_pass = bool(unlocker_dom_pass)
+    rest_base: list[list[str]] = []
+    for prof in _split_profiles(base_prof):
+        if _is_pass_profile(prof, "exclude_vpn_ips.txt"):
+            if not had_auto_vpn_pass:
+                vpn_ip_pass.append(prof)
+            continue
+        if _is_pass_profile(prof, "exclude_unlocker_domains.txt"):
+            if not had_auto_unlocker_pass:
+                unlocker_dom_pass.append(prof)
+            continue
+        rest_base.append(prof)
+
+    ordered_profiles = [
+        *vpn_ip_pass,
+        *auto_specific,
+        *unlocker_dom_pass,
+        *auto_generic_udp,
+        *rest_base,
+    ]
+    merged_profiles: list[str] = []
+    for idx, prof in enumerate(ordered_profiles):
+        if idx > 0:
             merged_profiles.append("--new")
-        merged_profiles.extend(base_prof)
+        merged_profiles.extend(prof)
 
     return [*lua_inits, *blobs, *other_globals, *merged_profiles]
 

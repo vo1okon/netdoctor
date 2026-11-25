@@ -23,6 +23,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from netdoctor import __version__
+from netdoctor.config_gen import parse_process_list
 from netdoctor.gui_backend import GuiBackend, elevate_gui
 from netdoctor.supervisor import _is_admin
 from netdoctor.vpn import is_auto_select_node, is_placeholder_node
@@ -162,6 +163,7 @@ SERVICE_ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("reval", "Проверить рабочие правила", "Тестирует уже сохранённые стратегии и переключает сбойные на резерв."),
     ("gen", "Обновить файлы конфигов", "Пересобирает конфиги и списки доменов из базы данных."),
     ("flush_dns", "Очистить DNS-кэш Windows", "Сбрасывает устаревшие системные записи DNS (ipconfig /flushdns)."),
+    ("cleanup_db", "Очистить мусорные правила БД", "Удаляет устаревшие незакреплённые direct/rDNS-записи из базы и пересобирает конфиги."),
     ("verify", "Проверить и докачать файлы", "Проверяет целостность рабочих модулей обхода и скачивает недостающие."),
 )
 
@@ -2908,7 +2910,8 @@ class NetdoctorGuiApp(tk.Tk):
         tk.Label(gc_top, text="ИГРОВОЙ ФИЛЬТР", bg=CARD, fg=MUTED, font=FONT_MICRO, anchor="w").pack(side="left")
         self.make_info_icon(
             gc_top,
-            "Расширяет обход блокировок на высокие порты (1024–65535) для работы голосовых каналов Discord и онлайн-игр.",
+            "Расширяет DPI-обход на высокие UDP-порты (5000–5500, 7000–8000, ipset-amazon). "
+            "Рекомендуется держать ВЫКЛ — так игровой UDP не повреждается (для игр используйте список VPN).",
             title="Голосовой трафик и игры",
             bg=CARD,
         ).pack(side="left", padx=(4, 0))
@@ -2917,7 +2920,10 @@ class NetdoctorGuiApp(tk.Tk):
             gc_top, variable=self.game_filter_var, command=self.on_toggle_game_filter, bg=CARD
         )
         self._game_filter_toggle.pack(side="right")
-        self.attach_tooltip(self._game_filter_toggle, "Включить обход голосовых каналов Discord и онлайн-игр.")
+        self.attach_tooltip(
+            self._game_filter_toggle,
+            "Включает DPI на игровые порты 1024–65535. Держите ВЫКЛ, чтобы не ломать мультиплеер/UDP.",
+        )
 
         chips_row = tk.Frame(game_card, bg=CARD)
         chips_row.pack(fill="x", padx=12, pady=(0, 4))
@@ -2936,7 +2942,7 @@ class NetdoctorGuiApp(tk.Tk):
         self._gf_chip1.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self._gf_chip2 = tk.Label(
             chips_row,
-            text="🎮 Игровой UDP / TCP",
+            text="🎮 Игровой UDP (защищён)",
             bg=CARD_ALT,
             fg=MUTED,
             font=FONT_SMALL,
@@ -3010,6 +3016,9 @@ class NetdoctorGuiApp(tk.Tk):
         brd = PILL_ACTIVE_BORDER if active else BORDER
         for chip in (self._gf_chip1, self._gf_chip2):
             chip.configure(bg=bg, fg=fg, highlightbackground=brd)
+        self._gf_chip2.configure(
+            text="🎮 Игровой UDP / TCP (ВКЛ)" if active else "🎮 Игровой UDP (защищён)"
+        )
 
     def _on_home_preset_selected(self, _event: Any = None) -> None:
         if self._preset_cb_syncing:
@@ -3331,14 +3340,18 @@ class NetdoctorGuiApp(tk.Tk):
         self.auto_heal_var = tk.BooleanVar(value=True)
         ah_row = self.make_toggle_row(
             bot_r,
-            "Автоматически подбирать обход для новых зависших подключений",
+            "Автоподбор обхода для зависших веб-подключений (80/443)",
             self.auto_heal_var,
+            command=self.on_toggle_auto_heal,
             bg=CARD,
             font=FONT_SMALL_B,
             fg=FG,
             slider_width=36,
             slider_height=18,
-            tooltip="В режиме Автоподбора программа автоматически подбирает стратегию, если соединение зависло. При фиксированном пресете не вмешивается.",
+            tooltip=(
+                "В режиме Автоподбора лечит только зависшие веб-соединения (порты 80/443). "
+                "Игры, UDP, закрытые порты (refused) и rDNS не трогает; состояние сохраняется после перезапуска."
+            ),
         )
         ah_row.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
@@ -3364,6 +3377,9 @@ class NetdoctorGuiApp(tk.Tk):
         self._conn_menu.add_command(label="Подобрать обход для этого сайта", command=self.on_heal_selected_connection)
         self._conn_menu.add_command(label="Показать в таблице сайтов", command=self._open_selected_conn_domain)
         self._conn_menu.add_command(label="Копировать адрес сайта", command=self._copy_selected_conn_domain)
+        self._conn_menu.add_separator()
+        self._conn_menu_vpn_idx = 4
+        self._conn_menu.add_command(label="Направить приложение через VPN", command=self._toggle_selected_conn_process_vpn)
 
         feed_panel = tk.Frame(paned, bg=BG)
         tk.Label(
@@ -3923,6 +3939,20 @@ class NetdoctorGuiApp(tk.Tk):
         sub_lbl.pack(fill="x", anchor="w", pady=(2, 0))
         self._bind_responsive_wrap(sub_lbl, min_wrap=220, pad=16)
 
+        self._dns_split_wrap = tk.Frame(tab, bg=INFO_BG, highlightthickness=1, highlightbackground=BORDER)
+        self._dns_split_wrap.pack(fill="x", pady=(0, 8))
+        self.dns_split_banner = tk.Label(
+            self._dns_split_wrap,
+            text="● Общий DoH/DNS: запросы → Cloudflare • исключения hosts → локальный DNS",
+            bg=INFO_BG,
+            fg=FG_SOFT,
+            font=FONT_SMALL,
+            anchor="w",
+            justify="left",
+        )
+        self.dns_split_banner.pack(fill="x", padx=10, pady=4)
+        self._bind_responsive_wrap(self.dns_split_banner, min_wrap=260, pad=24)
+
         # Category filter pills + latency tools (right buttons packed first)
         bar = tk.Frame(tab, bg=BG)
         bar.pack(fill="x", pady=(0, 8))
@@ -4129,9 +4159,29 @@ class NetdoctorGuiApp(tk.Tk):
 
         active_srv = next((s for s in servers if s.get("id") == active_dns_id), None)
         if active_srv:
+            srv_name = str(active_srv.get("name", active_dns_id))
+            srv_ip = str(active_srv.get("ip", ""))
             self.active_dns_pill.configure(
-                text=f"Активный общий DNS: {active_srv.get('name', active_dns_id)} ({active_srv.get('ip', '')})"
+                text=f"Активный общий DNS: {srv_name} ({srv_ip})"
             )
+            if hasattr(self, "dns_split_banner") and hasattr(self, "_dns_split_wrap"):
+                if str(active_srv.get("category") or "").strip().lower() == "ai_bypass":
+                    self._dns_split_wrap.configure(bg=OK_BG, highlightbackground=OK)
+                    self.dns_split_banner.configure(
+                        text=(
+                            f"● Режим SmartDNS-сплит: AI/геоблоки → {srv_name} • "
+                            f"системный трафик и игры → локальный DNS • VPN-приложения → 1.1.1.1 DoH"
+                        ),
+                        bg=OK_BG,
+                        fg=OK_TEXT,
+                    )
+                else:
+                    self._dns_split_wrap.configure(bg=INFO_BG, highlightbackground=BORDER)
+                    self.dns_split_banner.configure(
+                        text=f"● Общий DoH/DNS: запросы → {srv_name} • исключения hosts → локальный DNS",
+                        bg=INFO_BG,
+                        fg=FG_SOFT,
+                    )
 
         sig = repr(
             (
@@ -4340,10 +4390,50 @@ class NetdoctorGuiApp(tk.Tk):
         if iid:
             self.conn_tree.selection_set(iid)
             self.on_conn_select()
+            proc = str((self.selected_conn or {}).get("process") or "").strip()
+            proc_name = Path(proc.replace("\\", "/")).name
+            vpn_idx = getattr(self, "_conn_menu_vpn_idx", 4)
+            if proc_name and proc_name.lower() not in ("—", "sing-box", "sing-box.exe", "winws2.exe", "winws2"):
+                cur_procs = {p.lower() for p in parse_process_list(self.vpn_processes_var.get() if hasattr(self, "vpn_processes_var") else "")}
+                in_vpn = proc_name.lower() in cur_procs
+                self._conn_menu.entryconfigure(
+                    vpn_idx,
+                    state="normal",
+                    label=f"Убрать {proc_name} из VPN" if in_vpn else f"Направить {proc_name} через VPN",
+                )
+            else:
+                self._conn_menu.entryconfigure(vpn_idx, state="disabled", label="Направить приложение через VPN")
             try:
                 self._conn_menu.tk_popup(event.x_root, event.y_root)
             finally:
                 self._conn_menu.grab_release()
+
+    def _toggle_selected_conn_process_vpn(self) -> None:
+        if not self.selected_conn:
+            return
+        raw_proc = str(self.selected_conn.get("process") or "").strip()
+        proc_name = Path(raw_proc.replace("\\", "/")).name
+        if not proc_name:
+            return
+        cur = parse_process_list(self.vpn_processes_var.get() if hasattr(self, "vpn_processes_var") else "")
+        low = proc_name.lower()
+        if any(p.lower() == low for p in cur):
+            updated = [p for p in cur if p.lower() != low]
+            verb = "убран из VPN"
+        else:
+            updated = [*cur, proc_name]
+            verb = "направлен через VPN"
+        raw = ", ".join(updated)
+        if hasattr(self, "vpn_processes_var"):
+            self.vpn_processes_var.set(raw)
+
+        def done(res: dict[str, Any]) -> None:
+            procs = list(res.get("vpn_processes") or [])
+            self.log_console(f"Процесс {proc_name} {verb}. Список VPN: {', '.join(procs) if procs else '(пусто)'}")
+            self.set_status(f"Процесс {proc_name} {verb} (конфиг sing-box обновлён)", OK_TEXT)
+            self._after_change()
+
+        self.run_bg(f"VPN для {proc_name}", lambda: self.backend.set_vpn_processes(raw), done)
 
     def _open_selected_conn_domain(self) -> None:
         if not self.selected_conn:
@@ -4377,7 +4467,7 @@ class NetdoctorGuiApp(tk.Tk):
         self._make_page_header(
             tab,
             "VPN и журналы служб",
-            "Обычный трафик идёт напрямую или через Zapret; VPN используется точечно для сайтов с блокировкой по IP.",
+            "Обычный трафик идёт напрямую или через Zapret; VPN используется точечно для IP-блокировок и выбранных игр/приложений.",
         )
 
         vpn_card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
@@ -4497,6 +4587,92 @@ class NetdoctorGuiApp(tk.Tk):
             tooltip="Назначить выбранный сервер основным (#1) и переключить режим на «Приоритетный».",
         ).pack(side="right", padx=(8, 0))
 
+        tk.Frame(vpn_card, bg=BORDER_LIGHT, height=1).pack(fill="x", padx=12)
+
+        row4_hdr = tk.Frame(vpn_card, bg=CARD)
+        row4_hdr.pack(fill="x", padx=12, pady=(5, 2))
+        tk.Label(
+            row4_hdr,
+            text="Игры и приложения через VPN (.exe)",
+            bg=CARD,
+            fg=ACCENT,
+            font=FONT_SMALL_B,
+        ).pack(side="left")
+        self.make_info_icon(
+            row4_hdr,
+            "Перечисленные программы (TCP + UDP с xudp/EIM NAT и MTU 1500) принудительно идут через vpn-select, "
+            "а их DNS резолвится через чистый 1.1.1.1 DoH. Удобно для Rainbow Six Siege и других игр с IP/UDP-блоком.",
+            title="Принудительный VPN для процессов",
+            bg=CARD,
+        ).pack(side="left", padx=(4, 0))
+        self.make_button(
+            row4_hdr,
+            "Очистить VPN",
+            lambda: self._apply_vpn_process_preset(None),
+            "danger_soft",
+            font=FONT_MICRO,
+            padx=7,
+            pady=2,
+            tooltip="Очистить список приложений с принудительным маршрутом через VPN.",
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            row4_hdr,
+            "+ Discord",
+            lambda: self._apply_vpn_process_preset(["Discord.exe", "Update.exe"]),
+            "neutral",
+            font=FONT_MICRO,
+            padx=7,
+            pady=2,
+            tooltip="Добавить процессы Discord в список маршрутизации через VPN.",
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            row4_hdr,
+            "+ Ubisoft",
+            lambda: self._apply_vpn_process_preset(["upc.exe", "UplayWebCore.exe"]),
+            "neutral",
+            font=FONT_MICRO,
+            padx=7,
+            pady=2,
+            tooltip="Добавить лаунчер Ubisoft Connect (upc.exe, UplayWebCore.exe) в VPN.",
+        ).pack(side="right", padx=(4, 0))
+        self.make_button(
+            row4_hdr,
+            "+ R6 Siege",
+            lambda: self._apply_vpn_process_preset(
+                [
+                    "RainbowSix.exe",
+                    "RainbowSix_DX12.exe",
+                    "RainbowSix_Vulkan.exe",
+                    "RainbowSix_BE.exe",
+                    "BEService.exe",
+                    "BEService_x64.exe",
+                    "upc.exe",
+                ]
+            ),
+            "cyan_ghost",
+            font=FONT_MICRO,
+            padx=8,
+            pady=2,
+            tooltip="Добавить Rainbow Six Siege, BattlEye и Ubisoft Connect в список маршрутизации через VPN.",
+        ).pack(side="right", padx=(4, 0))
+
+        row4_in = tk.Frame(vpn_card, bg=CARD)
+        row4_in.pack(fill="x", padx=12, pady=(0, 8))
+        self.make_button(
+            row4_in,
+            "Сохранить VPN",
+            self.on_save_vpn_processes,
+            "primary",
+            font=FONT_SMALL_B,
+            padx=10,
+            pady=3,
+            tooltip="Сохранить список .exe, трафик и DNS которых принудительно направляются через VPN.",
+        ).pack(side="right", padx=(6, 0))
+        self.vpn_processes_var = tk.StringVar()
+        self.vpn_processes_entry = self.make_entry(row4_in, self.vpn_processes_var, 18)
+        self.vpn_processes_entry.pack(side="left", fill="x", expand=True, ipady=2)
+        self.vpn_processes_entry.bind("<Return>", lambda _e: self.on_save_vpn_processes())
+
         paned = ttk.PanedWindow(tab, orient="vertical")
         paned.pack(fill="both", expand=True)
 
@@ -4594,6 +4770,7 @@ class NetdoctorGuiApp(tk.Tk):
             "reval": self.on_revalidate,
             "gen": self.on_generate,
             "flush_dns": self.on_flush_dns,
+            "cleanup_db": self.on_cleanup_stale_db,
             "verify": self.on_verify,
         }
         kinds = {"layers": "primary"}
@@ -4642,7 +4819,7 @@ class NetdoctorGuiApp(tk.Tk):
                 self.debug_log_var,
                 "Подробный журнал отладки winws2",
                 self.on_toggle_debug_log,
-                "Включает расширенное логирование (--debug=1) для диагностики проблем.",
+                "Включает (--debug=1) для диагностики. Внимание: быстро раздувает winws2.log до сотен МБ — выключайте после проверки.",
             ),
         ):
             t_row = self.make_toggle_row(
@@ -4774,7 +4951,8 @@ class NetdoctorGuiApp(tk.Tk):
             side="left", padx=(0, 6)
         )
         self.unlocker_custom_var = tk.StringVar()
-        self.make_entry(g_row, self.unlocker_custom_var, 12).pack(side="left", fill="x", expand=True, ipady=2)
+        self.unlocker_custom_entry = self.make_entry(g_row, self.unlocker_custom_var, 12)
+        self.unlocker_custom_entry.pack(side="left", fill="x", expand=True, ipady=2)
 
         r_paned = ttk.PanedWindow(right, orient="vertical")
         r_paned.pack(fill="both", expand=True)
@@ -5035,6 +5213,16 @@ class NetdoctorGuiApp(tk.Tk):
             self.game_filter_var.set(bool(snap["game_filter"]))
         if "auto_start_protection" in snap:
             self.autostart_protection_var.set(bool(snap["auto_start_protection"]))
+        if "auto_heal_enabled" in snap and hasattr(self, "auto_heal_var"):
+            self.auto_heal_var.set(bool(snap["auto_heal_enabled"]))
+        if "vpn_processes" in snap and hasattr(self, "vpn_processes_var"):
+            vp_entry = getattr(self, "vpn_processes_entry", None)
+            try:
+                vp_focused = vp_entry is not None and self.focus_get() is vp_entry
+            except tk.TclError:
+                vp_focused = False
+            if not vp_focused:
+                self.vpn_processes_var.set(str(snap.get("vpn_processes") or ""))
         if "byedpi_fallback" in snap:
             self.byedpi_var.set(bool(snap["byedpi_fallback"]))
         if "winws2_debug_log" in snap:
@@ -5067,10 +5255,14 @@ class NetdoctorGuiApp(tk.Tk):
         if isinstance(guard, dict):
             enabled = bool(guard.get("enabled", True))
             self.unlocker_guard_var.set(enabled)
-            if not self._unlocker_custom_synced:
-                if guard.get("custom_exclusions"):
-                    self.unlocker_custom_var.set(str(guard["custom_exclusions"]))
-                self._unlocker_custom_synced = True
+            uc_entry = getattr(self, "unlocker_custom_entry", None)
+            try:
+                uc_focused = uc_entry is not None and self.focus_get() is uc_entry
+            except tk.TclError:
+                uc_focused = False
+            if not uc_focused:
+                self.unlocker_custom_var.set(str(guard.get("custom_exclusions") or ""))
+            self._unlocker_custom_synced = True
             if enabled:
                 self.unlocker_status_label.configure(
                     text=(
@@ -5192,9 +5384,13 @@ class NetdoctorGuiApp(tk.Tk):
             text=f"Общий: {dns_label}{rtt_txt}",
             fg=OK_TEXT if dns.get("status") == "ok" else WARN_TEXT,
         )
-        self.card_dns_sub.configure(
-            text=f"Сайтов под DNS: {dns.get('doh_protected_count', 0)} • подмен: {dns.get('poisoned_count', 0)}"
-        )
+        active_dns_snap = self.last_snapshot.get("active_dns") or {}
+        if str(active_dns_snap.get("category") or "").strip().lower() == "ai_bypass":
+            self.card_dns_sub.configure(text="Сплит: AI → SmartDNS • ОС → Лок. • VPN → 1.1.1.1")
+        else:
+            self.card_dns_sub.configure(
+                text=f"Сайтов под DNS: {dns.get('doh_protected_count', 0)} • подмен: {dns.get('poisoned_count', 0)}"
+            )
 
         dpi = orch.get("dpi") or {}
         dpi_running = bool(dpi.get("running"))
@@ -5227,7 +5423,9 @@ class NetdoctorGuiApp(tk.Tk):
         mode_short = "Приор." if sel_mode == "priority" else "Авто"
         best_short = (best_n[:18] + "…") if len(best_n) > 20 else best_n
         node_part = f" • {mode_short}: {best_short}" if best_short else ""
-        self.card_vpn_sub.configure(text=f"Через VPN: {vpn.get('vpn_domains_count', 0)} сайтов • TG-WS: {tg_ok}{node_part}")
+        vpn_procs = parse_process_list(str(self.last_snapshot.get("vpn_processes") or ""))
+        proc_part = f" • {len(vpn_procs)} прил." if vpn_procs else ""
+        self.card_vpn_sub.configure(text=f"Через VPN: {vpn.get('vpn_domains_count', 0)} сайтов{proc_part} • TG-WS: {tg_ok}{node_part}")
 
         rt = orch.get("realtime") or {}
         needs_fix = int(rt.get("needs_fix_count", 0))
@@ -5722,6 +5920,18 @@ class NetdoctorGuiApp(tk.Tk):
             self._restyle_button(self.radar_btn, "▶ Запустить мониторинг", "cyan_ghost")
         if self.last_snapshot:
             self.apply_snapshot(self.last_snapshot)
+
+    def on_toggle_auto_heal(self) -> None:
+        enabled = bool(self.auto_heal_var.get())
+
+        def runner() -> None:
+            try:
+                if hasattr(self.backend, "set_auto_heal_enabled"):
+                    self.backend.set_auto_heal_enabled(enabled)
+            except Exception:  # noqa: BLE001
+                return
+
+        threading.Thread(target=runner, name="gui-autoheal-save", daemon=True).start()
 
     def on_heal_selected_connection(self) -> None:
         if not self.selected_conn:
@@ -6530,6 +6740,15 @@ class NetdoctorGuiApp(tk.Tk):
 
         self.run_bg("Очистка DNS-кэша Windows", self.backend.flush_windows_dns_cache, done)
 
+    def on_cleanup_stale_db(self) -> None:
+        def done(res: dict[str, Any]) -> None:
+            removed = int(res.get("removed") or 0)
+            self.log_console(f"Очистка БД: удалено {removed} устаревших записей, конфиги пересобраны")
+            self.set_status(f"БД очищена: удалено {removed} мусорных правил", OK_TEXT)
+            self._after_change()
+
+        self.run_bg("Очистка мусорных правил БД", self.backend.cleanup_stale_db_rules, done)
+
     def _roll_dns_target(self, domain: str) -> None:
         def done(res: dict[str, Any]) -> None:
             srv = res.get("dns_server") or {}
@@ -6581,6 +6800,31 @@ class NetdoctorGuiApp(tk.Tk):
             self._after_change()
 
         self.run_bg("Сохранение исключений анлокеров", lambda: self.backend.set_unlocker_exclusions(raw, enabled=enabled), done)
+
+    def _apply_vpn_process_preset(self, preset_procs: list[str] | None) -> None:
+        if preset_procs is None:
+            self.vpn_processes_var.set("")
+        else:
+            cur = parse_process_list(self.vpn_processes_var.get())
+            seen = {p.lower() for p in cur}
+            merged = list(cur)
+            for p in preset_procs:
+                if p.lower() not in seen:
+                    seen.add(p.lower())
+                    merged.append(p)
+            self.vpn_processes_var.set(", ".join(merged))
+        self.on_save_vpn_processes()
+
+    def on_save_vpn_processes(self) -> None:
+        raw = self.vpn_processes_var.get().strip()
+
+        def done(res: dict[str, Any]) -> None:
+            procs = list(res.get("vpn_processes") or [])
+            self.log_console(f"Процессы через VPN: {', '.join(procs) if procs else '(пусто)'}")
+            self.set_status("Список процессов для VPN сохранён и конфиги пересобраны", OK_TEXT)
+            self._after_change()
+
+        self.run_bg("Сохранение процессов VPN", lambda: self.backend.set_vpn_processes(raw), done)
 
     def _load_autostart_async(self) -> None:
         def runner() -> None:
