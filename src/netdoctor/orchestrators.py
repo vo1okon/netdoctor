@@ -3334,12 +3334,22 @@ class RealtimeConnectionMonitor:
         max_domains: int,
         protected_domains: set[str] | None = None,
         vpn_processes: list[str] | None = None,
+        vpn_server_hosts: set[str] | None = None,
     ) -> list[tuple[str, str, str]]:
         """Return list of (domain, process_name, reason) eligible for real-time healing."""
         now = time.monotonic()
         candidates: list[tuple[str, str, str]] = []
         seen: set[str] = set()
         prot = protected_domains or set()
+        vpn_hosts = {
+            h.strip().lower().rstrip(".")
+            for h in (vpn_server_hosts or ())
+            if h and h.strip() and not _is_ip_literal(h.strip())
+        }
+
+        def _is_vpn_host(domain: str) -> bool:
+            low = domain.strip().lower().rstrip(".")
+            return bool(low and any(low == h or low.endswith("." + h) for h in vpn_hosts))
 
         with self._lock:
             cooldowns = dict(self.cooldown_until)
@@ -3375,6 +3385,7 @@ class RealtimeConnectionMonitor:
                 or dom == "—"
                 or _is_rdns_ptr_hostname(dom)
                 or _is_telemetry_noise_domain(dom)
+                or _is_vpn_host(dom)
                 or dom.lower() in healthy_domains
             ):
                 continue
@@ -3401,6 +3412,7 @@ class RealtimeConnectionMonitor:
                 or cooldowns.get(dom, 0.0) > now
                 or _is_rdns_ptr_hostname(dom)
                 or _is_telemetry_noise_domain(dom)
+                or _is_vpn_host(dom)
             ):
                 continue
             if any(dom == pd or dom.endswith("." + pd) for pd in prot):
@@ -3425,6 +3437,7 @@ class RealtimeConnectionMonitor:
                     or cooldowns.get(dom, 0.0) > now
                     or _is_rdns_ptr_hostname(dom)
                     or _is_telemetry_noise_domain(dom)
+                    or _is_vpn_host(dom)
                 ):
                     continue
                 if any(dom == pd or dom.endswith("." + pd) for pd in prot):
@@ -3477,12 +3490,14 @@ class RealtimeConnectionMonitor:
             vpn_procs = parse_process_list(raw_vpn_procs)
             has_real_vpn = storage.has_usable_vpn()
             can_dns_bypass = storage.get_setting("stack_mode", "hybrid").strip().lower() != "dpi_only"
+            vpn_server_hosts = {str(n.get("server") or "") for n in storage.get_all_subscription_nodes()}
             candidates = self._collect_fix_candidates(
                 connections,
                 logs_dir,
                 max_domains_per_tick,
                 protected_domains=set(guard["domains"]) if guard["enabled"] else None,
                 vpn_processes=vpn_procs,
+                vpn_server_hosts=vpn_server_hosts,
             )
             auto_vpn_procs: list[str] = []
             if has_real_vpn and can_dns_bypass:

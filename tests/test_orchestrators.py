@@ -2488,3 +2488,126 @@ def test_dns_infra_domains_ignored_by_noise_filter_and_purged_on_apply(tmp_path:
     assert "youtube.com" in remaining
 
 
+def test_vpn_server_hosts_excluded_from_fix_candidates_and_purged_on_apply(tmp_path: Path) -> None:
+    from netdoctor.orchestrators import RealtimeConnectionMonitor
+
+    mon = RealtimeConnectionMonitor()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    connections = [
+        {
+            "domain": "api-apuw.kaneki.cfd",
+            "process": "sing-box.exe",
+            "protocol": "tls",
+            "remote_port": 443,
+            "health": "needs_fix",
+            "socket_status": "SYN_SENT",
+            "layer": "direct",
+            "has_decision": False,
+        },
+        {
+            "domain": "sub.api-apuw.kaneki.cfd",
+            "process": "chrome.exe",
+            "protocol": "tls",
+            "remote_port": 443,
+            "health": "needs_fix",
+            "socket_status": "SYN_SENT",
+            "layer": "direct",
+            "has_decision": False,
+        },
+        {
+            "domain": "blocked.example.com",
+            "process": "chrome.exe",
+            "protocol": "tls",
+            "remote_port": 443,
+            "health": "needs_fix",
+            "socket_status": "SYN_SENT",
+            "layer": "direct",
+            "has_decision": False,
+        },
+    ]
+    candidates = mon._collect_fix_candidates(
+        connections,
+        logs_dir,
+        max_domains=10,
+        vpn_server_hosts={"api-apuw.kaneki.cfd"},
+    )
+    assert [dom for dom, _, _ in candidates] == ["blocked.example.com"]
+
+    db_path = tmp_path / "purge_vpn_host.db"
+    backend = GuiBackend(
+        db_path=db_path,
+        configs_dir=tmp_path / "configs",
+        lists_dir=tmp_path / "lists",
+        logs_dir=logs_dir,
+        bin_dir=tmp_path / "bin",
+    )
+    st = Storage(db_path)
+    try:
+        nk = st.upsert_network(NetworkFingerprint(asn=12389, kind=NetworkKind.HOME, isp="TestISP"))
+        st.upsert_strategies(DEFAULT_STRATEGIES)
+        st.save_subscription(
+            "sub1",
+            "https://example.com/sub",
+            [
+                {
+                    "tag": "vpn-1",
+                    "protocol": "vless",
+                    "server": "api-apuw.kaneki.cfd",
+                    "server_port": 443,
+                    "raw_outbound": {"type": "vless", "tag": "vpn-1", "server": "api-apuw.kaneki.cfd", "server_port": 443},
+                },
+                {
+                    "tag": "vpn-2",
+                    "protocol": "vless",
+                    "server": "pinned-vpn.example.org",
+                    "server_port": 443,
+                    "raw_outbound": {"type": "vless", "tag": "vpn-2", "server": "pinned-vpn.example.org", "server_port": 443},
+                },
+            ],
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="api-apuw.kaneki.cfd",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="pinned-vpn.example.org",
+                protocol=Protocol.TLS,
+                layer="vpn",
+                strategy_id="vpn-select",
+                pinned=True,
+            )
+        )
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="youtube.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_multisplit_pos2",
+            )
+        )
+    finally:
+        st.close()
+
+    backend.trigger_apply_configs()
+
+    st_after = Storage(db_path)
+    try:
+        remaining = {d.domain for d in st_after.get_decisions(nk, active_only=False)}
+    finally:
+        st_after.close()
+
+    assert "api-apuw.kaneki.cfd" not in remaining
+    assert "pinned-vpn.example.org" in remaining
+    assert "youtube.com" in remaining
+
+
+

@@ -2743,20 +2743,33 @@ class GuiBackend:
                 self._seed_default_strategies(storage)
                 strategies = {s.id: s for s in storage.get_strategies()}
                 net_key, _, _, _ = self._resolve_network_info(storage)
-                stale_dns_infra = [
+                raw_vpn_nodes = storage.get_all_subscription_nodes()
+                vpn_server_hosts = {
+                    str(n.get("server") or "").strip().lower().rstrip(".")
+                    for n in raw_vpn_nodes
+                    if n.get("server")
+                }
+
+                def _is_stale_infra(domain: str) -> bool:
+                    if is_dns_infra_domain(domain):
+                        return True
+                    low = (domain or "").strip().lower().rstrip(".")
+                    return bool(low and any(low == h or low.endswith("." + h) for h in vpn_server_hosts))
+
+                stale_infra = [
                     d
                     for d in storage.get_decisions(net_key, active_only=False)
-                    if is_dns_infra_domain(d.domain) and not getattr(d, "pinned", False)
+                    if _is_stale_infra(d.domain) and not getattr(d, "pinned", False)
                 ]
-                if stale_dns_infra:
+                if stale_infra:
                     with storage.conn:
-                        for d in stale_dns_infra:
+                        for d in stale_infra:
                             storage.conn.execute(
                                 "DELETE FROM decisions WHERE network_key = ? AND domain = ? AND protocol = ?",
                                 (net_key, d.domain, d.protocol.value),
                             )
                 decisions = storage.get_decisions(net_key, active_only=True)
-                vpn_nodes = [VpnNode(**n) for n in storage.get_all_subscription_nodes()]
+                vpn_nodes = [VpnNode(**n) for n in raw_vpn_nodes]
                 game_filter = storage.get_setting("game_filter", "0") == "1"
                 active_dns = self.orchestrator.dns.get_active_dns(storage)
                 base_dns = self.orchestrator.dns.get_base_dns(storage, net_key=net_key)
