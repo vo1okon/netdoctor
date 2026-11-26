@@ -542,6 +542,9 @@ def test_gui_unified_tab_presets_tab_and_home_layout_no_clipping(tmp_path: Path)
         assert "YouTube: 100%" in app._home_service_pills["youtube"].cget("text")
         assert "100%" in app.home_test_rate_pill.cget("text")
         assert "User Best ALT1" in app.home_preset_mode_pill.cget("text")
+        app.set_expert_mode(True, persist=False)
+        app.update_idletasks()
+        app.update()
         tools_card = app.unlocker_status_label.master.master
         assert tools_card.winfo_height() >= tools_card.winfo_reqheight() - 2
 
@@ -655,15 +658,15 @@ def test_audit_fixes_telegram_link_stack_modes_and_multi_service_watchdog(
     assert tg1["dd_secret"] == f"dd{tg1['secret']}"
     assert tg1["url"] == f"tg://proxy?server=127.0.0.1&port=10808&secret=dd{tg1['secret']}"
 
-    # Default tun_stack stays gvisor, set_tun_stack("mixed") propagates into sing-box.json
+    # Default tun_stack stays mixed (v2), set_tun_stack("gvisor") propagates into sing-box.json
     applied_default = backend.trigger_apply_configs()
-    assert applied_default["tun_stack"] == "gvisor"
+    assert applied_default["tun_stack"] == "mixed"
     cfg_default = json.loads((tmp_path / "configs" / "sing-box.json").read_text(encoding="utf-8"))
-    assert next(i for i in cfg_default["inbounds"] if i["type"] == "tun")["stack"] == "gvisor"
+    assert next(i for i in cfg_default["inbounds"] if i["type"] == "tun")["stack"] == "mixed"
 
-    backend.set_tun_stack("mixed")
-    cfg_mixed = json.loads((tmp_path / "configs" / "sing-box.json").read_text(encoding="utf-8"))
-    assert next(i for i in cfg_mixed["inbounds"] if i["type"] == "tun")["stack"] == "mixed"
+    backend.set_tun_stack("gvisor")
+    cfg_gvisor = json.loads((tmp_path / "configs" / "sing-box.json").read_text(encoding="utf-8"))
+    assert next(i for i in cfg_gvisor["inbounds"] if i["type"] == "tun")["stack"] == "gvisor"
 
     # dpi_only mode omits sing-box from process launch specs
     hybrid_names = [s[0] for s in backend._build_stack_specs(["--ctrack-disable=0"], tmp_path / "configs" / "sing-box.json")]
@@ -1848,6 +1851,12 @@ def test_start_autopilot_admin_single_apply_and_nonblocking_vpn_tasks(
                     "enabled": True,
                 }
             ],
+        )
+        st.save_network_profile(
+            net_key,
+            base_dns_id="cloudflare",
+            best_tls_strategy="z2_multisplit_sni",
+            quic_blocked=False,
         )
     finally:
         st.close()

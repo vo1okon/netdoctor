@@ -284,7 +284,6 @@ def test_venv_dependencies_installed_and_consistent() -> None:
         "pydantic",
         "typer",
         "rich",
-        "aioquic",
         "psutil",
         "pytest",
         "pytest-asyncio",

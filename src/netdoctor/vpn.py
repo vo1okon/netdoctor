@@ -311,7 +311,7 @@ def _apply_v2ray_transport(outbound: dict[str, Any], net_type: str, host: str, p
         outbound["transport"] = http_obj
     elif net in ("httpupgrade", "xhttp", "splithttp"):
         outbound["transport"] = {
-            "type": "httpupgrade",
+            "type": net,
             "host": host,
             "path": path or "/",
         }
@@ -531,7 +531,7 @@ def _extract_xray_last_config_outbounds(
                 if not isinstance(hu, dict):
                     hu = {}
                 hu_host = str(hu.get("host") or server)
-                _apply_v2ray_transport(outbound, "httpupgrade", hu_host, str(hu.get("path") or "/"), "")
+                _apply_v2ray_transport(outbound, net, hu_host, str(hu.get("path") or "/"), "")
 
         nodes.append(
             _make_vpn_node(
@@ -1695,30 +1695,28 @@ def parse_subscription_payload(payload: str, subscription_id: str = "default") -
         except Exception:
             pass
 
-    # 3. Parse line by line (preserve node.tag without subscription prefix when unique)
+    # 3. Parse line by line (isolate malformed URIs so one broken line never drops a subscription)
     nodes = []
     seen_tags: set[str] = set()
     for idx, line in enumerate(text.splitlines()):
         line = line.strip()
         if not line:
             continue
-        if line.startswith("vpn://"):
-            for n in decode_amnezia_vpn_uri(line):
-                n.subscription_id = subscription_id
-                if n.tag in seen_tags:
-                    n.tag = f"{n.tag}-{idx}"
-                    n.raw_outbound["tag"] = n.tag
-                seen_tags.add(n.tag)
-                nodes.append(n)
-        else:
-            node = parse_single_uri(line, index=idx)
-            if node:
-                node.subscription_id = subscription_id
-                if node.tag in seen_tags:
-                    node.tag = f"{node.tag}-{idx}"
-                    node.raw_outbound["tag"] = node.tag
-                seen_tags.add(node.tag)
-                nodes.append(node)
+        try:
+            if line.startswith("vpn://"):
+                decoded_nodes = decode_amnezia_vpn_uri(line)
+            else:
+                single = parse_single_uri(line, index=idx)
+                decoded_nodes = [single] if single else []
+        except Exception:
+            continue
+        for n in decoded_nodes:
+            n.subscription_id = subscription_id
+            if n.tag in seen_tags:
+                n.tag = f"{n.tag}-{idx}"
+                n.raw_outbound["tag"] = n.tag
+            seen_tags.add(n.tag)
+            nodes.append(n)
     return nodes
 
 

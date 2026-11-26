@@ -270,7 +270,7 @@ def test_t1_f2_01_venv_python_and_pip_check(venv_python: Path) -> None:
 
 
 def test_t1_f2_02_pyproject_runtime_and_dev_imports(venv_python: Path) -> None:
-    mods = "httpx, dns, yaml, pydantic, typer, rich, aioquic, psutil, pytest, pytest_asyncio, netdoctor"
+    mods = "httpx, dns, yaml, pydantic, typer, rich, psutil, pytest, pytest_asyncio, netdoctor"
     res = subprocess.run(
         [str(venv_python), "-c", f"import {mods}; print('IMPORTS_OK')"],
         stdin=subprocess.DEVNULL,

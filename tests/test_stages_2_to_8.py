@@ -284,7 +284,7 @@ async def test_dynamics_circular_downshift_and_canary_cycle(tmp_path: Path) -> N
         net_key = st.upsert_network(net)
         d1 = Decision(
             network_key=net_key,
-            domain="transient.example.com",
+            domain="transient-canary.example",
             protocol=Protocol.TLS,
             layer="dpi",
             strategy_id="tls_multisplit_pos2",
@@ -292,7 +292,7 @@ async def test_dynamics_circular_downshift_and_canary_cycle(tmp_path: Path) -> N
         )
         d2 = Decision(
             network_key=net_key,
-            domain="broken.example.com",
+            domain="broken-canary.example",
             protocol=Protocol.TLS,
             layer="dpi",
             strategy_id="tls_multisplit_pos2",
@@ -301,20 +301,20 @@ async def test_dynamics_circular_downshift_and_canary_cycle(tmp_path: Path) -> N
         st.save_decision(d1)
         st.save_decision(d2)
 
-        attempts = {"transient.example.com": 0, "broken.example.com": 0}
+        attempts = {"transient-canary.example": 0, "broken-canary.example": 0}
 
         async def fake_probe(dom: str) -> bool:
             attempts[dom] += 1
-            if dom == "transient.example.com":
+            if dom == "transient-canary.example":
                 # Fails first check, passes immediate confirmation retry
                 return attempts[dom] > 1
             return False
 
         summary = await run_canary_cycle(st, network=net, probe_fn=fake_probe)
-        assert summary["promoted"] == ["broken.example.com"]
+        assert summary["promoted"] == ["broken-canary.example"]
         decs = {d.domain: d for d in st.get_decisions(net_key)}
-        assert decs["transient.example.com"].strategy_id == "tls_multisplit_pos2"
-        assert decs["broken.example.com"].strategy_id == "tls_fakedsplit_pos2"
+        assert decs["transient-canary.example"].strategy_id == "tls_multisplit_pos2"
+        assert decs["broken-canary.example"].strategy_id == "tls_fakedsplit_pos2"
     finally:
         st.close()
 

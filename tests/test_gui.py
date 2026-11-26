@@ -660,6 +660,16 @@ def test_gui_minsize_layout_no_clipping_and_dns_alert(tmp_path: Path) -> None:
         assert bool(app._home_alert_frame.winfo_manager()) is True
         assert bool(app.bypass_label.winfo_manager()) is True
         assert app.bypass_label.winfo_height() >= 18
+        assert bool(app._home_fix_frame.winfo_manager()) is True
+        assert len(app.get_visible_nav_tabs()) == 3
+
+        # Switch to Expert mode to inspect expert-only Home widgets and expert tabs (7 total)
+        app.set_expert_mode(True, persist=False)
+        app._select_tab(app.tab_home)
+        app.update_idletasks()
+        app.update()
+
+        assert len(app.get_visible_nav_tabs()) == 7
         assert app.network_label.winfo_width() >= app.network_label.winfo_reqwidth()
 
         tools_card = app.unlocker_status_label.master.master
@@ -1135,6 +1145,8 @@ def test_gui_redesign_widgets_tooltips_and_deduplication(tmp_path: Path) -> None
         distinct_tips: list[gui_mod.HoverTooltip] = []
         seen_tip_keys: set[tuple[str, str | None]] = set()
         for t in app._tooltips:
+            if not t.widget.winfo_viewable():
+                continue
             key = (t.text, t.title)
             if key not in seen_tip_keys and t.text:
                 seen_tip_keys.add(key)
@@ -1187,13 +1199,16 @@ def test_gui_redesign_widgets_tooltips_and_deduplication(tmp_path: Path) -> None
         app.sparkline_canvas.push_sample(12, 9)
         assert len(app.sparkline_canvas.find_all()) >= 6
 
-        # Home collapsible extra drawer toggles cleanly
+        # Home collapsible extra drawer / Expert strip toggles cleanly
         assert app._extra_visible is False
         app._toggle_home_extra()
         assert app._extra_visible is True
-        assert bool(app._home_extra_frame.winfo_manager()) is True
         app._toggle_home_extra()
         assert app._extra_visible is False
+        app.set_expert_mode(True, persist=False)
+        assert bool(app._home_expert_strip.winfo_manager()) is True
+        app.set_expert_mode(False, persist=False)
+        assert bool(app._home_expert_strip.winfo_manager()) is False
 
         # Pin vs Unpin buttons never share identical labels; no hardcoded dev path on Presets tab
         app.apply_snapshot(backend.get_status_snapshot())

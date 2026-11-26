@@ -1,0 +1,220 @@
+bundles:
+  - id: ubisoft
+    name: "Ubisoft Connect / Rainbow Six Siege"
+    category: game
+    coupling: tight
+    processes:
+      - upc.exe
+      - UplayWebCore.exe
+      - UbisoftConnect.exe
+      - UbisoftGameLauncher.exe
+      - RainbowSix.exe
+      - RainbowSix_DX12.exe
+      - RainbowSix_Vulkan.exe
+      - RainbowSix_BE.exe
+      - BEService.exe
+      - BEService_x64.exe
+    auth_domains:
+      - ubi.com
+      - ubisoft.com
+      - ubisoftconnect.com
+      - uplay.com
+      - ubisoftclub.com
+      - vivox.com
+    download_cdn_domains: []
+
+  - id: riot
+    name: "Riot Client / Valorant / League of Legends"
+    category: game
+    coupling: tight
+    processes:
+      - RiotClientServices.exe
+      - RiotClientUx.exe
+      - RiotClientUxRender.exe
+      - VALORANT.exe
+      - VALORANT-Win64-Shipping.exe
+      - LeagueClient.exe
+      - LeagueClientUx.exe
+      - LeagueClientUxRender.exe
+      - "League of Legends.exe"
+      - vgc.exe
+      - vgtray.exe
+    auth_domains:
+      - riotgames.com
+      - riotcdn.net
+      - playvalorant.com
+      - leagueoflegends.com
+    download_cdn_domains: []
+
+  - id: ea
+    name: "EA App / Battlefield / Apex Legends"
+    category: game
+    coupling: tight
+    processes:
+      - EADesktop.exe
+      - EABackgroundService.exe
+      - EALocalHostSvc.exe
+      - EAAntiCheat.GameServiceLauncher.exe
+      - EAAntiCheat.GameService.exe
+      - r5apex.exe
+      - r5apex_dx12.exe
+      - bf2042.exe
+    auth_domains:
+      - ea.com
+      - origin.com
+      - eacdn.com
+    download_cdn_domains: []
+
+  - id: battlenet
+    name: "Battle.net / Overwatch / Call of Duty"
+    category: game
+    coupling: tight
+    processes:
+      - Battle.net.exe
+      - "Battle.net Launcher.exe"
+      - Agent.exe
+      - Overwatch.exe
+      - cod.exe
+      - Wow.exe
+      - Diablo IV.exe
+      - Hearthstone.exe
+    auth_domains:
+      - battle.net
+      - blizzard.com
+    download_cdn_domains: []
+
+  - id: rockstar
+    name: "Rockstar Games Launcher / GTA / RDR2"
+    category: game
+    coupling: tight
+    processes:
+      - Launcher.exe
+      - LauncherPatcher.exe
+      - RockstarService.exe
+      - SocialClubHelper.exe
+      - GTA5.exe
+      - PlayGTAV.exe
+      - RDR2.exe
+    auth_domains:
+      - rockstargames.com
+      - rsg.sc
+    download_cdn_domains: []
+
+  - id: steam
+    name: "Steam"
+    category: game
+    coupling: storefront
+    processes:
+      - steam.exe
+      - steamwebhelper.exe
+      - steamservice.exe
+      - cs2.exe
+      - dota2.exe
+      - deadbydaylight.exe
+      - helldivers2.exe
+      - rust.exe
+      - RustClient.exe
+    auth_domains:
+      - steampowered.com
+      - steamcommunity.com
+    download_cdn_domains:
+      - steamcontent.com
+      - steamstatic.com
+      - steamusercontent.com
+
+  - id: epic
+    name: "Epic Games / Fortnite"
+    category: game
+    coupling: storefront
+    processes:
+      - EpicGamesLauncher.exe
+      - EpicWebHelper.exe
+      - FortniteClient-Win64-Shipping.exe
+      - FortniteLauncher.exe
+      - EasyAntiCheat.exe
+      - EasyAntiCheat_EOS.exe
+    auth_domains:
+      - epicgames.com
+      - unrealengine.com
+    download_cdn_domains:
+      - epicgames-download1.akamaized.net
+      - download.epicgames.com
+      - fastly-download.epicgames.com
+      - cloudflare.epicgamescdn.com
+
+  - id: hoyoverse
+    name: "HoYoverse (Genshin / Star Rail / Zenless)"
+    category: game
+    coupling: tight
+    processes:
+      - HYP.exe
+      - GenshinImpact.exe
+      - StarRail.exe
+      - ZenlessZoneZero.exe
+      - ZFGameBrowser.exe
+    auth_domains:
+      - hoyoverse.com
+      - hoyolab.com
+      - miHoYo.com
+    download_cdn_domains: []
+
+  - id: minecraft
+    name: "Minecraft"
+    category: game
+    coupling: tight
+    processes:
+      - Minecraft.exe
+      - MinecraftLauncher.exe
+      - javaw.exe
+      - java.exe
+    auth_domains:
+      - minecraft.net
+      - mojang.com
+      - minecraftservices.com
+    download_cdn_domains: []
+
+  - id: roblox
+    name: "Roblox"
+    category: game
+    coupling: tight
+    processes:
+      - RobloxPlayerBeta.exe
+      - RobloxPlayerLauncher.exe
+      - RobloxStudioBeta.exe
+    auth_domains:
+      - roblox.com
+      - rbxcdn.com
+    download_cdn_domains: []
+
+  - id: tarkov
+    name: "Escape from Tarkov"
+    category: game
+    coupling: tight
+    processes:
+      - BsgLauncher.exe
+      - EscapeFromTarkov.exe
+      - EscapeFromTarkov_BE.exe
+      - BEService.exe
+      - BEService_x64.exe
+    auth_domains:
+      - escapefromtarkov.com
+      - battlestategames.com
+    download_cdn_domains: []
+
+  - id: discord
+    name: "Discord"
+    category: app
+    coupling: tight
+    default_mode: direct_dpi
+    processes:
+      - Discord.exe
+      - DiscordPTB.exe
+      - DiscordCanary.exe
+      - Update.exe
+    auth_domains:
+      - discord.com
+      - discordapp.com
+      - discord.gg
+      - discord.media
+      - discordapp.net
+    download_cdn_domains: []

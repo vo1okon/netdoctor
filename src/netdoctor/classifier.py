@@ -9,19 +9,6 @@ from netdoctor.models import (
     RecommendedAction,
     VerdictClass,
 )
-from netdoctor.probes import is_dns_ip_mismatch
-
-
-def classify_warnings(probes: ProbesSummary, bypass_active: bool = False) -> list[str]:
-    """Return non-breaking warning tags explaining probe caveats or low-confidence conditions."""
-    warnings: list[str] = []
-    if bypass_active:
-        warnings.append("bypass_active_during_probe")
-    if probes.dns.doh != "ok":
-        warnings.append("doh_unavailable")
-    if is_dns_ip_mismatch(probes.dns):
-        warnings.append("dns_ip_mismatch")
-    return warnings
 
 
 def classify_probes(
@@ -104,6 +91,18 @@ def classify_probes(
         recommended.append(
             RecommendedAction(layer="vpn", action="change_obfuscation", value="vless-reality")
         )
+
+    # 5c. Geo-block check (TLS OK, no stall, HTTP 403/451)
+    if (
+        probes.tls.real_sni == "ok"
+        and probes.stall.result == "ok"
+        and getattr(probes.stall, "http_status", None) in (403, 451)
+        and VerdictClass.IP_BLOCK not in verdicts
+        and VerdictClass.SNI_DPI not in verdicts
+        and VerdictClass.THROTTLE not in verdicts
+    ):
+        verdicts.append(VerdictClass.GEO_BLOCK)
+        recommended.append(RecommendedAction(layer="dns", action="smartdns", value="ai_bypass"))
 
     # 6. Everything clean
     if not verdicts:

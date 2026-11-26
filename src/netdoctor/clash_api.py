@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import urllib.parse
 from typing import Any
 
@@ -26,6 +27,25 @@ class ClashApiClient:
         self.secret = secret
         self.timeout = float(timeout)
         self._headers: dict[str, str] = {"Authorization": f"Bearer {secret}"} if secret else {}
+        self._sync_lock = threading.Lock()
+        self._sync_client: httpx.Client | None = None
+
+    def _get_sync_client(self) -> httpx.Client:
+        with self._sync_lock:
+            if self._sync_client is None or self._sync_client.is_closed:
+                self._sync_client = httpx.Client(
+                    base_url=self.base_url,
+                    headers=self._headers,
+                    timeout=self.timeout,
+                )
+            return self._sync_client
+
+    def close(self) -> None:
+        """Close the pooled synchronous HTTP client."""
+        with self._sync_lock:
+            if self._sync_client is not None and not self._sync_client.is_closed:
+                self._sync_client.close()
+            self._sync_client = None
 
     @staticmethod
     def _quote(value: str) -> str:
@@ -204,70 +224,45 @@ class ClashApiClient:
         return closed
 
     # ------------------------------------------------------------------
-    # Synchronous helpers (safe to call from GUI/threads/sync code)
+    # Synchronous helpers (pooled Client, safe across threads via _sync_lock)
     # ------------------------------------------------------------------
 
     def get_proxies_sync(self) -> dict[str, Any]:
         """Synchronous counterpart of `get_proxies()`."""
         try:
-            with httpx.Client(
-                base_url=self.base_url,
-                headers=self._headers,
-                timeout=self.timeout,
-            ) as client:
-                resp = client.get("/proxies")
-                return self.unwrap_proxies(self._parse_json_dict(resp))
+            with self._sync_lock:
+                resp = self._get_sync_client_unlocked().get("/proxies")
+            return self.unwrap_proxies(self._parse_json_dict(resp))
         except Exception:
             return {}
 
-    def measure_node_delay_sync(
-        self,
-        tag: str,
-        url: str = "https://www.gstatic.com/generate_204",
-        timeout_ms: int = 3500,
-    ) -> dict[str, Any]:
-        """Synchronous counterpart of `measure_node_delay()`."""
-        req_timeout = self._delay_timeout(timeout_ms)
-        try:
-            with httpx.Client(
+    def _get_sync_client_unlocked(self) -> httpx.Client:
+        if self._sync_client is None or self._sync_client.is_closed:
+            self._sync_client = httpx.Client(
                 base_url=self.base_url,
                 headers=self._headers,
-                timeout=req_timeout,
-            ) as client:
-                resp = client.get(
-                    f"/proxies/{self._quote(tag)}/delay",
-                    params={"url": url, "timeout": int(timeout_ms)},
-                )
-                return self._parse_delay_response(resp)
-        except Exception as exc:
-            return {"ok": False, "delay_ms": None, "error": str(exc)}
+                timeout=self.timeout,
+            )
+        return self._sync_client
 
     def select_outbound_sync(self, selector_tag: str, target_tag: str) -> bool:
         """Synchronous counterpart of `select_outbound()`."""
         try:
-            with httpx.Client(
-                base_url=self.base_url,
-                headers=self._headers,
-                timeout=self.timeout,
-            ) as client:
-                resp = client.put(
+            with self._sync_lock:
+                resp = self._get_sync_client_unlocked().put(
                     f"/proxies/{self._quote(selector_tag)}",
                     json={"name": target_tag},
                 )
-                return 200 <= resp.status_code < 300
+            return 200 <= resp.status_code < 300
         except Exception:
             return False
 
     def get_connections_sync(self) -> dict[str, Any]:
         """Synchronous counterpart of `get_connections()`."""
         try:
-            with httpx.Client(
-                base_url=self.base_url,
-                headers=self._headers,
-                timeout=self.timeout,
-            ) as client:
-                resp = client.get("/connections")
-                return self._parse_json_dict(resp)
+            with self._sync_lock:
+                resp = self._get_sync_client_unlocked().get("/connections")
+            return self._parse_json_dict(resp)
         except Exception:
             return {}
 
@@ -275,11 +270,8 @@ class ClashApiClient:
         """Synchronous counterpart of `close_connections_by_node()`."""
         closed = 0
         try:
-            with httpx.Client(
-                base_url=self.base_url,
-                headers=self._headers,
-                timeout=self.timeout,
-            ) as client:
+            with self._sync_lock:
+                client = self._get_sync_client_unlocked()
                 resp = client.get("/connections")
                 data = self._parse_json_dict(resp)
                 for conn in data.get("connections") or []:

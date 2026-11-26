@@ -28,10 +28,7 @@ DEFAULT_ZDY_PRESETS_DIR = (
     if (_REPO_ROOT / "presets" / "zapret-discord-youtube").is_dir()
     else (Path("presets") / "zapret-discord-youtube")
 )
-DEFAULT_EXTERNAL_ZAPRET_DIRS: tuple[Path, ...] = (
-    Path(r"C:\vso\Dev\presets\winws2"),
-    Path(r"C:\vso\Dev\presets\winws2_builtin"),
-)
+DEFAULT_EXTERNAL_ZAPRET_DIRS: tuple[Path, ...] = ()
 
 # Recommended priority order for well-known proven presets imported from Zapret2
 _FEATURED_PRESET_PRIORITY: dict[str, int] = {
@@ -390,7 +387,7 @@ def _resolve_list_file_for_preset(
     lists_path: Path,
     extra_search_dirs: list[Path],
 ) -> Path | None:
-    """Resolve a preset `--hostlist=` / `--ipset=` path against netdoctor lists, lists/zapret2, and C:\\vso\\Dev."""
+    """Resolve a preset `--hostlist=` / `--ipset=` path against netdoctor lists and lists/zapret2."""
     norm = raw_ref.replace("\\", "/").strip()
     if not norm:
         return None
@@ -437,9 +434,6 @@ def _resolve_blob_file_for_preset(raw_ref: str, bin_path: Path) -> str | None:
     repo_file = _REPO_ROOT / "bin" / "files" / fname
     if repo_file.is_file():
         return f"@{repo_file.resolve().as_posix()}"
-    dev_file = Path(r"C:\vso\Dev\bin") / fname
-    if dev_file.is_file():
-        return f"@{dev_file.as_posix()}"
     return None
 
 
@@ -453,11 +447,12 @@ def compile_zapret_preset(
     iface: int | str | None = None,
     game_filter: bool = True,
     exclude_filename: str = "exclude_unlocker_domains.txt",
+    enable_telegram_ipset: bool = True,
 ) -> list[str]:
     """Compile a built-in or user-supplied Zapret2 preset text into verified winws2 arguments.
 
     Handles:
-    - Full Zapret2 presets (e.g. from C:\\vso\\Dev\\presets\\winws2_builtin)
+    - Full Zapret2 presets (e.g. from presets/zapret2)
     - Raw user `--lua-desync=...` snippets (auto-wrapped with TLS/Telegram/Discord profiles)
     - Zapret1 `.bat` content (auto-converted via `parse_bat_to_winws2_text`)
     - Safe path rewriting (`@bin/*.bin` -> `@files/*.bin`, `lists/*.txt` -> `lists/zapret2/*.txt`)
@@ -524,21 +519,24 @@ def compile_zapret_preset(
             wrapped.append("--payload=tls_client_hello,http_req")
         if resolved_vpn_ips:
             wrapped.append(f"--ipset-exclude={exclude_ipset_path.as_posix()}")
+        if not enable_telegram_ipset:
+            wrapped.append(f"--ipset-exclude={tg_ipset.as_posix()}")
         if exclude_hostlist_path is not None:
             wrapped.append(f"--hostlist-exclude={exclude_hostlist_path.as_posix()}")
         wrapped.extend(desync_lines)
-        # Profile 2: Telegram MTProto IPSET
-        wrapped.extend(["--new", "--filter-tcp=80,443,5222", f"--ipset={tg_ipset.as_posix()}", "--payload=all"])
-        if resolved_vpn_ips:
-            wrapped.append(f"--ipset-exclude={exclude_ipset_path.as_posix()}")
-        wrapped.extend(
-            [
-                "--lua-desync=fake:blob=fake_stun_as_tls:tcp_ts=-600000:repeats=6",
-                "--lua-desync=fake:blob=tls_google:tcp_ts=-600000:repeats=6",
-                "--lua-desync=fakedsplit:pattern=0x00:tcp_ts=-600000:repeats=6",
-                "--lua-desync=fake:blob=tls_max:tcp_ts=-600000:repeats=6",
-            ]
-        )
+        # Profile 2: Telegram MTProto IPSET (disabled in mtproto proxy mode so tg-ws-proxy isn't mangled)
+        if enable_telegram_ipset:
+            wrapped.extend(["--new", "--filter-tcp=80,443,5222", f"--ipset={tg_ipset.as_posix()}", "--payload=all"])
+            if resolved_vpn_ips:
+                wrapped.append(f"--ipset-exclude={exclude_ipset_path.as_posix()}")
+            wrapped.extend(
+                [
+                    "--lua-desync=fake:blob=fake_stun_as_tls:tcp_ts=-600000:repeats=6",
+                    "--lua-desync=fake:blob=tls_google:tcp_ts=-600000:repeats=6",
+                    "--lua-desync=fakedsplit:pattern=0x00:tcp_ts=-600000:repeats=6",
+                    "--lua-desync=fake:blob=tls_max:tcp_ts=-600000:repeats=6",
+                ]
+            )
         # Profile 3: Discord / STUN / QUIC UDP
         wrapped.extend(
             [
@@ -553,7 +551,7 @@ def compile_zapret_preset(
         if exclude_hostlist_path is not None:
             wrapped.append(f"--hostlist-exclude={exclude_hostlist_path.as_posix()}")
         wrapped.append("--lua-desync=fake:blob=quic_google:repeats=6")
-        blob_args = extract_blob_args(wrapped)
+        blob_args = extract_blob_args(wrapped, bin_dir=bin_path)
         if blob_args:
             insert_idx = sum(1 for a in wrapped if a.startswith("--lua-init="))
             wrapped[insert_idx:insert_idx] = blob_args
@@ -718,12 +716,19 @@ def compile_zapret_preset(
             ]
         )
 
+    tg_ipset_path = lists_path / "ipset-telegram.txt"
+    if not tg_ipset_path.is_file() or tg_ipset_path.stat().st_size == 0:
+        tg_ipset_path.write_text("\n".join(TELEGRAM_CIDRS) + "\n", encoding="utf-8")
+
     for prof in profiles:
         if any(t == "--skip" for t in prof):
             continue
         out_prof: list[str] = []
         had_positive_list = False
         resolved_positive_list = False
+        targets_telegram_ipset = False
+        targets_ipset_all = False
+        has_telegram_exclude = False
         for tok in prof:
             if tok.startswith("--name="):
                 # `--name=` is metadata in ZapretGUI presets; standard winws2 ignores/rejects unknown flags in some builds
@@ -736,6 +741,11 @@ def compile_zapret_preset(
                     )
             if tok.startswith(("--hostlist=", "--ipset=")):
                 prefix, raw_val = tok.split("=", 1)
+                low_val = raw_val.lower()
+                if prefix == "--ipset" and "ipset-telegram" in low_val:
+                    targets_telegram_ipset = True
+                if prefix == "--ipset" and "ipset-all" in low_val:
+                    targets_ipset_all = True
                 had_positive_list = True
                 resolved = _resolve_list_file_for_preset(raw_val, lists_path, extra_list_dirs)
                 if resolved is not None:
@@ -744,11 +754,22 @@ def compile_zapret_preset(
                 continue
             if tok.startswith(("--hostlist-exclude=", "--ipset-exclude=")):
                 prefix, raw_val = tok.split("=", 1)
+                if prefix == "--ipset-exclude" and "ipset-telegram" in raw_val.lower():
+                    has_telegram_exclude = True
                 resolved = _resolve_list_file_for_preset(raw_val, lists_path, extra_list_dirs)
                 if resolved is not None:
                     out_prof.append(f"{prefix}={resolved.as_posix()}")
                 continue
             out_prof.append(tok)
+
+        if not enable_telegram_ipset and targets_telegram_ipset:
+            continue
+        if not enable_telegram_ipset and targets_ipset_all and not has_telegram_exclude:
+            insert_at = next(
+                (idx for idx, tok in enumerate(out_prof) if tok.startswith(("--payload=", "--lua-desync="))),
+                len(out_prof),
+            )
+            out_prof.insert(insert_at, f"--ipset-exclude={tg_ipset_path.as_posix()}")
 
         # If a profile relied ONLY on a hostlist/ipset that doesn't exist, skip the profile rather than matching ALL traffic!
         if had_positive_list and not resolved_positive_list:
@@ -782,7 +803,7 @@ def compile_zapret_preset(
 
     needed_blobs = [
         b
-        for b in extract_blob_args(final_args)
+        for b in extract_blob_args(final_args, bin_dir=bin_path)
         if b[len("--blob=") :].split(":", 1)[0] not in defined_blobs
     ]
     if needed_blobs:
@@ -824,7 +845,16 @@ def merge_winws2_base_preset(auto_args: list[str], base_args: list[str]) -> list
                 blobs.append(tok)
         else:
             key = tok.split("=", 1)[0]
-            if key not in seen_keys:
+            if key in ("--wf-tcp-out", "--wf-udp-out") and key in seen_keys:
+                # Union port specs so auto_glob never strips base preset ports like 1024-65535
+                for idx_g, existing_g in enumerate(other_globals):
+                    if existing_g.startswith(key + "="):
+                        cur_ports = [p.strip() for p in existing_g.split("=", 1)[1].split(",") if p.strip()]
+                        new_ports = [p.strip() for p in tok.split("=", 1)[1].split(",") if p.strip()]
+                        merged_ports = list(dict.fromkeys([*cur_ports, *new_ports]))
+                        other_globals[idx_g] = f"{key}={','.join(merged_ports)}"
+                        break
+            elif key not in seen_keys:
                 seen_keys.add(key)
                 other_globals.append(tok)
 
@@ -889,6 +919,21 @@ def merge_winws2_base_preset(auto_args: list[str], base_args: list[str]) -> list
             continue
         rest_base.append(prof)
 
+    base_has_cloud_udp = any(
+        any("--filter-udp=" in t for t in prof)
+        and any(ipset_name in " ".join(prof).lower() for ipset_name in ("ipset-amazon", "ipset-ovh", "ipset-cloudflare"))
+        for prof in rest_base
+    )
+    if base_has_cloud_udp:
+        def _keep_udp(prof: list[str]) -> bool:
+            return not (
+                any("--filter-udp=1024-65535" in t for t in prof)
+                and "game_active:repeats=4" in " ".join(prof)
+            )
+
+        auto_specific = [prof for prof in auto_specific if _keep_udp(prof)]
+        auto_generic_udp = [prof for prof in auto_generic_udp if _keep_udp(prof)]
+
     ordered_profiles = [
         *vpn_ip_pass,
         *unlocker_dom_pass,
@@ -910,7 +955,7 @@ def discover_builtin_zapret_presets(
     presets_dir: str | Path = DEFAULT_ZAPRET2_PRESETS_DIR,
     zdy_dir: str | Path = DEFAULT_ZDY_PRESETS_DIR,
 ) -> list[dict[str, Any]]:
-    """Return built-in Zapret2 presets from presets/zapret2/*.txt (imported from C:\\vso\\Dev) and presets/zapret-discord-youtube/*.bat."""
+    """Return built-in Zapret2 presets from presets/zapret2/*.txt and presets/zapret-discord-youtube/*.bat."""
     z2_path = Path(presets_dir)
     zdy_path = Path(zdy_dir)
 
@@ -1113,7 +1158,7 @@ def import_presets_from_directory(
     *,
     max_files: int = 25,
 ) -> list[dict[str, Any]]:
-    """Bulk-import .txt/.bat presets from a user directory (e.g. C:\\vso\\Dev\\presets\\winws2)."""
+    """Bulk-import .txt/.bat presets from a user directory."""
     root = Path(dir_path)
     if not root.is_dir():
         raise FileNotFoundError(f"Папка пресетов не найдена: {root}")
@@ -1121,7 +1166,6 @@ def import_presets_from_directory(
     candidates: list[Path] = []
     for ext in ("*.txt", "*.bat"):
         candidates.extend(sorted(root.glob(ext)))
-    # Also check winws2 / winws2_builtin subdirs if user pointed at C:\vso\Dev or C:\vso\Dev\presets
     for sub in ("presets/winws2", "winws2", "presets/winws2_builtin", "winws2_builtin"):
         sub_dir = root / sub
         if sub_dir.is_dir():

@@ -25,7 +25,7 @@ import psutil
 
 from netdoctor.clash_api import ClashApiClient
 from netdoctor.classifier import classify_probes
-from netdoctor.config_gen import is_game_process, parse_process_list
+from netdoctor.config_gen import DEFAULT_BYPASS_PROCESSES, is_game_process, parse_process_list
 from netdoctor.dynamics import parse_circular_rotations, promote_fallback_on_failure
 from netdoctor.models import (
     Decision,
@@ -51,7 +51,7 @@ from netdoctor.selector import (
     load_targets_from_yaml,
     select_best_strategy,
 )
-from netdoctor.storage import Storage
+from netdoctor.storage import Storage, normalize_domain_etld1
 from netdoctor.supervisor import _is_admin
 from netdoctor.vpn import infer_node_region, is_auto_select_node, is_placeholder_node
 
@@ -416,6 +416,15 @@ def _is_rdns_ptr_hostname(domain: str | None) -> bool:
     return any(low == s or low.endswith("." + s) for s in _RDNS_PTR_SUFFIXES)
 
 
+_TG_WS_FRONTING_RE = re.compile(r"^kws\d+(?:-\d+)?\.", re.IGNORECASE)
+
+
+def _is_tg_ws_fronting_domain(domain: str | None) -> bool:
+    """Return True for internal tg-ws-proxy Cloudflare fronting subdomains (kws1.*, kws2.web.telegram.org)."""
+    low = (domain or "").strip().lower().rstrip(".")
+    return bool(low and _TG_WS_FRONTING_RE.match(low))
+
+
 def _is_telemetry_noise_domain(domain: str | None) -> bool:
     """Return True for OS telemetry / CRL / OCSP / NCSI / rDNS PTR / DNS-infra domains."""
     low = (domain or "").strip().lower().rstrip(".")
@@ -423,7 +432,7 @@ def _is_telemetry_noise_domain(domain: str | None) -> bool:
         return False
     if _is_rdns_ptr_hostname(low):
         return True
-    if is_dns_infra_domain(low):
+    if is_dns_infra_domain(low) or _is_tg_ws_fronting_domain(low):
         return True
     if low.startswith(("ocsp.", "crl.")):
         return True
@@ -678,6 +687,7 @@ def _is_external_ip(ip_str: str) -> bool:
 _SHARED_CDN_ANYCAST_NETS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
+        # Cloudflare
         "104.16.0.0/12",
         "172.64.0.0/13",
         "188.114.96.0/22",
@@ -687,12 +697,34 @@ _SHARED_CDN_ANYCAST_NETS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, .
         "141.101.64.0/18",
         "190.93.240.0/20",
         "197.234.240.0/22",
+        # AWS CloudFront
+        "13.32.0.0/15",
+        "13.35.0.0/16",
+        "13.224.0.0/14",
+        "18.64.0.0/14",
+        "52.84.0.0/15",
+        "54.182.0.0/16",
+        "54.192.0.0/16",
+        "99.84.0.0/16",
+        "108.156.0.0/14",
+        "143.204.0.0/16",
+        # Fastly
+        "151.101.0.0/16",
+        "199.232.0.0/16",
+        # Akamai
+        "23.32.0.0/11",
+        "23.192.0.0/11",
+        "104.64.0.0/10",
+        # Google / GGC shared frontends
+        "142.250.0.0/15",
+        "172.217.0.0/16",
+        "216.58.192.0/19",
     )
 )
 
 
 def _is_shared_cdn_anycast_ip(ip_str: str) -> bool:
-    """Return True for multi-tenant shared CDN anycast IPs (e.g. Cloudflare) unsafe to attribute from history."""
+    """Return True for multi-tenant shared CDN anycast IPs (Cloudflare/CloudFront/Akamai/Fastly/Google) unsafe to attribute from history."""
     clean = ip_str.split("%", 1)[0].strip()
     if not clean:
         return False
@@ -1947,14 +1979,20 @@ class VpnLayerOrchestrator:
                         enriched["protocol_ok"] = True
                         enriched["tunnel_verified"] = True
                     else:
+                        err_low = str(err_msg or "").lower()
+                        bridge_down = "127.0.0.1" in err_low and ("refused" in err_low or "reset" in err_low)
                         tcp_ok = False
-                        if not is_udp_proto:
+                        if not is_udp_proto and not bridge_down:
                             tcp_res = await probe_tcp(server, port=port, timeout=min(timeout, 1.0))
                             tcp_ok = tcp_res.result == "ok"
                         enriched["alive"] = False
                         enriched["ping_ms"] = None
-                        enriched["probe_result"] = "protocol_block" if tcp_ok else err_msg
-                        enriched["protocol_ok"] = False if tcp_ok else bool(prev_health.get("protocol_ok", 1))
+                        enriched["probe_result"] = (
+                            "bridge_unavailable" if bridge_down else ("protocol_block" if tcp_ok else err_msg)
+                        )
+                        enriched["protocol_ok"] = (
+                            False if (tcp_ok and not bridge_down) else bool(prev_health.get("protocol_ok", 1))
+                        )
                         enriched["tunnel_verified"] = True
                 else:
                     tcp_res = await probe_tcp(server, port=port, timeout=timeout)
@@ -2229,7 +2267,12 @@ class VpnLayerOrchestrator:
                     is_udp = proto in ("wireguard", "amneziawg", "hysteria", "hysteria2", "tuic")
                     srv = str(node.get("server") or "").strip()
                     port = int(node.get("server_port") or 443)
-                    if not is_udp and srv:
+                    err_low = str(err or "").lower()
+                    bridge_down = "127.0.0.1" in err_low and ("refused" in err_low or "reset" in err_low)
+                    if bridge_down:
+                        proto_ok = bool(prev_h.get("protocol_ok", 1))
+                        probe_err = "bridge_unavailable"
+                    elif not is_udp and srv:
                         tcp_res = await probe_tcp(srv, port=port, timeout=min(timeout, 1.0))
                         if tcp_res.result == "ok":
                             proto_ok = False
@@ -2773,6 +2816,8 @@ class RealtimeConnectionMonitor:
         self._proc_stall_strikes: dict[str, int] = {}
         self._last_stalled_direct_procs: dict[str, dict[str, int]] = {}
         self._manual_vpn_proc_optout: set[str] = set()
+        self.pending_bundle_alerts: deque[dict[str, Any]] = deque(maxlen=20)
+        self._emitted_bundle_alerts: set[str] = set()
 
     def get_recent_connections(self, net_key: str, max_age_sec: float = 2.0) -> list[dict[str, Any]] | None:
         """Return shallow copy of recent scan_active_connections rows if fresh and matching network_key."""
@@ -2918,13 +2963,15 @@ class RealtimeConnectionMonitor:
             log_map: dict[str, str] = {}
             if text:
                 for dom, ip_val in _LOG_DOMAIN_IP_RE.findall(text):
-                    if _is_external_ip(ip_val):
+                    if _is_external_ip(ip_val) and not _is_shared_cdn_anycast_ip(ip_val):
                         log_map[ip_val] = dom.lower()
                 for ip_val, dom in _WINWS2_IP_HOST_RE.findall(text):
-                    if _is_external_ip(ip_val):
+                    if _is_external_ip(ip_val) and not _is_shared_cdn_anycast_ip(ip_val):
                         log_map[ip_val] = dom.lower()
                 if fname == "sing-box.log":
-                    log_map.update(_parse_singbox_dns_ip_map(text))
+                    for ip_val, dom in _parse_singbox_dns_ip_map(text).items():
+                        if not _is_shared_cdn_anycast_ip(ip_val):
+                            log_map[ip_val] = dom
             with self._lock:
                 self._log_ip_cache[cache_key] = (fsig, log_map)
             new_map.update(log_map)
@@ -3017,7 +3064,18 @@ class RealtimeConnectionMonitor:
         raw_vpn_procs = storage.get_setting(f"vpn_processes:{resolved_key}", "")
         if not raw_vpn_procs:
             raw_vpn_procs = storage.get_setting("vpn_processes", "")
-        vpn_procs_low = {p.lower() for p in parse_process_list(raw_vpn_procs)}
+        infra_low = {p.lower() for p in DEFAULT_BYPASS_PROCESSES} | {"sing-box", "sing-box.exe"}
+        vpn_procs_low = {p.lower() for p in parse_process_list(raw_vpn_procs)} - infra_low
+        try:
+            from netdoctor.core.bundles import compile_bundle_rules, load_bundles
+
+            _bm = storage.get_bundle_modes(resolved_key)
+            if _bm:
+                _cb = compile_bundle_rules(load_bundles(storage=storage), _bm)
+                vpn_procs_low.update(p.lower() for p in _cb.get("vpn_processes") or ())
+                vpn_procs_low -= infra_low
+        except Exception:
+            pass
         known_targets = {e["domain"].lower() for e in load_targets_from_yaml(targets_file) if e.get("domain")}
 
         # Tail logs rather than reading multi-MB logs completely on every 3s tick
@@ -3056,7 +3114,7 @@ class RealtimeConnectionMonitor:
             if not rip or not _is_external_ip(rip) or rport <= 0:
                 continue
 
-            raw_proc = str(meta.get("processPath") or "").strip()
+            raw_proc = str(meta.get("processPath") or meta.get("process") or "").strip()
             proc_name = Path(raw_proc.replace("\\", "/")).name if raw_proc else "sing-box"
             if not proc_name:
                 proc_name = "sing-box"
@@ -3100,12 +3158,21 @@ class RealtimeConnectionMonitor:
             except (TypeError, ValueError):
                 download_b = 0
             age_sec = _parse_clash_conn_age_sec(c.get("start"))
-            is_healthy = upload_b > 0 and download_b > 0
-            is_stalled = (
+            is_16kb_stall = (
                 upload_b > 0
-                and download_b == 0
-                and proto in ("tls", "http", "tcp")
-                and (age_sec is None or age_sec >= 3.0)
+                and 10_000 <= download_b <= 26_000
+                and proto in ("tls", "http")
+                and (age_sec is not None and age_sec >= 3.5)
+            )
+            is_healthy = upload_b > 0 and download_b > 0 and not is_16kb_stall
+            is_stalled = (
+                (
+                    upload_b > 0
+                    and download_b == 0
+                    and proto in ("tls", "http", "tcp")
+                    and (age_sec is None or age_sec >= 3.0)
+                )
+                or is_16kb_stall
             )
             if is_healthy:
                 healthy_clash_endpoints.add((rip, rport, t_proto))
@@ -3139,6 +3206,7 @@ class RealtimeConnectionMonitor:
                     "host": host,
                     "is_healthy": is_healthy,
                     "is_stalled": is_stalled,
+                    "is_16kb_stall": is_16kb_stall,
                 }
             )
 
@@ -3194,7 +3262,7 @@ class RealtimeConnectionMonitor:
             elif is_telemetry:
                 health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
             elif (rport in _WEB_PORTS) and (
-                sock_status in ("SYN_SENT", "STALLED")
+                sock_status in ("SYN_SENT", "STALLED", "16KB_STALL")
                 or endpoint_stalled
                 or (rip, rport) in failed_endpoints
                 or rip in failed_ip_only
@@ -3289,9 +3357,13 @@ class RealtimeConnectionMonitor:
                 self._schedule_rdns(flow["rip"])
 
             sock_status = (
-                "STALLED"
-                if (flow["is_stalled"] or (flow["rip"], flow["rport"], flow["t_proto"]) in stalled_clash_endpoints)
-                else "ESTABLISHED"
+                "16KB_STALL"
+                if flow.get("is_16kb_stall")
+                else (
+                    "STALLED"
+                    if (flow["is_stalled"] or (flow["rip"], flow["rport"], flow["t_proto"]) in stalled_clash_endpoints)
+                    else "ESTABLISHED"
+                )
             )
             rows_out.append(
                 _build_conn_row(
@@ -3395,6 +3467,8 @@ class RealtimeConnectionMonitor:
             sock_st = str(conn.get("socket_status") or "")
             if sock_st == "SYN_SENT":
                 reason = "SYN_SENT stall"
+            elif sock_st == "16KB_STALL":
+                reason = "16KB stall"
             elif sock_st == "STALLED":
                 reason = "Clash stall"
             else:
@@ -3499,39 +3573,64 @@ class RealtimeConnectionMonitor:
                 vpn_processes=vpn_procs,
                 vpn_server_hosts=vpn_server_hosts,
             )
-            auto_vpn_procs: list[str] = []
-            if has_real_vpn and can_dns_bypass:
-                prot_low = {p.lower() for p in guard["processes"]} if guard["enabled"] else set()
-                vpn_low = {p.lower() for p in vpn_procs}
-                with self._lock:
-                    proc_stats = dict(self._last_stalled_direct_procs)
-                    optout = set(self._manual_vpn_proc_optout)
-                    for p_name, counts in proc_stats.items():
-                        low = p_name.lower()
-                        if (
-                            not low
-                            or low == "system"
-                            or low in _NON_AUTO_VPN_PROCESSES
-                            or low in _INTERNAL_PROXY_PROCESSES
-                            or low in prot_low
-                            or low in vpn_low
-                            or low in optout
-                        ):
-                            continue
-                        if counts.get("healthy", 0) > 0:
+            bundle_alerts: list[tuple[str, str]] = []
+            prot_low = {p.lower() for p in guard["processes"]} if guard["enabled"] else set()
+            vpn_low = {p.lower() for p in vpn_procs}
+            with self._lock:
+                proc_stats = dict(self._last_stalled_direct_procs)
+                optout = set(self._manual_vpn_proc_optout)
+                for p_name, counts in proc_stats.items():
+                    low = p_name.lower()
+                    if (
+                        not low
+                        or low == "system"
+                        or low in _NON_AUTO_VPN_PROCESSES
+                        or low in _INTERNAL_PROXY_PROCESSES
+                        or low in prot_low
+                        or low in vpn_low
+                        or low in optout
+                    ):
+                        continue
+                    if counts.get("healthy", 0) > 0:
+                        self._proc_stall_strikes.pop(low, None)
+                    elif counts.get("stalled", 0) >= 1:
+                        strikes = self._proc_stall_strikes.get(low, 0) + 1
+                        if counts.get("stalled", 0) >= 2 or strikes >= 2:
                             self._proc_stall_strikes.pop(low, None)
-                        elif counts.get("stalled", 0) >= 1:
-                            strikes = self._proc_stall_strikes.get(low, 0) + 1
-                            if counts.get("stalled", 0) >= 2 or strikes >= 2:
-                                self._proc_stall_strikes.pop(low, None)
-                                auto_vpn_procs.append(p_name)
-                            else:
-                                self._proc_stall_strikes[low] = strikes
+                            if low not in self._emitted_bundle_alerts:
+                                self._emitted_bundle_alerts.add(low)
+                                bundle_alerts.append((p_name, low))
+                        else:
+                            self._proc_stall_strikes[low] = strikes
         finally:
             storage.close()
 
+        for proc_name, low in bundle_alerts:
+            bundle_label = proc_name
+            bundle_id = ""
+            try:
+                from netdoctor.core.bundles import load_bundles, match_process_to_bundle
+
+                matched_b = match_process_to_bundle(proc_name, load_bundles())
+                if matched_b is not None:
+                    bundle_label = matched_b.name
+                    bundle_id = matched_b.id
+            except Exception:
+                pass
+            msg = f"У {bundle_label} проблемы со связью — подобрать другой маршрут?"
+            self.record_event(bundle_id or proc_name, proc_name, msg, "recommend", bundle_id or "bundle_issue")
+            with self._lock:
+                self.pending_bundle_alerts.append(
+                    {
+                        "bundle_id": bundle_id,
+                        "bundle_name": bundle_label,
+                        "process": proc_name,
+                        "message": msg,
+                    }
+                )
+
         healed: list[dict[str, Any]] = []
-        if not candidates and not auto_vpn_procs:
+        if not candidates:
             with self._lock:
                 events = list(self.recent_events)
             return {"connections": connections, "healed": healed, "events": events}
@@ -3543,36 +3642,6 @@ class RealtimeConnectionMonitor:
         singbox_changed = False
         has_new_domain = False
         bypass_fell = not bypass
-
-        for proc_to_vpn in auto_vpn_procs:
-            if hasattr(backend, "add_vpn_process"):
-                backend.add_vpn_process(proc_to_vpn, net_key=net_key, apply=False)
-            else:
-                st_vp = Storage(backend.db_path)
-                try:
-                    cur_vp = parse_process_list(st_vp.get_setting(f"vpn_processes:{net_key}", ""))
-                    if all(x.lower() != proc_to_vpn.lower() for x in cur_vp):
-                        cur_vp.append(proc_to_vpn)
-                        st_vp.set_setting(f"vpn_processes:{net_key}", ", ".join(cur_vp))
-                finally:
-                    st_vp.close()
-            any_saved = True
-            dpi_or_vpn_changed = True
-            singbox_changed = True
-            has_new_domain = True
-            with self._lock:
-                self.auto_healed_count += 1
-            action_txt = "Авто-VPN процесса (UDP/TCP таймаут напрямую) -> vpn/vpn-proc"
-            self.record_event(proc_to_vpn, proc_to_vpn, action_txt, "vpn", "vpn-proc")
-            healed.append(
-                {
-                    "domain": proc_to_vpn,
-                    "process": proc_to_vpn,
-                    "layer": "vpn",
-                    "strategy_id": "vpn-proc",
-                    "reason": "stalled non-web direct traffic",
-                }
-            )
 
         if candidates:
             net = await detect_network_fingerprint(timeout=timeout)
@@ -3600,7 +3669,10 @@ class RealtimeConnectionMonitor:
             now_cd = time.monotonic()
             with self._lock:
                 for dom, proc_name, reason in candidates:
-                    existing = active_decisions.get((dom.lower(), Protocol.TLS))
+                    existing = (
+                        active_decisions.get((dom.lower(), Protocol.TLS))
+                        or active_decisions.get((normalize_domain_etld1(dom), Protocol.TLS))
+                    )
                     if dom.lower() in pinned_domains or (existing is not None and getattr(existing, "pinned", False)):
                         # User explicitly pinned this working rule — never churn it automatically!
                         continue
@@ -3663,6 +3735,23 @@ class RealtimeConnectionMonitor:
                             # Port closed/refused on remote host (not DPI/block); never persist direct/dpi noise
                             continue
                         report = classify_probes(domain=dom, probes=probes, network=net, bypass_active=bypass)
+
+                        # Confirm-before-Persist for circular rotations and 16KB stalls to prevent transient lag poisoning
+                        if existing is None and ("circular" in reason or "16KB" in reason):
+                            needs_confirm = any(
+                                v in report.verdicts
+                                for v in (VerdictClass.SNI_DPI, VerdictClass.THROTTLE, VerdictClass.IP_BLOCK)
+                            )
+                            if needs_confirm:
+                                confirm_probes = await run_domain_probes(dom, timeout=min(timeout, 1.5))
+                                confirm_rep = classify_probes(
+                                    domain=dom, probes=confirm_probes, network=net, bypass_active=bypass
+                                )
+                                if confirm_rep.verdicts == [VerdictClass.OK]:
+                                    continue
+                                report = confirm_rep
+                                probes = confirm_probes
+
                         storage.save_verdict(net_key, report, protocol=Protocol.TLS)
 
                         ip = probes.tcp.target_ip or (
@@ -3847,7 +3936,15 @@ class RealtimeConnectionMonitor:
             procs = backend._collect_processes_state()
             is_adm = _is_admin()
             urgent_reload = bool(has_new_domain or bypass_fell)
-            defer_active = bool(bypass)
+            has_game_or_voice = any(
+                c.get("active_healthy")
+                and (
+                    is_game_process(str(c.get("process") or ""))
+                    or (str(c.get("protocol") or "").lower() == "udp" and "discord" in str(c.get("process") or "").lower())
+                )
+                for c in connections
+            )
+            defer_active = bool(bypass or has_game_or_voice)
             reloaded_any = False
             if winws2_changed and ((procs.get("winws2") or {}).get("running")) and is_adm:
                 reloaded_any = True

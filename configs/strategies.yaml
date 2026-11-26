@@ -312,7 +312,7 @@ strategies:
   protocol: tls
   tier: 2
   args_template:
-  - --lua-desync=tls_client_hello_clone
+  - --lua-desync=tls_client_hello_clone:blob=tls_google
   - --lua-desync=multisplit:pos=1,midsld
   description: 'Zapret2 v1.0.7: tls_client_hello_clone + multisplit по midsld'
 - id: tls_oob_multisplit_pos2

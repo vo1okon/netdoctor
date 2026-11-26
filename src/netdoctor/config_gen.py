@@ -68,6 +68,13 @@ KNOWN_BLOBS: dict[str, str] = {
     "fake_default_udp": "0x" + ("00" * 16),
 }
 
+QUIC_HOSTLIST_DOMAINS: tuple[str, ...] = (
+    "youtube.com",
+    "googlevideo.com",
+    "instagram.com",
+    "facebook.com",
+)
+
 TELEGRAM_CIDRS: tuple[str, ...] = (
     "91.108.4.0/22",
     "91.108.8.0/22",
@@ -517,6 +524,13 @@ def generate_winws2_config(
     expand_cdn_domains: bool = False,
     enable_tcp_in: bool = False,
     enable_telegram_ipset: bool = True,
+    isp_best_tls: str | None = None,
+    bundle_pass_domains: list[str] | None = None,
+    enable_game_udp_dpi: bool = False,
+    dns_infra_ips: list[str] | None = None,
+    dns_infra_domains: list[str] | None = None,
+    bundle_dpi_domains: Iterable[str] | None = None,
+    bin_dir: str | Path | None = None,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Generate winws2 command-line arguments and write hostlist files per winning strategy.
 
@@ -525,7 +539,15 @@ def generate_winws2_config(
     lists_path = Path(lists_dir)
     lists_path.mkdir(parents=True, exist_ok=True)
 
-    excluded_set = sorted({d.strip().lower() for d in (exclude_domains or []) if d and d.strip()})
+    excluded_set = sorted(
+        {
+            d.strip().lower()
+            for d in [*(exclude_domains or []), *(dns_infra_domains or [])]
+            if d and d.strip()
+        }
+    )
+    bundle_dpi_set = {d.strip().lower() for d in (bundle_dpi_domains or []) if d and d.strip()}
+    bundle_pass_set = {d.strip().lower() for d in (bundle_pass_domains or []) if d and d.strip()} - bundle_dpi_set
 
     def _is_excluded_domain(dom: str) -> bool:
         low = dom.strip().lower()
@@ -533,28 +555,43 @@ def generate_winws2_config(
 
     # Group domains by (protocol, strategy_id), skipping unlocker/hosts-excluded domains and no-op strategies (e.g. quic_fallback_tcp)
     grouped: dict[tuple[Protocol, str], list[str]] = {}
+    vpn_decided_domains: set[str] = set()
+    dpi_tls_covered: set[str] = set()
     for d in decisions:
+        if d.status == "active" and d.layer == "vpn" and d.domain:
+            vpn_decided_domains.add(d.domain.strip().lower())
         if d.layer == "dpi" and d.strategy_id and d.strategy_id in strategies and not _is_excluded_domain(d.domain):
             strat = strategies[d.strategy_id]
             if not strat.args_template:
                 continue
             key = (d.protocol, d.strategy_id)
             grouped.setdefault(key, []).append(d.domain)
+            if d.protocol == Protocol.TLS:
+                dpi_tls_covered.add(d.domain.strip().lower())
+
+    def _pick_best_tls_strategy() -> str | None:
+        if isp_best_tls and isp_best_tls in strategies and strategies[isp_best_tls].args_template:
+            return isp_best_tls
+        if "tls_alt1_199_fake_fakedsplit" in strategies and strategies["tls_alt1_199_fake_fakedsplit"].args_template:
+            return "tls_alt1_199_fake_fakedsplit"
+        if "tls_multisplit_pos2" in strategies and strategies["tls_multisplit_pos2"].args_template:
+            return "tls_multisplit_pos2"
+        return next((sid for sid, s in strategies.items() if s.protocol == Protocol.TLS and s.args_template), None)
+
+    # Wire AppBundle direct_dpi auth_domains into active TLS DPI profile (never shadowed by pass_domains)
+    pending_bundle_dpi = sorted(
+        d
+        for d in bundle_dpi_set
+        if d not in dpi_tls_covered and d not in vpn_decided_domains and not _is_excluded_domain(d)
+    )
+    if pending_bundle_dpi:
+        bundle_tls_id = _pick_best_tls_strategy()
+        if bundle_tls_id is not None:
+            grouped.setdefault((Protocol.TLS, bundle_tls_id), []).extend(pending_bundle_dpi)
 
     # Stage 1 fallback profile when DB has no active DPI decisions yet
     if not grouped:
-        fallback_strat_id = (
-            "tls_alt1_199_fake_fakedsplit"
-            if "tls_alt1_199_fake_fakedsplit" in strategies and strategies["tls_alt1_199_fake_fakedsplit"].args_template
-            else (
-                "tls_multisplit_pos2"
-                if "tls_multisplit_pos2" in strategies and strategies["tls_multisplit_pos2"].args_template
-                else next(
-                    (sid for sid, s in strategies.items() if s.protocol == Protocol.TLS and s.args_template),
-                    None,
-                )
-            )
-        )
+        fallback_strat_id = _pick_best_tls_strategy()
         if fallback_strat_id is not None:
             grouped[(Protocol.TLS, fallback_strat_id)] = [
                 "discord.com",
@@ -567,6 +604,7 @@ def generate_winws2_config(
                 "ytimg.com",
             ]
 
+    udp_dpi_active = bool(game_filter or enable_game_udp_dpi)
     args: list[str] = [
         "--lua-init=@lua/zapret-lib.lua",
         "--lua-init=@lua/zapret-antidpi.lua",
@@ -576,18 +614,19 @@ def generate_winws2_config(
         "--ipcache-hostname=1",
         "--wf-tcp-out=80,443,2053,2083,2087,2096,5222,8443",
     ]
-    if enable_tcp_in:
+    if enable_tcp_in or enable_circular_catchall:
         args.append("--wf-tcp-in=80,443")
     args.append(
         "--wf-udp-out=443,19294-19344,50000-50100,1024-65535"
-        if game_filter
+        if udp_dpi_active
         else "--wf-udp-out=443,19294-19344,50000-50100"
     )
     if iface is not None:
         args.append(f"--wf-iface={iface}")
 
-    # Always generate exclude_vpn_ips.txt with resolved IP/CIDR entries only
-    resolved_vpn_ips = resolve_vpn_ips(vpn_server_ips)
+    # Always generate exclude_vpn_ips.txt with resolved IP/CIDR entries (VPN servers + DNS infra)
+    combined_exclude_ips = [*(vpn_server_ips or []), *(dns_infra_ips or [])]
+    resolved_vpn_ips = resolve_vpn_ips(combined_exclude_ips)
     exclude_ipset_path = lists_path / "exclude_vpn_ips.txt"
     if resolved_vpn_ips:
         exclude_ipset_path.write_text("\n".join(resolved_vpn_ips) + "\n", encoding="utf-8")
@@ -615,7 +654,9 @@ def generate_winws2_config(
         for d in decisions
         if d.layer == "dns" and d.status == "active" and d.domain and d.domain.strip()
     } - dpi_domains
-    catchall_excluded_domains = sorted(set(excluded_set) | vpn_hostnames | direct_domains | dns_domains)
+    catchall_excluded_domains = sorted(
+        (set(excluded_set) | vpn_hostnames | direct_domains | dns_domains | bundle_pass_set) - bundle_dpi_set
+    )
     exclude_hostlist_path: Path | None = None
     if catchall_excluded_domains:
         exclude_hostlist_path = lists_path / "exclude_unlocker_domains.txt"
@@ -623,6 +664,20 @@ def generate_winws2_config(
 
     hostlists_map: dict[str, list[str]] = {}
     profile_count = 0
+
+    # Explicit pass guard for direct_clean bundle auth domains, DNS infrastructure, and VPN servers
+    pass_domains = sorted((set(excluded_set) | (bundle_pass_set - dpi_domains - bundle_dpi_set)) | vpn_hostnames)
+    if pass_domains:
+        pass_list_path = lists_path / "pass_domains.txt"
+        pass_list_path.write_text("\n".join(pass_domains) + "\n", encoding="utf-8")
+        args.extend(
+            [
+                "--filter-tcp=80,443,2053,2083,2087,2096,8443",
+                f"--hostlist={pass_list_path.as_posix()}",
+                "--lua-desync=pass",
+            ]
+        )
+        profile_count += 1
 
     for (proto, strat_id), domains in sorted(grouped.items(), key=lambda x: x[0][1]):
         strat = strategies[strat_id]
@@ -688,11 +743,12 @@ def generate_winws2_config(
         args.extend(strat.args_template)
         profile_count += 1
 
-    # Dedicated Telegram MTProto / Web IPSET profile (MTProto has no TLS SNI, so --ipset + --payload=all is required)
+    tg_ipset_path = lists_path / "ipset-telegram.txt"
+    if not tg_ipset_path.is_file() or tg_ipset_path.stat().st_size == 0:
+        tg_ipset_path.write_text("\n".join(TELEGRAM_CIDRS) + "\n", encoding="utf-8")
+
+    # Dedicated Telegram MTProto / Web IPSET profile (disabled when tg-ws-proxy MTProto mode is active)
     if enable_telegram_ipset:
-        tg_ipset_path = lists_path / "ipset-telegram.txt"
-        if not tg_ipset_path.is_file() or tg_ipset_path.stat().st_size == 0:
-            tg_ipset_path.write_text("\n".join(TELEGRAM_CIDRS) + "\n", encoding="utf-8")
         if profile_count > 0:
             args.append("--new")
         args.extend(
@@ -714,7 +770,7 @@ def generate_winws2_config(
         )
         profile_count += 1
 
-    # Add circular insurance profile for unknown / newly broken TLS hosts
+    # Add circular catch-all: strategy=1 is pass (zero harm for direct), strategy=2 is isp_best_tls, followed by diverse fallbacks
     if enable_circular_catchall:
         tls_candidates = [
             s
@@ -722,20 +778,42 @@ def generate_winws2_config(
             if s.protocol == Protocol.TLS
             and s.tier in (2, 3)
             and s.args_template
-            and len(s.args_template) == 1
-            and s.args_template[0].startswith("--lua-desync=")
+            and all(tok.startswith("--lua-desync=") for tok in s.args_template)
             and not _uses_known_file_blob(s)
         ]
         if tls_candidates:
-            # Prefer clean split/disorder strategies without fake ClientHello first so catch-all
-            # doesn't trigger ERR_SSL_UNRECOGNIZED_NAME_ALERT on ordinary strict servers.
             tls_candidates.sort(
                 key=lambda s: (
-                    0 if ("fake" not in s.family and "fake" not in s.args_template[0]) else 1,
+                    0 if (isp_best_tls and s.id == isp_best_tls) else 1,
+                    0 if ("fake" not in s.family and "fake" not in " ".join(s.args_template)) else 1,
                     s.tier,
                     s.id,
                 )
             )
+            chosen_cands: list[Strategy] = []
+            seen_families: set[str] = set()
+            if isp_best_tls and isp_best_tls in strategies:
+                best_s = strategies[isp_best_tls]
+                if best_s.protocol == Protocol.TLS and best_s.args_template and all(
+                    tok.startswith("--lua-desync=") for tok in best_s.args_template
+                ):
+                    chosen_cands.append(best_s)
+                    seen_families.add(best_s.family)
+            for cand in tls_candidates:
+                if any(c.id == cand.id for c in chosen_cands):
+                    continue
+                if len(chosen_cands) >= 1 and cand.family in seen_families and len(tls_candidates) > 3:
+                    continue
+                chosen_cands.append(cand)
+                seen_families.add(cand.family)
+                if len(chosen_cands) >= 3:
+                    break
+            for cand in tls_candidates:
+                if len(chosen_cands) >= 3:
+                    break
+                if all(c.id != cand.id for c in chosen_cands):
+                    chosen_cands.append(cand)
+
             if profile_count > 0:
                 args.append("--new")
             args.extend(
@@ -747,21 +825,26 @@ def generate_winws2_config(
             )
             if resolved_vpn_ips:
                 args.append(f"--ipset-exclude={exclude_ipset_path.as_posix()}")
+            if not enable_telegram_ipset:
+                args.append(f"--ipset-exclude={tg_ipset_path.as_posix()}")
             if exclude_hostlist_path is not None:
                 args.append(f"--hostlist-exclude={exclude_hostlist_path.as_posix()}")
             args.append("--lua-desync=circular:fails=2:time=300:retrans=3:nld=2")
-            for idx, cand in enumerate(tls_candidates[:4], start=1):
-                base_arg = cand.args_template[0]
-                suffix = f":strategy={idx}" + (":final" if idx == len(tls_candidates[:4]) else "")
-                args.append(f"{base_arg}{suffix}")
+            args.append("--lua-desync=pass:strategy=1")
+            total_steps = 1 + len(chosen_cands)
+            for idx, cand in enumerate(chosen_cands, start=2):
+                is_last = idx == total_steps
+                suffix = f":strategy={idx}" + (":final" if is_last else "")
+                for base_arg in cand.args_template:
+                    args.append(f"{base_arg}{suffix}")
             profile_count += 1
 
-    # Always add Discord voice / STUN UDP profile (and widen port range when game_filter is enabled)
+    # Discord voice / STUN UDP profile — strictly bounded to voice ports (NEVER 1024-65535)
     if profile_count > 0:
         args.append("--new")
     args.extend(
         [
-            "--filter-udp=1024-65535" if game_filter else "--filter-udp=443,19294-19344,50000-50100",
+            "--filter-udp=19294-19344,50000-50100",
             "--filter-l7=discord,stun",
         ]
     )
@@ -770,7 +853,28 @@ def generate_winws2_config(
     args.append("--lua-desync=fake:blob=discord_active:repeats=6")
     profile_count += 1
 
-    blob_args = extract_blob_args(args)
+    # Separate Game Cloud UDP profile when a game bundle uses direct_dpi or game_filter is enabled
+    if udp_dpi_active:
+        args.append("--new")
+        args.append("--filter-udp=1024-65535")
+        cloud_ipsets = [
+            lists_path / "zapret2" / fname
+            for fname in ("ipset-amazon.txt", "ipset-ovh.txt", "ipset-cloudflare.txt", "ipset-azure.txt")
+            if (lists_path / "zapret2" / fname).is_file() and (lists_path / "zapret2" / fname).stat().st_size > 0
+        ]
+        for ipset_f in cloud_ipsets:
+            args.append(f"--ipset={ipset_f.as_posix()}")
+        if resolved_vpn_ips:
+            args.append(f"--ipset-exclude={exclude_ipset_path.as_posix()}")
+        args.extend(
+            [
+                "--out-range=-d8",
+                "--lua-desync=fake:blob=game_active:repeats=4",
+            ]
+        )
+        profile_count += 1
+
+    blob_args = extract_blob_args(args, bin_dir=bin_dir)
     if blob_args:
         insert_idx = sum(1 for a in args if a.startswith("--lua-init="))
         args[insert_idx:insert_idx] = blob_args
@@ -831,6 +935,7 @@ def _build_wireguard_endpoint(
     raw_outbound: dict[str, Any],
     node: VpnNode,
     extended_core: bool,
+    domain_resolver: str = "dns-local",
 ) -> dict[str, Any]:
     """Convert a legacy WireGuard/AmneziaWG outbound dict into sing-box 1.12+/1.14+ endpoint schema."""
     ob = dict(raw_outbound)
@@ -883,7 +988,7 @@ def _build_wireguard_endpoint(
     if ob.get("domain_resolver"):
         ep["domain_resolver"] = ob["domain_resolver"]
     elif needs_domain_resolver:
-        ep["domain_resolver"] = "dns-doh"
+        ep["domain_resolver"] = domain_resolver
 
     if extended_core:
         for awg_key in _AMNEZIAWG_KEYS:
@@ -1182,7 +1287,6 @@ _GAME_PROCESS_SUBSTR_HINTS: tuple[str, ...] = (
     "rainbowsix",
     "beservice",
     "battleye",
-    "uplaywebcore",
     "valorant",
     "riotclient",
     "cs2.exe",
@@ -1231,19 +1335,6 @@ def is_game_process(proc_name: str, extra_processes: Iterable[str] = ()) -> bool
         return True
     return any(hint in low for hint in _GAME_PROCESS_SUBSTR_HINTS)
 
-GAME_BYPASS_PORTS: tuple[int, ...] = (25565, 19132, 19133, 3074, 2099, 5223, 6667, 6672, 27900, 27901, 28910)
-
-GAME_BYPASS_PORT_RANGES: tuple[str, ...] = (
-    "27015:27050",
-    "5000:5500",
-    "6112:6119",
-    "7000:8000",
-    "7777:7780",
-    "8393:8400",
-    "9000:9100",
-    "61455:61458",
-)
-
 
 def needs_xray_bridge(node: VpnNode | dict[str, Any]) -> bool:
     """Return True if a VLESS node requires Xray-core sidecar bridging (Reality or xhttp/splithttp)."""
@@ -1284,7 +1375,7 @@ def generate_xray_bridge_config(
     enable_byedpi: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     """Build Xray-core local SOCKS5 bridge config for VLESS Reality/xhttp nodes and return (config, {tag: port})."""
-    used_tags: set[str] = {"direct", "tg-ws-out", "vpn-auto", "vpn-select", "vpn-ai"}
+    used_tags: set[str] = {"direct", "vpn-auto", "vpn-select", "vpn-ai"}
     if enable_byedpi:
         used_tags.add("byedpi-out")
 
@@ -1409,10 +1500,10 @@ def generate_xray_bridge_config(
         dict.fromkeys(
             s
             for s in (
+                "localhost",
                 dns_server if _is_ip_address(dns_server) else "",
                 "1.1.1.1",
                 "8.8.8.8",
-                "localhost",
             )
             if s
         )
@@ -1421,8 +1512,14 @@ def generate_xray_bridge_config(
         "log": {"loglevel": "warning"},
         "dns": {"servers": xray_dns},
         "inbounds": inbounds,
-        "outbounds": [*xray_outbounds, {"protocol": "freedom", "tag": "direct"}],
-        "routing": {"domainStrategy": "AsIs", "rules": rules},
+        "outbounds": [{"protocol": "freedom", "tag": "direct"}, *xray_outbounds],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "port": 53, "outboundTag": "direct"},
+                *rules,
+            ],
+        },
     }
     if output_path and bridge_ports:
         out_file = Path(output_path)
@@ -1431,12 +1528,144 @@ def generate_xray_bridge_config(
     return cfg, bridge_ports
 
 
+def build_singbox_rulesets_payload(
+    decisions: list[Decision],
+    *,
+    bypass_domains: list[str] | None = None,
+    enable_byedpi: bool = False,
+    smartdns_domains: list[str] | None = None,
+    bundle_rules: dict[str, Any] | None = None,
+    quic_blocked_domains: list[str] | None = None,
+    vpn_processes: list[str] | None = None,
+    telegram_mode: str = "mtproto",
+) -> dict[str, list[dict[str, Any]]]:
+    """Build JSON rule lists for sing-box remote HTTP rule_set endpoints (ETag zero-downtime updates)."""
+    bypass_list = sorted({d.strip().lower() for d in (bypass_domains or []) if d and d.strip()})
+
+    def _is_bypassed(dom: str) -> bool:
+        low = dom.strip().lower()
+        return any(low == b or low.endswith("." + b) for b in bypass_list)
+
+    per_dns_override_hosts: set[str] = set()
+    explicit_smartdns_hosts: set[str] = set()
+    for d in decisions:
+        if _is_bypassed(d.domain):
+            continue
+        if d.layer == "dns" and isinstance(d.strategy_id, str):
+            if d.strategy_id == "smartdns":
+                explicit_smartdns_hosts.add(d.domain.strip().lower().lstrip("."))
+            elif d.strategy_id.startswith("dns:"):
+                dns_id = d.strategy_id.split(":", 1)[1].strip()
+                if dns_id:
+                    per_dns_override_hosts.add(d.domain)
+
+    vpn_select_set: set[str] = set()
+    vpn_ai_set: set[str] = set()
+    byedpi_set: set[str] = set()
+    for d in decisions:
+        if d.layer == "vpn" and not _is_bypassed(d.domain):
+            expanded = [d.domain]
+            expanded.extend(CDN_DOMAIN_EXPANSIONS.get(d.domain.strip().lower(), ()))
+            if d.strategy_id == "vpn-ai":
+                target_bucket = vpn_ai_set
+            elif d.strategy_id == "byedpi-out" and enable_byedpi:
+                target_bucket = byedpi_set
+            else:
+                target_bucket = vpn_select_set
+            for dom_cand in expanded:
+                if dom_cand and not _is_bypassed(dom_cand):
+                    target_bucket.add(dom_cand)
+
+    all_vpn_route_domains = vpn_select_set | vpn_ai_set | byedpi_set
+    doh_domains = sorted(
+        {
+            d.domain
+            for d in decisions
+            if d.layer in ("dns", "dpi", "vpn")
+            and d.domain not in per_dns_override_hosts
+            and not _is_bypassed(d.domain)
+        }
+        | {
+            dom
+            for dom in all_vpn_route_domains
+            if dom not in per_dns_override_hosts and not _is_bypassed(dom)
+        }
+    )
+    smart_doms = sorted(
+        {
+            d.strip().lower().lstrip(".")
+            for d in [*doh_domains, *(smartdns_domains or []), *explicit_smartdns_hosts]
+            if d and d.strip()
+        }
+    )
+    quic_reject_set = {
+        d.domain
+        for d in decisions
+        if d.protocol == Protocol.QUIC
+        and d.strategy_id == "quic_fallback_tcp"
+        and not _is_bypassed(d.domain)
+    }
+    for qd in quic_blocked_domains or []:
+        q_clean = str(qd or "").strip().lower()
+        if q_clean and not _is_bypassed(q_clean):
+            quic_reject_set.add(q_clean)
+
+    br = bundle_rules or {}
+    bundles_direct_rules: list[dict[str, Any]] = []
+    if br.get("direct_processes"):
+        bundles_direct_rules.append({"process_name": list(br["direct_processes"])})
+    if br.get("direct_path_regexes"):
+        bundles_direct_rules.append({"process_path_regex": list(br["direct_path_regexes"])})
+    if br.get("direct_domains"):
+        bundles_direct_rules.append({"domain_suffix": list(br["direct_domains"])})
+
+    bundles_vpn_rules: list[dict[str, Any]] = []
+    if br.get("vpn_processes"):
+        bundles_vpn_rules.append({"process_name": list(br["vpn_processes"])})
+    if br.get("vpn_path_regexes"):
+        bundles_vpn_rules.append({"process_path_regex": list(br["vpn_path_regexes"])})
+    if br.get("vpn_domains"):
+        bundles_vpn_rules.append({"domain_suffix": list(br["vpn_domains"])})
+
+    infra_low = {p.lower() for p in DEFAULT_BYPASS_PROCESSES} | {"sing-box", "sing-box.exe"}
+    clean_vpn_procs = [
+        p
+        for p in (vpn_processes or [])
+        if Path(str(p or "").strip().replace("\\", "/")).name.strip().lower() not in infra_low
+    ]
+    bundles_dns_vpn_rules: list[dict[str, Any]] = []
+    dns_vpn_procs = list(dict.fromkeys([*clean_vpn_procs, *(br.get("vpn_processes") or [])]))
+    if dns_vpn_procs:
+        bundles_dns_vpn_rules.append({"process_name": dns_vpn_procs})
+    if br.get("vpn_domains"):
+        bundles_dns_vpn_rules.append({"domain_suffix": list(br["vpn_domains"])})
+
+    rs_vpn_rules: list[dict[str, Any]] = []
+    if vpn_select_set:
+        rs_vpn_rules.append({"domain_suffix": sorted(vpn_select_set)})
+    if str(telegram_mode or "mtproto").strip().lower() == "transparent" and (
+        "telegram.org" in vpn_select_set or "t.me" in vpn_select_set
+    ):
+        rs_vpn_rules.append({"ip_cidr": list(TELEGRAM_CIDRS)})
+
+    return {
+        "rs-doh": [{"domain_suffix": doh_domains}] if doh_domains else [],
+        "rs-smartdns": [{"domain_suffix": smart_doms}] if smart_doms else [],
+        "rs-vpn": rs_vpn_rules,
+        "rs-vpn-ai": [{"domain_suffix": sorted(vpn_ai_set)}] if vpn_ai_set else [],
+        "rs-byedpi": [{"domain_suffix": sorted(byedpi_set)}] if byedpi_set else [],
+        "rs-quic-reject": [{"domain_suffix": sorted(quic_reject_set)}] if quic_reject_set else [],
+        "rs-bundles-direct": bundles_direct_rules,
+        "rs-bundles-vpn": bundles_vpn_rules,
+        "rs-bundles-dns-vpn": bundles_dns_vpn_rules,
+    }
+
+
 def generate_singbox_config(
     decisions: list[Decision],
     vpn_nodes: list[VpnNode] | None = None,
     output_path: str | Path | None = None,
     doh_server: str = "1.1.1.1",
-    tg_ws_proxy_port: int = 10808,
     enable_tun: bool = True,
     extended_core: bool = False,
     dns_type: str = "https",
@@ -1452,7 +1681,7 @@ def generate_singbox_config(
     use_wireguard_endpoints: bool = False,
     extra_dns_servers_sni: bool = True,
     doh_tls_sni: str | None = None,
-    tun_stack: str = "gvisor",
+    tun_stack: str = "mixed",
     vpn_selection_mode: str = "auto",
     preferred_vpn_node: str | None = None,
     xray_bridge_ports: dict[str, int] | None = None,
@@ -1461,8 +1690,12 @@ def generate_singbox_config(
     primary_is_smartdns: bool = False,
     smartdns_domains: list[str] | None = None,
     base_dns: dict[str, Any] | None = None,
+    bundle_rules: dict[str, Any] | None = None,
+    ruleset_base_url: str | None = None,
+    quic_blocked_domains: list[str] | None = None,
+    telegram_mode: str = "mtproto",
 ) -> dict[str, Any]:
-    """Generate sing-box 1.12+/1.14+ JSON configuration combining global + per-domain DoH/bypass DNS rules, Telegram proxy route, multi-VPN regional/auto/AI urltest/selector outbounds, and Clash API."""
+    """Generate sing-box 1.12+/1.14+ JSON configuration with safe mixed TUN, Split-DNS, AppBundles, and zero-downtime HTTP rule_sets."""
     vpn_nodes = vpn_nodes or []
 
     bypass_list = sorted({d.strip().lower() for d in (bypass_domains or []) if d and d.strip()})
@@ -1471,19 +1704,21 @@ def generate_singbox_config(
         low = dom.strip().lower()
         return any(low == b or low.endswith("." + b) for b in bypass_list)
 
-    # Collect per-domain DNS overrides (layer="dns", strategy_id="dns:<dns_id>")
     per_dns_domains: dict[str, list[str]] = {}
     per_dns_override_hosts: set[str] = set()
+    explicit_smartdns_hosts: set[str] = set()
     for d in decisions:
         if _is_bypassed(d.domain):
             continue
-        if d.layer == "dns" and isinstance(d.strategy_id, str) and d.strategy_id.startswith("dns:"):
-            dns_id = d.strategy_id.split(":", 1)[1].strip()
-            if dns_id:
-                per_dns_domains.setdefault(dns_id, []).append(d.domain)
-                per_dns_override_hosts.add(d.domain)
+        if d.layer == "dns" and isinstance(d.strategy_id, str):
+            if d.strategy_id == "smartdns":
+                explicit_smartdns_hosts.add(d.domain.strip().lower().lstrip("."))
+            elif d.strategy_id.startswith("dns:"):
+                dns_id = d.strategy_id.split(":", 1)[1].strip()
+                if dns_id:
+                    per_dns_domains.setdefault(dns_id, []).append(d.domain)
+                    per_dns_override_hosts.add(d.domain)
 
-    # Bucket layer="vpn" decisions by target outbound and expand CDN/alias domains
     vpn_select_set: set[str] = set()
     vpn_ai_set: set[str] = set()
     byedpi_set: set[str] = set()
@@ -1506,7 +1741,6 @@ def generate_singbox_config(
     byedpi_domains = sorted(byedpi_set)
     all_vpn_route_domains = vpn_select_set | vpn_ai_set | byedpi_set
 
-    # Collect remaining domains needing default DoH, VPN, or QUIC drop
     doh_domains = sorted(
         {
             d.domain
@@ -1521,15 +1755,18 @@ def generate_singbox_config(
             if dom not in per_dns_override_hosts and not _is_bypassed(dom)
         }
     )
-    quic_reject_domains = sorted(
-        {
-            d.domain
-            for d in decisions
-            if d.protocol == Protocol.QUIC
-            and d.strategy_id == "quic_fallback_tcp"
-            and not _is_bypassed(d.domain)
-        }
-    )
+    quic_reject_set = {
+        d.domain
+        for d in decisions
+        if d.protocol == Protocol.QUIC
+        and d.strategy_id == "quic_fallback_tcp"
+        and not _is_bypassed(d.domain)
+    }
+    for qd in quic_blocked_domains or []:
+        q_clean = str(qd or "").strip().lower()
+        if q_clean and not _is_bypassed(q_clean):
+            quic_reject_set.add(q_clean)
+    quic_reject_domains = sorted(quic_reject_set)
 
     catalog_map = dns_catalog
     if catalog_map is None and (per_dns_domains or (extra_dns_servers_sni and dns_type == "https") or not _is_ip_address(doh_server)):
@@ -1585,12 +1822,14 @@ def generate_singbox_config(
                             primary_tls_sni = parsed_cand.hostname
                             break
 
+    infra_low = {p.lower() for p in DEFAULT_BYPASS_PROCESSES} | {"sing-box", "sing-box.exe"}
     vpn_proc_list: list[str] = []
     seen_vpn_procs: set[str] = set()
     for p in vpn_processes or []:
         clean_p = Path(str(p or "").strip().replace("\\", "/")).name.strip()
-        if clean_p and clean_p.lower() not in seen_vpn_procs:
-            seen_vpn_procs.add(clean_p.lower())
+        low_p = clean_p.lower()
+        if clean_p and low_p not in infra_low and low_p not in seen_vpn_procs:
+            seen_vpn_procs.add(low_p)
             vpn_proc_list.append(clean_p)
 
     has_usable_vpn = any(getattr(n, "enabled", True) and not is_placeholder_node(n) for n in vpn_nodes)
@@ -1653,7 +1892,7 @@ def generate_singbox_config(
             server_port=srv_port,
         )
 
-    # 1. DNS configuration (sing-box 1.12+ / 1.14+ typed server format)
+    # 1. DNS configuration (Split-DNS by default: dns.final == "dns-local")
     primary_dns_entry = _build_singbox_dns_server_entry(
         tag="dns-doh",
         server=primary_server,
@@ -1668,31 +1907,33 @@ def generate_singbox_config(
     ]
     vpn_dns_tag = "dns-doh"
     vpn_outbound_resolver = "dns-doh"
-    if primary_is_smartdns:
-        base_entry: dict[str, Any] | None = None
-        if isinstance(base_dns, dict) and str(base_dns.get("category") or "").strip().lower() != "ai_bypass":
-            base_entry = _build_catalog_dns_entry(base_dns, "dns-base", allow_broken_doh=False)
-        if base_entry is not None:
-            dns_servers.append(base_entry)
-            vpn_dns_tag = "dns-base"
-            vpn_outbound_resolver = "dns-base"
-        elif has_usable_vpn:
-            dns_servers.append(
-                {
-                    "type": "https",
-                    "tag": "dns-vpn",
-                    "server": "9.9.9.9",
-                    "path": "/dns-query",
-                    "tls": {"enabled": True, "server_name": "dns.quad9.net"},
-                    "detour": "vpn-select",
-                }
-            )
-            vpn_dns_tag = "dns-vpn"
-            vpn_outbound_resolver = "dns-local"
-        else:
-            vpn_dns_tag = "dns-local"
-            vpn_outbound_resolver = "dns-local"
+    base_entry: dict[str, Any] | None = None
+    if isinstance(base_dns, dict) and str(base_dns.get("category") or "").strip().lower() != "ai_bypass":
+        base_entry = _build_catalog_dns_entry(base_dns, "dns-base", allow_broken_doh=False)
+    if base_entry is not None:
+        dns_servers.append(base_entry)
+        vpn_dns_tag = "dns-base"
+        vpn_outbound_resolver = "dns-base"
+    elif has_usable_vpn:
+        dns_servers.append(
+            {
+                "type": "https",
+                "tag": "dns-vpn",
+                "server": "9.9.9.9",
+                "path": "/dns-query",
+                "tls": {"enabled": True, "server_name": "dns.quad9.net"},
+                "detour": "vpn-select",
+            }
+        )
+        vpn_dns_tag = "dns-vpn"
+        vpn_outbound_resolver = "dns-local"
+    else:
+        vpn_dns_tag = "dns-local"
+        vpn_outbound_resolver = "dns-local"
+
     dns_rules: list[dict[str, Any]] = []
+    use_remote_rulesets = bool(ruleset_base_url and str(ruleset_base_url).strip())
+    rs_base = str(ruleset_base_url or "").rstrip("/")
 
     if bypass_list:
         dns_rules.append(
@@ -1702,25 +1943,39 @@ def generate_singbox_config(
             }
         )
 
-    if primary_is_smartdns and vpn_proc_list:
+    if use_remote_rulesets:
         dns_rules.append(
             {
-                "process_name": vpn_proc_list,
+                "rule_set": ["rs-bundles-dns-vpn"],
                 "server": vpn_dns_tag,
             }
         )
+    else:
+        br_dns_procs = list(dict.fromkeys([*vpn_proc_list, *((bundle_rules or {}).get("vpn_processes") or [])]))
+        if br_dns_procs:
+            dns_rules.append(
+                {
+                    "process_name": br_dns_procs,
+                    "server": vpn_dns_tag,
+                }
+            )
+        if (bundle_rules or {}).get("vpn_domains"):
+            dns_rules.append(
+                {
+                    "domain_suffix": list((bundle_rules or {})["vpn_domains"]),
+                    "server": vpn_dns_tag,
+                }
+            )
 
     if per_dns_domains and catalog_map is not None:
         for dns_id in sorted(per_dns_domains):
             srv = catalog_map.get(dns_id)
             if not srv:
-                # Unknown DNS id falls back to default dns-doh
                 doh_domains = sorted(set(doh_domains).union(per_dns_domains[dns_id]))
                 continue
             tag = f"dns-{dns_id}"
             srv_entry = _build_catalog_dns_entry(srv, tag)
             if srv_entry is None:
-                # Unresolvable DNS id falls back to default dns-doh
                 doh_domains = sorted(set(doh_domains).union(per_dns_domains[dns_id]))
                 continue
 
@@ -1732,11 +1987,18 @@ def generate_singbox_config(
                 }
             )
 
-    if primary_is_smartdns:
+    if use_remote_rulesets:
+        if primary_is_smartdns:
+            if vpn_dns_tag != "dns-local":
+                dns_rules.append({"rule_set": ["rs-vpn"], "server": vpn_dns_tag})
+            dns_rules.append({"rule_set": ["rs-smartdns"], "server": "dns-doh"})
+        else:
+            dns_rules.append({"rule_set": ["rs-doh"], "server": "dns-doh"})
+    elif primary_is_smartdns:
         smart_doms = sorted(
             {
                 d.strip().lower().lstrip(".")
-                for d in [*doh_domains, *(smartdns_domains or [])]
+                for d in [*doh_domains, *(smartdns_domains or []), *explicit_smartdns_hosts]
                 if d and d.strip()
             }
         )
@@ -1766,11 +2028,11 @@ def generate_singbox_config(
     dns_config: dict[str, Any] = {
         "servers": dns_servers,
         "rules": dns_rules,
-        "final": "dns-local" if primary_is_smartdns else "dns-doh",
+        "final": "dns-local",
     }
 
-    # 2. Inbounds (sing-box 1.12+ address array + route action sniff)
-    resolved_stack = tun_stack if tun_stack in ("gvisor", "mixed", "system") else "gvisor"
+    # 2. Inbounds (safe mixed TUN + MTU 1380 by default)
+    resolved_stack = tun_stack if tun_stack in ("mixed", "gvisor", "system") else "mixed"
     inbounds: list[dict[str, Any]] = []
     if enable_tun:
         inbounds.append(
@@ -1779,7 +2041,7 @@ def generate_singbox_config(
                 "tag": "tun-in",
                 "interface_name": "netdoctor-tun",
                 "address": ["172.19.0.1/30"],
-                "mtu": 1500,
+                "mtu": 1380,
                 "auto_route": True,
                 "strict_route": False,
                 "endpoint_independent_nat": True,
@@ -1801,13 +2063,21 @@ def generate_singbox_config(
             "listen_port": 2080,
         }
     )
+    if has_usable_vpn:
+        inbounds.append(
+            {
+                "type": "mixed",
+                "tag": "vpn-probe-in",
+                "listen": "127.0.0.1",
+                "listen_port": 2081,
+            }
+        )
 
-    # 3. Outbounds & WireGuard endpoints
+    # 3. Outbounds & WireGuard endpoints (no fake tg-ws-out direct stub)
     outbounds: list[dict[str, Any]] = [
         {"type": "direct", "tag": "direct"},
-        {"type": "direct", "tag": "tg-ws-out"},
     ]
-    used_tags: set[str] = {"direct", "tg-ws-out", "vpn-auto", "vpn-select", "vpn-ai"}
+    used_tags: set[str] = {"direct", "vpn-auto", "vpn-select", "vpn-ai"}
     if enable_byedpi:
         used_tags.add("byedpi-out")
         outbounds.append(
@@ -1860,7 +2130,14 @@ def generate_singbox_config(
         elif is_ts:
             endpoints.append(_build_tailscale_endpoint(ob, node))
         elif is_wg and use_wireguard_endpoints:
-            endpoints.append(_build_wireguard_endpoint(ob, node, extended_core=extended_core))
+            endpoints.append(
+                _build_wireguard_endpoint(
+                    ob,
+                    node,
+                    extended_core=extended_core,
+                    domain_resolver=vpn_outbound_resolver,
+                )
+            )
         else:
             if not extended_core and ob.get("type") == "wireguard":
                 for awg_key in _AMNEZIAWG_KEYS:
@@ -1915,7 +2192,6 @@ def generate_singbox_config(
             if region != "ru":
                 non_ru_ut_tags.append(ut_tag)
 
-        # Automatic fastest/alive node switching via urltest (prefer non-RU nodes so geo-blocked sites exit abroad)
         non_ru_node_tags = [e.tag for e in active_entries if e.region != "ru"]
         outbounds.append(
             {
@@ -1930,7 +2206,6 @@ def generate_singbox_config(
             }
         )
 
-        # AI-dedicated pool preferring non-RU regional urltest groups / nodes
         ai_targets = list(dict.fromkeys([*non_ru_ut_tags, *non_ru_node_tags]))
         if not ai_targets:
             ai_targets = list(active_tags)
@@ -1947,7 +2222,6 @@ def generate_singbox_config(
             }
         )
 
-        # Selector allowing manual or orchestrator-driven pinning with vpn-auto or priority node as default
         default_outbound = "vpn-auto"
         if (vpn_selection_mode or "auto").strip().lower() == "priority":
             non_quarantined_active = [e for e in active_entries if e.tag not in quarantined]
@@ -1969,7 +2243,6 @@ def generate_singbox_config(
             }
         )
     else:
-        # Fallback if no VPN subscription is added yet
         outbounds.append(
             {
                 "type": "selector",
@@ -1989,39 +2262,13 @@ def generate_singbox_config(
 
     bypass_procs = list(dict.fromkeys([*DEFAULT_BYPASS_PROCESSES, *(extra_bypass_processes or [])]))
 
-    # 4. Route rules (sing-box 1.12+ route actions: sniff, hijack-dns, reject)
+    # 4. Route rules: proc_bypass_rule strictly BEFORE sniff & hijack-dns!
     proc_bypass_rule: dict[str, Any] = {
         "process_name": bypass_procs,
         "outbound": "direct",
     }
     if enable_tun:
-        # Scope process bypass to TUN only so mixed-in explicit proxy probes from python/pythonw still test VPN routes
         proc_bypass_rule["inbound"] = ["tun-in"]
-
-    vpn_proc_low = {p.lower() for p in vpn_proc_list}
-    game_procs = (
-        [p for p in DEFAULT_GAME_PROCESSES if p.lower() not in vpn_proc_low]
-        if vpn_proc_list
-        else list(DEFAULT_GAME_PROCESSES)
-    )
-    game_proc_subrules: list[dict[str, Any]] = [
-        {"process_name": game_procs},
-        {"port": [53, 80, 443, 8080, 8443], "invert": True},
-    ]
-    game_port_rule: dict[str, Any] = {
-        "port": list(GAME_BYPASS_PORTS),
-        "port_range": list(GAME_BYPASS_PORT_RANGES),
-        "outbound": "direct",
-    }
-    if enable_tun:
-        game_proc_subrules.append({"inbound": ["tun-in"]})
-        game_port_rule["inbound"] = ["tun-in"]
-    game_proc_rule: dict[str, Any] = {
-        "type": "logical",
-        "mode": "and",
-        "rules": game_proc_subrules,
-        "outbound": "direct",
-    }
 
     normalized_bypass_cidrs: list[str] = []
     seen_cidrs: set[str] = set()
@@ -2039,13 +2286,74 @@ def generate_singbox_config(
             normalized_bypass_cidrs.append(cidr)
 
     route_rules: list[dict[str, Any]] = [
-        {"port": [53, 80, 443, 8080, 8443], "action": "sniff", "timeout": "100ms"},
-        {"protocol": "dns", "action": "hijack-dns"},
-        # Prevent routing loops and preserve external unlocker / IDE apps (Antigravity, xray, happ, etc.)
+        # 1. Bypass internal tools (python, winws2, tg-ws-proxy, xray) BEFORE hijack-dns/sniff
         proc_bypass_rule,
+        # 2. Sniff web & DNS ports
+        {"port": [53, 80, 443, 8080, 8443], "action": "sniff", "timeout": "100ms"},
+        # 3. Hijack DNS into Split-DNS engine
+        {"protocol": "dns", "action": "hijack-dns"},
     ]
-    if vpn_proc_list:
-        vpn_proc_rule: dict[str, Any] = {
+
+    if normalized_bypass_cidrs:
+        route_rules.append({"ip_cidr": normalized_bypass_cidrs, "outbound": "direct"})
+
+    if bypass_list:
+        route_rules.append({"domain_suffix": bypass_list, "outbound": "direct"})
+
+    # 4. AppBundle rules (VPN bundle & process rules strictly BEFORE direct bundle rules)
+    if use_remote_rulesets:
+        rs_vpn_bundle_rule: dict[str, Any] = {"rule_set": ["rs-bundles-vpn"], "outbound": "vpn-select"}
+        rs_direct_rule: dict[str, Any] = {"rule_set": ["rs-bundles-direct"], "outbound": "direct"}
+        if enable_tun:
+            rs_vpn_bundle_rule["inbound"] = ["tun-in"]
+            rs_direct_rule["inbound"] = ["tun-in"]
+        route_rules.append(rs_vpn_bundle_rule)
+        if vpn_proc_list:
+            vpn_proc_rule: dict[str, Any] = {
+                "process_name": vpn_proc_list,
+                "outbound": "vpn-select",
+            }
+            if enable_tun:
+                vpn_proc_rule["inbound"] = ["tun-in"]
+            route_rules.append(vpn_proc_rule)
+        route_rules.append(rs_direct_rule)
+    elif bundle_rules:
+        if bundle_rules.get("vpn_processes"):
+            r: dict[str, Any] = {"process_name": list(bundle_rules["vpn_processes"]), "outbound": "vpn-select"}
+            if enable_tun:
+                r["inbound"] = ["tun-in"]
+            route_rules.append(r)
+        if bundle_rules.get("vpn_path_regexes"):
+            r = {"process_path_regex": list(bundle_rules["vpn_path_regexes"]), "outbound": "vpn-select"}
+            if enable_tun:
+                r["inbound"] = ["tun-in"]
+            route_rules.append(r)
+        if bundle_rules.get("vpn_domains"):
+            route_rules.append({"domain_suffix": list(bundle_rules["vpn_domains"]), "outbound": "vpn-select"})
+
+        if vpn_proc_list:
+            vpn_proc_rule = {
+                "process_name": vpn_proc_list,
+                "outbound": "vpn-select",
+            }
+            if enable_tun:
+                vpn_proc_rule["inbound"] = ["tun-in"]
+            route_rules.append(vpn_proc_rule)
+
+        if bundle_rules.get("direct_processes"):
+            r = {"process_name": list(bundle_rules["direct_processes"]), "outbound": "direct"}
+            if enable_tun:
+                r["inbound"] = ["tun-in"]
+            route_rules.append(r)
+        if bundle_rules.get("direct_path_regexes"):
+            r = {"process_path_regex": list(bundle_rules["direct_path_regexes"]), "outbound": "direct"}
+            if enable_tun:
+                r["inbound"] = ["tun-in"]
+            route_rules.append(r)
+        if bundle_rules.get("direct_domains"):
+            route_rules.append({"domain_suffix": list(bundle_rules["direct_domains"]), "outbound": "direct"})
+    elif vpn_proc_list:
+        vpn_proc_rule = {
             "process_name": vpn_proc_list,
             "outbound": "vpn-select",
         }
@@ -2053,93 +2361,84 @@ def generate_singbox_config(
             vpn_proc_rule["inbound"] = ["tun-in"]
         route_rules.append(vpn_proc_rule)
 
-    # Keep multiplayer game streams direct while preserving DPI/VPN for web/mod ports (80/443/8080/8443)
-    route_rules.append(game_proc_rule)
-    route_rules.append(game_port_rule)
-
-    if normalized_bypass_cidrs:
-        route_rules.append(
-            {
-                "ip_cidr": normalized_bypass_cidrs,
-                "outbound": "direct",
-            }
-        )
-
-    if bypass_list:
-        route_rules.append(
-            {
-                "domain_suffix": bypass_list,
-                "outbound": "direct",
-            }
-        )
-
-    # Explicit VPN / ByeDPI routing placed BEFORE tg-ws-out (so VPN-assigned Telegram web domains are not shadowed)
-    # and BEFORE QUIC reject (so VPN domains keep UDP/443 inside tunnel)
-    if vpn_select_domains:
-        route_rules.append(
-            {
-                "domain_suffix": vpn_select_domains,
-                "outbound": "vpn-select",
-            }
-        )
-    if vpn_ai_domains:
-        route_rules.append(
-            {
-                "domain_suffix": vpn_ai_domains,
-                "outbound": "vpn-ai",
-            }
-        )
-    if byedpi_domains:
-        route_rules.append(
-            {
-                "domain_suffix": byedpi_domains,
-                "outbound": "byedpi-out",
-            }
-        )
-
-    # Telegram domains & MTProto DC CIDRs routed via tg-ws-out
-    route_rules.extend(
-        [
-            {
-                "domain_suffix": ["t.me", "telegram.org", "telegram.me", "telesco.pe"],
-                "outbound": "tg-ws-out",
-            },
-            {
-                "ip_cidr": [
-                    "91.108.4.0/22",
-                    "91.108.8.0/22",
-                    "91.108.12.0/22",
-                    "91.108.16.0/22",
-                    "91.108.56.0/22",
-                    "149.154.160.0/20",
-                    "185.76.151.0/24",
-                ],
-                "outbound": "tg-ws-out",
-            },
+    # 5. Dynamic domain rule_sets (or inline fallback when ruleset_base_url is None)
+    route_rule_sets: list[dict[str, Any]] = []
+    if use_remote_rulesets:
+        rs_tags = [
+            "rs-doh",
+            "rs-smartdns",
+            "rs-vpn",
+            "rs-vpn-ai",
+            "rs-quic-reject",
+            "rs-bundles-direct",
+            "rs-bundles-vpn",
+            "rs-bundles-dns-vpn",
         ]
-    )
-
-    if quic_reject_domains:
+        if enable_byedpi:
+            rs_tags.append("rs-byedpi")
+        for rtag in rs_tags:
+            route_rule_sets.append(
+                {
+                    "tag": rtag,
+                    "type": "remote",
+                    "format": "source",
+                    "url": f"{rs_base}/{rtag}.json",
+                    "update_interval": "15s",
+                    "download_detour": "direct",
+                }
+            )
+        route_rules.append({"rule_set": ["rs-vpn"], "outbound": "vpn-select"})
+        if has_usable_vpn:
+            route_rules.append({"inbound": ["vpn-probe-in"], "outbound": "vpn-select"})
+        route_rules.append({"rule_set": ["rs-vpn-ai"], "outbound": "vpn-ai"})
+        if enable_byedpi:
+            route_rules.append({"rule_set": ["rs-byedpi"], "outbound": "byedpi-out"})
         route_rules.append(
             {
-                "domain_suffix": quic_reject_domains,
+                "rule_set": ["rs-quic-reject"],
                 "network": "udp",
                 "port": 443,
                 "action": "reject",
             }
         )
+    else:
+        if vpn_select_domains:
+            route_rules.append({"domain_suffix": vpn_select_domains, "outbound": "vpn-select"})
+        if str(telegram_mode or "mtproto").strip().lower() == "transparent" and (
+            "telegram.org" in vpn_select_set or "t.me" in vpn_select_set
+        ):
+            route_rules.append({"ip_cidr": list(TELEGRAM_CIDRS), "outbound": "vpn-select"})
+        if has_usable_vpn:
+            route_rules.append({"inbound": ["vpn-probe-in"], "outbound": "vpn-select"})
+        if vpn_ai_domains:
+            route_rules.append({"domain_suffix": vpn_ai_domains, "outbound": "vpn-ai"})
+        if byedpi_domains:
+            route_rules.append({"domain_suffix": byedpi_domains, "outbound": "byedpi-out"})
+        if quic_reject_domains:
+            route_rules.append(
+                {
+                    "domain_suffix": quic_reject_domains,
+                    "network": "udp",
+                    "port": 443,
+                    "action": "reject",
+                }
+            )
+
+    route_block: dict[str, Any] = {
+        "auto_detect_interface": True,
+        "default_domain_resolver": "dns-local",
+        "rules": route_rules,
+        "final": "direct",
+    }
+    if route_rule_sets:
+        route_block["rule_set"] = route_rule_sets
 
     config: dict[str, Any] = {
         "log": {"level": "info", "timestamp": True},
         "dns": dns_config,
         "inbounds": inbounds,
         "outbounds": outbounds,
-        "route": {
-            "auto_detect_interface": True,
-            "default_domain_resolver": "dns-local",
-            "rules": route_rules,
-            "final": "direct",
-        },
+        "route": route_block,
     }
 
     if endpoints:

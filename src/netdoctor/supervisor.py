@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from collections.abc import Sequence
@@ -177,8 +178,34 @@ def _write_bytes_atomic(target: Path, data: bytes) -> Path:
     return target
 
 
+_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
+_MAX_UNCOMPRESSED_MEMBER_BYTES = 200 * 1024 * 1024
+_STATE_LOCK = threading.Lock()
+
+
+def _redact_cmd(cmd: Sequence[str]) -> list[str]:
+    """Redact sensitive CLI flag values (e.g., `--secret`) before writing supervisor_state.json."""
+    out: list[str] = []
+    redact_next = False
+    for tok in cmd:
+        if redact_next:
+            out.append("***")
+            redact_next = False
+            continue
+        if tok == "--secret":
+            out.append(tok)
+            redact_next = True
+        elif tok.startswith("--secret="):
+            out.append("--secret=***")
+        else:
+            out.append(tok)
+    return out
+
+
 def _safe_extract_file(dest_root: Path, rel_path: PurePosixPath | Path, data: bytes) -> Path:
-    """Write extracted archive bytes ensuring final resolved path stays within dest_root."""
+    """Write extracted archive bytes ensuring final resolved path stays within dest_root and size bounds."""
+    if len(data) > _MAX_UNCOMPRESSED_MEMBER_BYTES:
+        raise ValueError(f"Blocked oversized archive entry ({len(data)} bytes): {rel_path}")
     root_resolved = dest_root.resolve()
     target = (root_resolved / Path(*rel_path.parts)).resolve()
     if not target.is_relative_to(root_resolved):
@@ -207,15 +234,32 @@ def _is_admin() -> bool:
         return False
 
 
-async def _download_bytes(url: str, *, timeout: float, client: httpx.AsyncClient | None = None) -> bytes:
+async def _download_bytes(
+    url: str,
+    *,
+    timeout: float,
+    client: httpx.AsyncClient | None = None,
+    expected_sha256: str | None = None,
+    max_bytes: int = _MAX_DOWNLOAD_BYTES,
+) -> bytes:
+    # shortcut: UPSTREAM_RELEASES entries omit hardcoded sha256 until per-tag manifest pinning is added
     if client is not None:
         resp = await client.get(url)
         resp.raise_for_status()
-        return resp.content
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as own_client:
-        resp = await own_client.get(url)
-        resp.raise_for_status()
-        return resp.content
+        data = resp.content
+    else:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as own_client:
+            resp = await own_client.get(url)
+            resp.raise_for_status()
+            data = resp.content
+    if len(data) > max_bytes:
+        raise ValueError(f"Downloaded payload exceeds {max_bytes} bytes limit ({len(data)} bytes)")
+    if expected_sha256:
+        actual = hashlib.sha256(data).hexdigest().lower()
+        want = expected_sha256.strip().lower()
+        if actual != want:
+            raise ValueError(f"SHA-256 mismatch for {url}: expected {want}, got {actual}")
+    return data
 
 
 async def _fetch_zip_binary(
@@ -226,19 +270,22 @@ async def _fetch_zip_binary(
     force: bool = False,
     timeout: float = 60.0,
     client: httpx.AsyncClient | None = None,
+    expected_sha256: str | None = None,
 ) -> Path:
     """Download a pinned ZIP archive and extract a single named executable atomically."""
     target_exe.parent.mkdir(parents=True, exist_ok=True)
     if target_exe.exists() and not force:
         return target_exe
 
-    archive_bytes = await _download_bytes(url, timeout=timeout, client=client)
+    archive_bytes = await _download_bytes(url, timeout=timeout, client=client, expected_sha256=expected_sha256)
     expected_lower = exe_filename.lower()
     with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
-        for member in zf.namelist():
-            rel = _safe_rel_path(member, strip_root=False)
+        for info in zf.infolist():
+            if info.file_size > _MAX_UNCOMPRESSED_MEMBER_BYTES:
+                raise ValueError(f"Oversized archive member {info.filename}: {info.file_size} bytes")
+            rel = _safe_rel_path(info.filename, strip_root=False)
             if rel is not None and rel.name.lower() == expected_lower:
-                _write_bytes_atomic(target_exe, zf.read(member))
+                _write_bytes_atomic(target_exe, zf.read(info.filename))
                 return target_exe
     raise RuntimeError(f"{exe_filename} not found inside downloaded archive")
 
@@ -1222,12 +1269,10 @@ def _is_pid_running(pid: int | None, expected_create_time: float | None = None) 
             try:
                 if abs(float(proc.create_time()) - float(expected_create_time)) > 2.0:
                     return False
-            except psutil.NoSuchProcess:
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError, OSError):
                 return False
-            except (psutil.AccessDenied, ValueError, OSError):
-                pass
         return True
-    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError, OSError):
         return False
 
 
@@ -1560,8 +1605,7 @@ class ProcessSupervisor:
         self._create_times: dict[str, float] = {}
         self._stopped_names: set[str] = set()
 
-    def adopt_persisted_state(self) -> dict[str, Any]:
-        """Read supervisor_state.json and return still-running processes not currently managed or stopped."""
+    def _read_persisted_state_unlocked(self) -> dict[str, Any]:
         if not self.state_path.is_file():
             self._adopted = {}
             return {}
@@ -1594,25 +1638,31 @@ class ProcessSupervisor:
         self._adopted = dict(adopted)
         return adopted
 
+    def adopt_persisted_state(self) -> dict[str, Any]:
+        """Read supervisor_state.json and return still-running processes not currently managed or stopped."""
+        with _STATE_LOCK:
+            return self._read_persisted_state_unlocked()
+
     def _save_state(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        merged_processes: dict[str, Any] = self.adopt_persisted_state()
-        for name, proc in self.processes.items():
-            if proc.poll() is None:
-                entry: dict[str, Any] = {
-                    "pid": proc.pid,
-                    "running": True,
-                    "cmd": self._cmds.get(name, []),
-                    "started_at": self._started_at.get(name, ""),
-                }
-                if name in self._create_times:
-                    entry["create_time"] = self._create_times[name]
-                merged_processes[name] = entry
-        payload = {
-            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "processes": merged_processes,
-        }
-        _write_bytes_atomic(self.state_path, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+        with _STATE_LOCK:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            merged_processes: dict[str, Any] = self._read_persisted_state_unlocked()
+            for name, proc in self.processes.items():
+                if proc.poll() is None:
+                    entry: dict[str, Any] = {
+                        "pid": proc.pid,
+                        "running": True,
+                        "cmd": _redact_cmd(self._cmds.get(name, [])),
+                        "started_at": self._started_at.get(name, ""),
+                    }
+                    if name in self._create_times:
+                        entry["create_time"] = self._create_times[name]
+                    merged_processes[name] = entry
+            payload = {
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "processes": merged_processes,
+            }
+            _write_bytes_atomic(self.state_path, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
 
     def start_process(
         self,

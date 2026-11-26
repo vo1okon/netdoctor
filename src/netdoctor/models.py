@@ -17,6 +17,7 @@ class VerdictClass(StrEnum):
     THROTTLE = "throttle"
     QUIC_BLOCK = "quic_block"
     PROTOCOL_BLOCK = "protocol_block"
+    GEO_BLOCK = "geo_block"
     UNKNOWN = "unknown"
 
 
@@ -66,6 +67,7 @@ class StallProbeResult(BaseModel):
     result: str = "ok"  # "ok", "stall", "reset", "timeout", "skipped"
     bytes_read: int = 0
     throughput_kbps: float | None = None
+    http_status: int | None = None
 
 
 class QuicProbeResult(BaseModel):

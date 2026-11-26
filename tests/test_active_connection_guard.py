@@ -22,8 +22,6 @@ import netdoctor.gui_backend as backend_mod
 import netdoctor.orchestrators as orch_mod
 from netdoctor.config_gen import (
     DEFAULT_GAME_PROCESSES,
-    GAME_BYPASS_PORT_RANGES,
-    GAME_BYPASS_PORTS,
     generate_singbox_config,
     generate_winws2_config,
     generate_xray_bridge_config,
@@ -627,8 +625,10 @@ def test_xray_bridge_config_and_singbox_mtu_and_scoped_sniff(tmp_path: Path) -> 
     assert bridge_ports == {"NL-Reality": 18100, "DE-xhttp": 18101}
     assert xray_path.is_file()
     assert [ib["port"] for ib in xcfg["inbounds"]] == [18100, 18101]
-    assert xcfg["outbounds"][0]["streamSettings"]["security"] == "reality"
-    assert xcfg["outbounds"][1]["streamSettings"]["network"] == "xhttp"
+    assert xcfg["outbounds"][0] == {"protocol": "freedom", "tag": "direct"}
+    assert xcfg["dns"]["servers"][0] == "localhost"
+    assert xcfg["outbounds"][1]["streamSettings"]["security"] == "reality"
+    assert xcfg["outbounds"][2]["streamSettings"]["network"] == "xhttp"
 
     sb_path = tmp_path / "sing-box.json"
     sb_cfg = generate_singbox_config([], vpn_nodes=nodes, output_path=sb_path, xray_bridge_ports=bridge_ports)
@@ -638,11 +638,15 @@ def test_xray_bridge_config_and_singbox_mtu_and_scoped_sniff(tmp_path: Path) -> 
     assert obs["PL-TLS"]["type"] == "vless"
     assert obs["FI-Hy2"]["type"] == "hysteria2"
 
-    # TUN MTU, endpoint_independent_nat & scoped sniff
+    # TUN MTU, endpoint_independent_nat & proc_bypass_rule strictly before sniff
     tun_in = next(i for i in sb_cfg["inbounds"] if i.get("type") == "tun")
-    assert tun_in["mtu"] == 1500
+    assert tun_in["mtu"] == 1380
     assert tun_in["endpoint_independent_nat"] is True
-    assert sb_cfg["route"]["rules"][0] == {
+    rules = sb_cfg["route"]["rules"]
+    assert rules[0]["outbound"] == "direct" and "winws2.exe" in rules[0].get("process_name", [])
+    sniff_idx = next(i for i, r in enumerate(rules) if r.get("action") == "sniff")
+    assert sniff_idx > 0
+    assert rules[sniff_idx] == {
         "port": [53, 80, 443, 8080, 8443],
         "action": "sniff",
         "timeout": "100ms",
@@ -970,40 +974,27 @@ def test_singbox_game_bypass_rules_before_vpn_and_passes_check(tmp_path: Path) -
         ),
     ]
     sb_path = tmp_path / "sing-box-game.json"
-    cfg = generate_singbox_config(decisions, vpn_nodes=[vpn_node], output_path=sb_path)
+    cfg = generate_singbox_config(
+        decisions,
+        vpn_nodes=[vpn_node],
+        extra_bypass_processes=["javaw.exe"],
+        output_path=sb_path,
+    )
     rules = cfg["route"]["rules"]
 
     proc_idx = next(
         i
         for i, r in enumerate(rules)
-        if r.get("type") == "logical"
-        and r.get("mode") == "and"
-        and r.get("outbound") == "direct"
-        and any("javaw.exe" in sub.get("process_name", []) for sub in r.get("rules", []))
-    )
-    port_idx = next(
-        i
-        for i, r in enumerate(rules)
-        if r.get("outbound") == "direct" and 25565 in r.get("port", [])
+        if r.get("outbound") == "direct" and "javaw.exe" in (r.get("process_name") or [])
     )
     vpn_idx = next(i for i, r in enumerate(rules) if r.get("outbound") == "vpn-select")
 
     assert proc_idx < vpn_idx
-    assert port_idx < vpn_idx
-
-    logical_rule = rules[proc_idx]
-    inv_port_sub = next(sub for sub in logical_rule["rules"] if sub.get("invert") is True)
-    assert set(inv_port_sub["port"]) == {53, 80, 443, 8080, 8443}
+    assert not any("1024:65535" in str(r.get("port_range") or "") for r in rules)
     assert len(DEFAULT_GAME_PROCESSES) >= 120
     assert len(set(DEFAULT_GAME_PROCESSES)) == len(DEFAULT_GAME_PROCESSES)
-    assert any(sub.get("process_name") == list(DEFAULT_GAME_PROCESSES) for sub in logical_rule["rules"])
-
-    port_rule = rules[port_idx]
-    assert port_rule["port"] == list(GAME_BYPASS_PORTS)
-    assert port_rule["port_range"] == list(GAME_BYPASS_PORT_RANGES)
-    assert "27015:27050" in port_rule["port_range"]
-    # Discord voice range must stay outside game port bypass
-    assert "50000:50100" not in port_rule["port_range"]
+    # Blanket GAME_BYPASS_PORTS rule removed in v2 (AppBundle handles per-game routing safely)
+    assert not any(r.get("port") == [25565, 19132, 19133, 3074, 2099, 5223, 6667, 6672, 27900, 27901, 28910] for r in rules)
 
     sb_exe = Path("bin") / "sing-box.exe"
     if sb_exe.is_file():
@@ -1416,16 +1407,15 @@ def test_generate_singbox_vpn_processes_and_smartdns_split(tmp_path: Path) -> No
 
     rules = sb_cfg["route"]["rules"]
     vpn_proc_idx = next(i for i, r in enumerate(rules) if r.get("process_name") == ["RainbowSix.exe", "upc.exe"])
-    game_proc_idx = next(
-        i
-        for i, r in enumerate(rules)
-        if r.get("type") == "logical" and any("process_name" in sr for sr in r.get("rules", []))
-    )
-    assert vpn_proc_idx < game_proc_idx
     assert rules[vpn_proc_idx]["outbound"] == "vpn-select"
-    game_list = next(sr["process_name"] for sr in rules[game_proc_idx]["rules"] if "process_name" in sr)
-    assert "RainbowSix.exe" not in game_list
-    assert "upc.exe" not in game_list
+    direct_procs_all = {
+        p
+        for r in rules
+        if r.get("outbound") == "direct"
+        for p in (r.get("process_name") or [])
+    }
+    assert "RainbowSix.exe" not in direct_procs_all
+    assert "upc.exe" not in direct_procs_all
     assert {"ip_cidr": ["198.51.100.55/32"], "outbound": "direct"} in rules
 
 
@@ -1724,9 +1714,14 @@ def test_auto_heal_promotes_stalled_nonweb_process_to_vpn_per_network(
     monkeypatch.setattr(orch_mod, "_is_admin", lambda: False)
 
     res = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
-    assert any(h.get("process") == "AnyGame.exe" and h.get("layer") == "vpn" for h in res["healed"])
+    assert any(
+        ev.get("layer") == "recommend" and ev.get("process") == "AnyGame.exe"
+        for ev in res["events"]
+    )
+    assert any(a.get("process") == "AnyGame.exe" for a in backend.get_pending_bundle_alerts())
 
-    # Per-network isolation + manual opt-out
+    # Manual acceptance promotes AnyGame.exe per-network; toggling removes & opts out
+    backend.add_vpn_process("AnyGame.exe", net_key=nk1)
     st2 = Storage(db_path)
     try:
         assert backend.get_vpn_processes(st2, net_key=nk1) == ["AnyGame.exe"]
@@ -1737,7 +1732,6 @@ def test_auto_heal_promotes_stalled_nonweb_process_to_vpn_per_network(
     toggled = backend.toggle_vpn_process("AnyGame.exe")
     assert toggled["enabled"] is False
     assert toggled["vpn_processes"] == []
-    # Re-scanning after manual opt-out must NOT re-add AnyGame.exe
     res2 = asyncio.run(backend.orchestrator.monitor.auto_heal_connections(backend, max_domains_per_tick=2))
     assert not any(h.get("process") == "AnyGame.exe" for h in res2["healed"])
 

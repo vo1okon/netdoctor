@@ -287,7 +287,7 @@ def test_config_generators_winws2_and_singbox(tmp_path: Path) -> None:
     assert "vpn-select" in out_tags
     assert "DE-Node1" in out_tags
     assert "FI-Node2" in out_tags
-    assert "tg-ws-out" in out_tags
+    assert "tg-ws-out" not in out_tags
 
 
 async def test_happ_remnawave_xray_json_and_fetch_ua_fallback(monkeypatch: pytest.MonkeyPatch) -> None:

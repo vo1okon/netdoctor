@@ -54,6 +54,7 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
+NIN_BALLOONUSERCLICK = 0x0405
 
 # Shell_NotifyIcon constants
 NIM_ADD = 0x00000000
@@ -395,6 +396,10 @@ def terminate_pid_gracefully(pid: int, timeout: float = 2.5) -> bool:
     terminate_sent = False
     try:
         proc = psutil.Process(pid)
+        pname = (proc.name() or "").strip().lower()
+        if pname not in {"python.exe", "pythonw.exe", "py.exe", "netdoctor.exe", "python3.exe"}:
+            logger.warning("Refusing to terminate PID %d with unexpected process name %r", pid, pname)
+            return False
         proc.terminate()
         terminate_sent = True
         proc.wait(timeout=max(0.0, float(timeout)))
@@ -810,6 +815,7 @@ class NetdoctorTrayIcon:
         self._icon_added: bool = False
         self._delete_pending: bool = False
         self._wndproc_ref: WNDPROC | None = None
+        self._balloon_click_cb: Callable[[], Any] | None = None
 
     @property
     def tooltip(self) -> str:
@@ -881,21 +887,21 @@ class NetdoctorTrayIcon:
         hmenu = api.user32.CreatePopupMenu()
         if not hmenu:
             return 0
-        api.user32.AppendMenuW(hmenu, MF_STRING, MENU_ID_SHOW, "Открыть окно netdoctor")
+        api.user32.AppendMenuW(hmenu, MF_STRING, MENU_ID_SHOW, "Открыть netdoctor")
         api.user32.AppendMenuW(
             hmenu,
             MF_STRING,
             MENU_ID_TOGGLE_PROTECTION,
-            "🚀 Включить / ⏹ Остановить защиту",
+            "Включить / Остановить защиту",
         )
-        api.user32.AppendMenuW(hmenu, MF_STRING, MENU_ID_ROTATE_VPN, "🔄 Переключить VPN-узел")
-        api.user32.AppendMenuW(hmenu, MF_STRING, MENU_ID_FLUSH_DNS, "🧹 Сбросить DNS-кэш")
+        api.user32.AppendMenuW(hmenu, MF_STRING, MENU_ID_ROTATE_VPN, "Сменить сервер VPN")
+        api.user32.AppendMenuW(hmenu, MF_STRING, MENU_ID_FLUSH_DNS, "Починить сеть (сброс DNS)")
         api.user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
         api.user32.AppendMenuW(
             hmenu,
             MF_STRING,
             MENU_ID_EXIT,
-            "❌ Полный выход (остановить службы)",
+            "Выход",
         )
         api.user32.SetMenuDefaultItem(hmenu, 0, True)
         return hmenu
@@ -929,6 +935,12 @@ class NetdoctorTrayIcon:
             if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
                 self._invoke_callback(self.on_show, "on_show")
                 return 0
+            if event == NIN_BALLOONUSERCLICK:
+                with self._lock:
+                    cb = self._balloon_click_cb
+                    self._balloon_click_cb = None
+                self._invoke_callback(cb if cb is not None else self.on_show, "on_balloon_click")
+                return 0
             if event in (WM_RBUTTONUP, WM_CONTEXTMENU):
                 self._show_context_menu(api, hwnd)
                 return 0
@@ -940,7 +952,8 @@ class NetdoctorTrayIcon:
             return 0
 
         if self._taskbar_created_msg and msg == self._taskbar_created_msg:
-            self._add_tray_icon(api, hwnd)
+            if not self._stop_event.is_set():
+                self._add_tray_icon(api, hwnd)
             return 0
 
         if msg == WM_CLOSE:
@@ -1146,6 +1159,21 @@ class NetdoctorTrayIcon:
             nid.dwInfoFlags = int(info_flags)
             api.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
+    def notify_bundle_issue(
+        self,
+        bundle_name: str,
+        on_click: Callable[[], Any] | None = None,
+    ) -> None:
+        """Show a clickable Windows balloon when a game/app bundle cannot connect directly."""
+        with self._lock:
+            self._balloon_click_cb = on_click
+        self.show_balloon(
+            "Проблема с подключением",
+            f"{bundle_name} не может подключиться напрямую. Нажмите, чтобы перевести через VPN.",
+            timeout_ms=6000,
+            info_flags=NIIF_WARNING,
+        )
+
     def stop(self) -> None:
         """Remove the tray icon, post WM_QUIT, and join the background daemon thread cleanly."""
         with self._lock:
@@ -1157,7 +1185,7 @@ class NetdoctorTrayIcon:
         if api is not None and hwnd:
             self._delete_tray_icon(api, hwnd)
             api.user32.PostMessageW(hwnd, WM_CANCELMODE, 0, 0)
-            api.user32.PostMessageW(hwnd, WM_QUIT, 0, 0)
+            api.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
 
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=3.0)

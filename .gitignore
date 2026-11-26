@@ -25,7 +25,9 @@ configs/winws2_preset.txt
 
 # Generated dynamic hostlists (keep static lists and zapret2 lists)
 lists/exclude_unlocker_domains.txt
+lists/exclude_base_preset_domains.txt
 lists/exclude_vpn_ips.txt
+lists/pass_domains.txt
 lists/tls_*.txt
 lists/quic_*.txt
 lists/*.backup

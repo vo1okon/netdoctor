@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sqlite3
@@ -23,7 +24,116 @@ from netdoctor.models import (
 )
 
 
-CURRENT_DB_VERSION = 2
+CURRENT_DB_VERSION = 3
+
+_MULTI_LABEL_TLDS: frozenset[str] = frozenset(
+    {
+        "co.uk",
+        "org.uk",
+        "ac.uk",
+        "gov.uk",
+        "com.au",
+        "net.au",
+        "org.au",
+        "com.br",
+        "com.tr",
+        "com.ua",
+        "co.jp",
+        "ne.jp",
+        "or.jp",
+        "com.cn",
+        "net.cn",
+        "org.cn",
+        "co.kr",
+        "com.mx",
+        "com.ar",
+        "co.in",
+        "com.sg",
+        "com.hk",
+        "co.nz",
+        "co.za",
+        "msk.ru",
+        "spb.ru",
+        "org.ru",
+        "net.ru",
+        "pp.ru",
+    }
+)
+
+_PRESERVED_FUNCTIONAL_DOMAINS: frozenset[str] = frozenset(
+    {
+        "googlevideo.com",
+        "googleapis.com",
+        "clients6.google.com",
+        "storage.googleapis.com",
+        "ytimg.com",
+        "ggpht.com",
+        "api.telegram.org",
+        "web.telegram.org",
+        "telesco.pe",
+        "telegram-cdn.org",
+        "api.openai.com",
+        "chat.openai.com",
+        "api.anthropic.com",
+        "gemini.google.com",
+        "aistudio.google.com",
+        "copilot.microsoft.com",
+        "steamcontent.com",
+        "discordapp.com",
+        "discordapp.net",
+        "discord.media",
+    }
+)
+
+_SKIP_ETLD_SUFFIXES: tuple[str, ...] = (
+    ".in-addr.arpa",
+    ".ip6.arpa",
+    ".1e100.net",
+    ".akamaitechnologies.com",
+    ".googleusercontent.com",
+    ".amazonaws.com",
+    ".local",
+    ".localhost",
+)
+
+_PRESERVED_AUTH_SUBDOMAINS: frozenset[str] = frozenset(
+    {
+        "login",
+        "auth",
+        "account",
+        "accounts",
+        "sso",
+        "oauth",
+        "signin",
+        "id",
+    }
+)
+
+
+def normalize_domain_etld1(domain: str) -> str:
+    """Normalize a hostname to eTLD+1 while preserving functional API/CDN/auth subdomains and IP/rDNS tokens."""
+    clean = (domain or "").strip().lower().strip(".")
+    if not clean or "." not in clean:
+        return clean
+    try:
+        ipaddress.ip_address(clean)
+        return clean
+    except ValueError:
+        pass
+    if any(clean.endswith(sfx) for sfx in _SKIP_ETLD_SUFFIXES):
+        return clean
+    for preserved in _PRESERVED_FUNCTIONAL_DOMAINS:
+        if clean == preserved or clean.endswith("." + preserved):
+            return preserved
+    parts = [p for p in clean.split(".") if p]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    tail2 = ".".join(parts[-2:])
+    if tail2 in _MULTI_LABEL_TLDS and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    if len(parts) == 3 and parts[0] in _PRESERVED_AUTH_SUBDOMAINS:
+        return ".".join(parts)
+    return tail2
 
 _INITIALIZED_DB_SIGNATURES: dict[str, tuple[int, int, int]] = {}
 _INIT_DB_LOCK = threading.Lock()
@@ -50,21 +160,20 @@ class Storage:
         try:
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA busy_timeout=10000")
-            need_init = is_memory or pre_sig is None
-            if not need_init and resolved_key:
-                with _INIT_DB_LOCK:
-                    need_init = _INITIALIZED_DB_SIGNATURES.get(resolved_key) != pre_sig
-            if need_init:
-                try:
-                    self.conn.execute("PRAGMA journal_mode=WAL")
-                except (OSError, sqlite3.OperationalError):
-                    pass
+            if is_memory:
                 self._init_schema()
-                if not is_memory and resolved_key:
-                    try:
-                        st_after = self.db_path.stat()
-                        if st_after.st_size > 0:
-                            with _INIT_DB_LOCK:
+            elif resolved_key:
+                with _INIT_DB_LOCK:
+                    need_init = pre_sig is None or _INITIALIZED_DB_SIGNATURES.get(resolved_key) != pre_sig
+                    if need_init:
+                        try:
+                            self.conn.execute("PRAGMA journal_mode=WAL")
+                        except (OSError, sqlite3.OperationalError):
+                            pass
+                        self._init_schema()
+                        try:
+                            st_after = self.db_path.stat()
+                            if st_after.st_size > 0:
                                 if len(_INITIALIZED_DB_SIGNATURES) > 64:
                                     _INITIALIZED_DB_SIGNATURES.clear()
                                 _INITIALIZED_DB_SIGNATURES[resolved_key] = (
@@ -72,8 +181,8 @@ class Storage:
                                     int(st_after.st_ino),
                                     int(st_after.st_ctime_ns),
                                 )
-                    except OSError:
-                        pass
+                        except OSError:
+                            pass
         except Exception:
             self.conn.close()
             raise
@@ -223,6 +332,41 @@ class Storage:
                 self.conn.execute("PRAGMA user_version = 2")
             ver = 2
 
+        if ver < 3:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS network_profiles (
+                    network_key TEXT PRIMARY KEY,
+                    base_dns_id TEXT NOT NULL DEFAULT '',
+                    best_tls_strategy TEXT NOT NULL DEFAULT '',
+                    quic_blocked INTEGER NOT NULL DEFAULT 0,
+                    calibrated_at TEXT NOT NULL DEFAULT '',
+                    meta_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS bundle_modes (
+                    network_key TEXT NOT NULL,
+                    bundle_id TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'direct_clean',
+                    custom_processes_json TEXT NOT NULL DEFAULT '[]',
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (network_key, bundle_id)
+                );
+                """
+            )
+            with self.conn:
+                self.conn.execute("PRAGMA user_version = 3")
+            ver = 3
+        else:
+            bm_cols = {
+                str(r["name"])
+                for r in self.conn.execute("PRAGMA table_info(bundle_modes)").fetchall()
+            }
+            if bm_cols and "pinned" not in bm_cols:
+                with self.conn:
+                    self.conn.execute("ALTER TABLE bundle_modes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+
     def upsert_network(self, net: NetworkFingerprint) -> str:
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         target_net = net
@@ -310,6 +454,7 @@ class Storage:
         report: DiagnosticReport,
         protocol: Protocol = Protocol.TLS,
     ) -> None:
+        norm_domain = normalize_domain_etld1(report.domain)
         with self.conn:
             self.conn.execute(
                 """
@@ -329,7 +474,7 @@ class Storage:
                 """,
                 (
                     network_key,
-                    report.domain,
+                    norm_domain,
                     protocol.value,
                     json.dumps([v.value for v in report.verdicts]),
                     report.probes.model_dump_json(),
@@ -347,10 +492,16 @@ class Storage:
         domain: str,
         protocol: Protocol = Protocol.TLS,
     ) -> DiagnosticReport | None:
+        norm_domain = normalize_domain_etld1(domain)
         row = self.conn.execute(
             "SELECT * FROM verdicts WHERE network_key = ? AND domain = ? AND protocol = ?",
-            (network_key, domain, protocol.value),
+            (network_key, norm_domain, protocol.value),
         ).fetchone()
+        if not row and norm_domain != domain.strip().lower():
+            row = self.conn.execute(
+                "SELECT * FROM verdicts WHERE network_key = ? AND domain = ? AND protocol = ?",
+                (network_key, domain.strip().lower(), protocol.value),
+            ).fetchone()
         if not row:
             return None
         net_row = self.conn.execute(
@@ -375,6 +526,8 @@ class Storage:
         )
 
     def save_decision(self, decision: Decision) -> None:
+        raw_domain = (decision.domain or "").strip().lower().rstrip(".")
+        norm_domain = raw_domain if getattr(decision, "pinned", False) else normalize_domain_etld1(raw_domain)
         with self.conn:
             self.conn.execute(
                 """
@@ -397,7 +550,7 @@ class Storage:
                 """,
                 (
                     decision.network_key,
-                    decision.domain,
+                    norm_domain,
                     decision.protocol.value,
                     decision.layer,
                     decision.strategy_id,
@@ -420,11 +573,18 @@ class Storage:
         pinned: bool,
     ) -> bool:
         proto_val = protocol.value if isinstance(protocol, Protocol) else str(protocol).strip().lower()
+        clean_dom = domain.strip().lower()
+        norm_dom = normalize_domain_etld1(clean_dom)
         with self.conn:
             cur = self.conn.execute(
                 "UPDATE decisions SET pinned = ? WHERE network_key = ? AND domain = ? AND protocol = ?",
-                (1 if pinned else 0, network_key, domain.strip().lower(), proto_val),
+                (1 if pinned else 0, network_key, norm_dom, proto_val),
             )
+            if cur.rowcount == 0 and norm_dom != clean_dom:
+                cur = self.conn.execute(
+                    "UPDATE decisions SET pinned = ? WHERE network_key = ? AND domain = ? AND protocol = ?",
+                    (1 if pinned else 0, network_key, clean_dom, proto_val),
+                )
         return cur.rowcount > 0
 
     def get_decisions(self, network_key: str, active_only: bool = True) -> list[Decision]:
@@ -884,6 +1044,7 @@ class Storage:
         window: int = 10,
     ) -> dict[str, dict[str, Any]]:
         """Aggregate recent test pass/fail stats and success rate (%) per domain."""
+        max_rows = max(200, max(window, 1) * 50)
         rows = self.conn.execute(
             """
             SELECT id, domain, service_group, preset_id, strategy_id,
@@ -891,8 +1052,9 @@ class Storage:
             FROM domain_tests
             WHERE network_key = ?
             ORDER BY id DESC
+            LIMIT ?
             """,
-            (network_key,),
+            (network_key, max_rows),
         ).fetchall()
 
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -1183,6 +1345,161 @@ class Storage:
             "failing_removed": int(cur_fail.rowcount or 0),
             "vpn_reset": int(cur_vpn.rowcount or 0),
         }
+
+    # ---------------------------------------------------------------- Network Profiles & AppBundle Modes (v3)
+
+    def save_network_profile(
+        self,
+        network_key: str,
+        *,
+        base_dns_id: str = "",
+        best_tls_strategy: str = "",
+        quic_blocked: bool = False,
+        calibrated_at: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        ts = calibrated_at or datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        meta_json = json.dumps(meta or {}, ensure_ascii=False)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO network_profiles (
+                    network_key, base_dns_id, best_tls_strategy, quic_blocked, calibrated_at, meta_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(network_key) DO UPDATE SET
+                    base_dns_id = excluded.base_dns_id,
+                    best_tls_strategy = excluded.best_tls_strategy,
+                    quic_blocked = excluded.quic_blocked,
+                    calibrated_at = excluded.calibrated_at,
+                    meta_json = excluded.meta_json
+                """,
+                (
+                    network_key,
+                    str(base_dns_id or "").strip(),
+                    str(best_tls_strategy or "").strip(),
+                    1 if quic_blocked else 0,
+                    ts,
+                    meta_json,
+                ),
+            )
+        return self.get_network_profile(network_key) or {}
+
+    def get_network_profile(self, network_key: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM network_profiles WHERE network_key = ?",
+            (network_key,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            meta = json.loads(str(row["meta_json"] or "{}"))
+            if not isinstance(meta, dict):
+                meta = {}
+        except (TypeError, ValueError):
+            meta = {}
+        return {
+            "network_key": str(row["network_key"]),
+            "base_dns_id": str(row["base_dns_id"] or ""),
+            "best_tls_strategy": str(row["best_tls_strategy"] or ""),
+            "quic_blocked": bool(row["quic_blocked"]),
+            "calibrated_at": str(row["calibrated_at"] or ""),
+            "meta": meta,
+        }
+
+    def set_bundle_mode(
+        self,
+        network_key: str,
+        bundle_id: str,
+        mode: str,
+        *,
+        custom_processes: list[str] | None = None,
+        pinned: bool | None = None,
+    ) -> dict[str, Any]:
+        clean_mode = str(mode or "direct_clean").strip().lower()
+        if clean_mode not in ("direct_clean", "direct_dpi", "vpn"):
+            raise ValueError(f"Unsupported bundle mode: {mode!r}")
+        clean_id = str(bundle_id or "").strip().lower()
+        if not clean_id:
+            raise ValueError("bundle_id is required")
+        now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        existing = self.conn.execute(
+            "SELECT custom_processes_json, pinned FROM bundle_modes WHERE network_key = ? AND bundle_id = ?",
+            (network_key, clean_id),
+        ).fetchone()
+        if custom_processes is None:
+            procs_json = str(existing["custom_processes_json"]) if existing else "[]"
+        else:
+            procs_json = json.dumps([str(p).strip() for p in custom_processes if str(p).strip()], ensure_ascii=False)
+        pinned_val = (
+            (1 if pinned else 0)
+            if pinned is not None
+            else (int(existing["pinned"]) if existing is not None else 0)
+        )
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO bundle_modes (network_key, bundle_id, mode, custom_processes_json, pinned, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(network_key, bundle_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    custom_processes_json = excluded.custom_processes_json,
+                    pinned = excluded.pinned,
+                    updated_at = excluded.updated_at
+                """,
+                (network_key, clean_id, clean_mode, procs_json, pinned_val, now),
+            )
+        return self.get_bundle_modes(network_key).get(clean_id, {})
+
+    def set_bundle_pinned(self, network_key: str, bundle_id: str, pinned: bool) -> bool:
+        clean_id = str(bundle_id or "").strip().lower()
+        if not clean_id:
+            return False
+        now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE bundle_modes SET pinned = ?, updated_at = ? WHERE network_key = ? AND bundle_id = ?",
+                (1 if pinned else 0, now, network_key, clean_id),
+            )
+            if cur.rowcount == 0:
+                self.conn.execute(
+                    """
+                    INSERT INTO bundle_modes (network_key, bundle_id, mode, custom_processes_json, pinned, updated_at)
+                    VALUES (?, ?, 'direct_clean', '[]', ?, ?)
+                    """,
+                    (network_key, clean_id, 1 if pinned else 0, now),
+                )
+        return True
+
+    def get_bundle_modes(self, network_key: str) -> dict[str, dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM bundle_modes WHERE network_key = ? ORDER BY bundle_id ASC",
+            (network_key,),
+        ).fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            try:
+                procs = list(json.loads(str(r["custom_processes_json"] or "[]")))
+            except (TypeError, ValueError):
+                procs = []
+            bid = str(r["bundle_id"])
+            out[bid] = {
+                "network_key": str(r["network_key"]),
+                "bundle_id": bid,
+                "mode": str(r["mode"] or "direct_clean"),
+                "custom_processes": procs,
+                "pinned": bool(r["pinned"]) if "pinned" in r.keys() else False,
+                "updated_at": str(r["updated_at"] or ""),
+            }
+        return out
+
+    def delete_bundle_mode(self, network_key: str, bundle_id: str) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM bundle_modes WHERE network_key = ? AND bundle_id = ?",
+                (network_key, str(bundle_id or "").strip().lower()),
+            )
+        return cur.rowcount > 0
 
     def close(self) -> None:
         self.conn.close()

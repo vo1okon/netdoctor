@@ -19,7 +19,7 @@ from netdoctor.probes import (
     probe_stall,
     silence_proactor_connection_reset,
 )
-from netdoctor.supervisor import _is_admin
+from netdoctor.supervisor import _is_admin, terminate_process_tree
 
 
 DEFAULT_STRATEGIES: list[Strategy] = [
@@ -139,7 +139,7 @@ DEFAULT_STRATEGIES: list[Strategy] = [
         ],
         description="ALT9 QUIC fake using quic_google blob and autottl",
     ),
-    # --- Expanded proven Zapret2 strategies (from C:\vso\Dev / Flowseal 1.9.9 & 1.10.3) ---
+    # --- Expanded proven Zapret2 strategies (Flowseal 1.9.9 & 1.10.3) ---
     Strategy(
         id="tls_alt1_199_fake_fakedsplit",
         family="fake_fakedsplit",
@@ -444,7 +444,7 @@ DEFAULT_STRATEGIES: list[Strategy] = [
         protocol=Protocol.TLS,
         tier=2,
         args_template=[
-            "--lua-desync=tls_client_hello_clone",
+            "--lua-desync=tls_client_hello_clone:blob=tls_google",
             "--lua-desync=multisplit:pos=1,midsld",
         ],
         description="Zapret2 v1.0.7: tls_client_hello_clone + multisplit по midsld",
@@ -622,7 +622,7 @@ def _build_winws2_eval_cmd(
         "--lua-init=@lua/zapret-lib.lua",
         "--lua-init=@lua/zapret-antidpi.lua",
         "--lua-init=@lua/zapret-auto.lua",
-        *extract_blob_args(strategy.args_template),
+        *extract_blob_args(strategy.args_template, bin_dir=winws2_exe.parent),
         "--ctrack-disable=0",
         "--wf-tcp-out=80,443",
         "--wf-udp-out=443",
@@ -790,7 +790,7 @@ async def run_blockcheck2_for_domain(
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            terminate_process_tree(proc.pid)
             out, err = proc.communicate()
         return f"{out or ''}\n{err or ''}"
 
@@ -844,9 +844,39 @@ _PRIORITY_ORDER: dict[str, int] = {
 }
 
 
+ORTHOGONAL_CORE_TLS: tuple[str, ...] = (
+    "tls_alt1_199_fake_fakedsplit",
+    "tls_hostfakesplit_ozon",
+    "tls_alt12_1104_sferum_seqovl",
+    "tls_fakedsplit_autottl",
+    "tls_rostelecom_multidisorder",
+    "tls_fake_tls_auto_alt2_1103",
+    "tls_syndata_multisplit_seqovl",
+    "tls_tcpseg_sni",
+)
+
+ORTHOGONAL_CORE_QUIC: tuple[str, ...] = (
+    "quic_fake_google_repeats6",
+    "quic_fake_google_autottl",
+    "quic_fake_zero64",
+)
+
+_CORE_TLS_RANK: dict[str, int] = {sid: idx for idx, sid in enumerate(ORTHOGONAL_CORE_TLS)}
+_CORE_QUIC_RANK: dict[str, int] = {sid: idx for idx, sid in enumerate(ORTHOGONAL_CORE_QUIC)}
+
+
 def _ordered_pool(candidates: list[Strategy] | None, protocol: Protocol) -> list[Strategy]:
+    """Order strategies into Wave 1 (orthogonal core techniques) followed by Wave 2 extended variants."""
     pool = [s for s in (candidates or DEFAULT_STRATEGIES) if s.protocol == protocol]
-    pool.sort(key=lambda s: (s.tier, _PRIORITY_ORDER.get(s.id, 50), s.id))
+    core_rank = _CORE_QUIC_RANK if protocol == Protocol.QUIC else _CORE_TLS_RANK
+    pool.sort(
+        key=lambda s: (
+            0 if s.id in core_rank else 1,
+            core_rank[s.id] if s.id in core_rank else s.tier,
+            _PRIORITY_ORDER.get(s.id, 50),
+            s.id,
+        )
+    )
     return pool
 
 
@@ -960,6 +990,16 @@ def _quick_non_dpi_decision(
             layer="dns",
             strategy_id="doh",
         )
+    if VerdictClass.GEO_BLOCK in effective and not any(
+        v in effective for v in (VerdictClass.SNI_DPI, VerdictClass.THROTTLE, VerdictClass.IP_BLOCK)
+    ):
+        return Decision(
+            network_key=network_key,
+            domain=domain,
+            protocol=protocol,
+            layer="dns",
+            strategy_id="smartdns",
+        )
     return None
 
 
@@ -998,7 +1038,14 @@ async def evaluate_domains_live_batch(
     ):
         silence_proactor_connection_reset()
         effective_iface = iface if iface is not None else detect_physical_egress_iface()
-        for strat in pool:
+        # Wave 1 tests all orthogonal DPI techniques first; Wave 2 runs only capped extra variants if still blocked.
+        wave1 = [s for s in pool if s.id in _CORE_TLS_RANK]
+        if not wave1:
+            wave1 = list(pool[:8])
+        wave1_ids = {s.id for s in wave1}
+        wave2 = [s for s in pool if s.id not in wave1_ids][:8]
+        tiered_pool = [*wave1, *wave2]
+        for strat in tiered_pool:
             if not unresolved:
                 break
             domains_list = list(unresolved.keys())
@@ -1138,8 +1185,16 @@ async def select_best_strategy(
 
     eval_fn = evaluator or (lambda d, i, s: default_strategy_evaluator(d, i, s))
     passing: list[CandidateEvaluation] = []
+    core_ids = _CORE_QUIC_RANK if protocol == Protocol.QUIC else _CORE_TLS_RANK
 
     for strat in pool:
+        if (
+            passing
+            and len(pool) > 12
+            and strat.id not in core_ids
+            and any(e.success_rate >= 0.8 for e in passing)
+        ):
+            break
         res = await eval_fn(domain, ip, strat)
         if res.success_rate >= min_success_rate:
             passing.append(res)

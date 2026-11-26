@@ -102,17 +102,18 @@ def test_singbox_vpn_precedes_tg_ws_out_expands_cdn_scopes_tun_and_excludes_ru(t
     )
 
     rules = cfg["route"]["rules"]
+    out_tags = {o["tag"] for o in cfg["outbounds"]}
+    assert "tg-ws-out" not in out_tags
     proc_idx = next(i for i, r in enumerate(rules) if r.get("outbound") == "direct" and "process_name" in r)
     vpn_idx = next(i for i, r in enumerate(rules) if r.get("outbound") == "vpn-select")
     vpn_ai_idx = next(i for i, r in enumerate(rules) if r.get("outbound") == "vpn-ai")
     byedpi_idx = next(i for i, r in enumerate(rules) if r.get("outbound") == "byedpi-out")
-    tg_idx = next(i for i, r in enumerate(rules) if r.get("outbound") == "tg-ws-out")
 
     assert rules[proc_idx]["inbound"] == ["tun-in"]
     assert "pythonw.exe" in rules[proc_idx]["process_name"]
-    assert proc_idx < vpn_idx < tg_idx
-    assert proc_idx < vpn_ai_idx < tg_idx
-    assert proc_idx < byedpi_idx < tg_idx
+    assert proc_idx < vpn_idx
+    assert proc_idx < vpn_ai_idx
+    assert proc_idx < byedpi_idx
     assert "telegram.org" in rules[vpn_idx]["domain_suffix"]
     assert "t.me" in rules[vpn_idx]["domain_suffix"]
     assert "claude.ai" in rules[vpn_ai_idx]["domain_suffix"]

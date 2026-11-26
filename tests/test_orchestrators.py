@@ -236,7 +236,17 @@ def test_gui_backend_autopilot_and_orchestrator_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db_path = tmp_path / "auto.db"
-    _seed_db(db_path)
+    net_key = _seed_db(db_path)
+    st = Storage(db_path)
+    try:
+        st.save_network_profile(
+            net_key,
+            base_dns_id="cloudflare",
+            best_tls_strategy="tls_hostfakesplit_ozon",
+            quic_blocked=False,
+        )
+    finally:
+        st.close()
     monkeypatch.setattr(psutil, "net_connections", lambda kind="inet": [])
     monkeypatch.setattr(backend_mod, "_is_admin", lambda: False)
     monkeypatch.setattr(backend_mod, "detect_bypass_active", lambda: False)
@@ -606,10 +616,11 @@ def test_antigravity_unlocker_and_hosts_guard_protection(
 
     # Exclude hostlist prevents circular catch-all from touching unlocker & Antigravity domains
     excluded_doms_txt = (tmp_path / "lists" / "exclude_unlocker_domains.txt").read_text(encoding="utf-8")
-    assert "ai.google.dev" in excluded_doms_txt
-    assert "daily-cloudcode-pa.googleapis.com" in excluded_doms_txt
-    assert "openrouter.ai" in excluded_doms_txt
-    assert "x.com" not in excluded_doms_txt
+    excluded_doms_lines = {ln.strip().lower() for ln in excluded_doms_txt.splitlines() if ln.strip() and not ln.startswith("#")}
+    assert "ai.google.dev" in excluded_doms_lines
+    assert "daily-cloudcode-pa.googleapis.com" in excluded_doms_lines
+    assert "openrouter.ai" in excluded_doms_lines
+    assert "x.com" not in excluded_doms_lines
 
     preset_txt = (tmp_path / "configs" / "winws2_preset.txt").read_text(encoding="utf-8")
     assert "--hostlist-exclude=" in preset_txt
@@ -1461,9 +1472,9 @@ def test_auto_heal_self_probe_guard_and_singbox_log_edge_cases(
     net_key = _seed_db(db_path)
 
     (logs_dir / "sing-box.log").write_text(
-        "ERROR connection: open connection to 162.159.135.232:443 using outbound/direct[direct]: "
-        "dial tcp 162.159.135.232:443: i/o timeout\n"
-        "INFO outbound connected to discord.com:162.159.135.232\n",
+        "ERROR connection: open connection to 198.51.100.232:443 using outbound/direct[direct]: "
+        "dial tcp 198.51.100.232:443: i/o timeout\n"
+        "INFO outbound connected to discord.com:198.51.100.232\n",
         encoding="utf-8",
     )
     fake_conns = [
@@ -1472,7 +1483,7 @@ def test_auto_heal_self_probe_guard_and_singbox_log_edge_cases(
             family=socket.AF_INET,
             type=socket.SOCK_STREAM,
             laddr=SimpleNamespace(ip="192.168.1.10", port=53001),
-            raddr=SimpleNamespace(ip="162.159.135.232", port=443),
+            raddr=SimpleNamespace(ip="198.51.100.232", port=443),
             status="ESTABLISHED",
             pid=4001,
         )
@@ -1488,8 +1499,8 @@ def test_auto_heal_self_probe_guard_and_singbox_log_edge_cases(
 
     async def fake_probes(domain: str, timeout: float = 2.0) -> ProbesSummary:
         return ProbesSummary(
-            dns=DnsProbeResult(system="ok", doh="ok", doh_ips=["162.159.135.232"]),
-            tcp=TcpProbeResult(result="ok", rtt_ms=14.0, target_ip="162.159.135.232"),
+            dns=DnsProbeResult(system="ok", doh="ok", doh_ips=["198.51.100.232"]),
+            tcp=TcpProbeResult(result="ok", rtt_ms=14.0, target_ip="198.51.100.232"),
             tls=TlsProbeResult(real_sni="ok" if probe_mode["ok"] else "reset", neutral_sni="ok", ttfb_ms=20.0),
             stall=StallProbeResult(result="ok", bytes_read=4096, throughput_kbps=3500.0),
             quic=QuicProbeResult(result="ok"),

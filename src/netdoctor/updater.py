@@ -449,17 +449,22 @@ async def apply_app_update(
         }
 
     try:
-        archive_bytes = await _download_bytes(url, timeout=timeout, client=client)
-        updated_files = 0
+        archive_bytes = await _download_bytes(url, timeout=timeout, client=client, max_bytes=100 * 1024 * 1024)
+        staged: list[tuple[Path, bytes]] = []
         with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
             for info in zf.infolist():
                 if info.is_dir():
                     continue
+                if info.file_size > 50 * 1024 * 1024:
+                    raise ValueError(f"Archive entry exceeds 50 MB limit: {info.filename}")
                 rel = _safe_rel_path(info.filename, strip_root=True)
                 if rel is None or not _is_allowed_portable_relpath(rel):
                     continue
-                _safe_extract_file(root, rel, zf.read(info.filename))
-                updated_files += 1
+                staged.append((rel, zf.read(info.filename)))
+        updated_files = 0
+        for rel, data in staged:
+            _safe_extract_file(root, rel, data)
+            updated_files += 1
         if updated_files == 0:
             return {
                 "ok": False,

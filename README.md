@@ -143,3 +143,27 @@ netdoctor/
 - `netdoctor.db`, `logs/`, `bin/`, `.venv/`, `*.lnk`
 
 Подробнее о лицензиях внешних компонентов — в [`LICENSES.md`](LICENSES.md).
+
+---
+
+# netdoctor Blueprint
+
+## System Overview
+`netdoctor` is an adaptive censorship-circumvention orchestrator for Windows 10/11 (x64) structured around layered diagnostics and automated fallback routing (`Direct` → `DNS/DoH` → `DPI desync via winws2/ByeDPI` → `tg-ws-proxy` → `sing-box TUN/Xray bridge VPN`). All runtime orchestration, state persistence, binary management, CLI (`netdoctor`), and desktop/tray UI (`netdoctor-gui`) live inside the [`src`](./src/README.md) package tree, paired with static YAML catalogs (`configs/strategies.yaml`, `configs/targets.yaml`), domain/IP hostlists (`lists/`), Zapret/Zapret2 presets (`presets/`), and `pytest` unit/E2E suites (`tests/`).
+
+## Subdirectories & System Boundaries
+- [src](./src/README.md) - Source root containing the [`netdoctor`](./src/netdoctor/README.md) Python package implementing probing, verdict classification, strategy/preset compilation, multi-protocol VPN parsing, SQLite storage, process supervision, CLI, and Tkinter/Win32 tray UI.
+
+## Global Invariants
+- **Persistence & Schema Integrity**: SQLite state (`netdoctor.db`) enforces `PRAGMA user_version == 2` (`[storage.py:Storage._init_schema]`) with `WAL` mode, caps `domain_tests` at 30 rows per `(network_key, domain)` (`[storage.py:Storage.record_domain_test]`), and never auto-deletes pinned decisions (`[storage.py:Storage.cleanup_stale_decisions]`, `[storage.py:Storage.reset_unhealthy_state]`).
+- **Privilege, Conflict & Integrity Gates**: Launching or reloading `winws2.exe` or `sing-box.exe` TUN requires Windows Administrator privileges (`_is_admin()`) and aborts on external bypass conflicts (`[probes.py:detect_bypass_active]`) unless forced (`[cli.py:cmd_apply]`, `[gui_backend.py:GuiBackend.start_services]`). Downloaded artifacts must pass ZipSlip path checks, `b'MZ'` PE validation, byte-size and SHA-256 verification against `bin/manifest.json`, and pinned `UPSTREAM_RELEASES` tag checks (`[supervisor.py:verify_binaries]`).
+- **Routing & Unlocker Guard Isolation**: `stack_mode` is constrained to `('hybrid', 'dpi_only')` and `tun_stack` to `('gvisor', 'mixed', 'system')` (`[gui_backend.py:GuiBackend.trigger_apply_configs]`, `[config_gen.py:generate_singbox_config]`). Protected Antigravity/local/hosts domains and proxy IPs (`[orchestrators.py:build_unlocker_protection_context]`) are forced to `dns-local`/`direct` and excluded from DPI/VPN routing; when `enable_tun=True`, process and game bypass rules apply strictly to `inbound=['tun-in']`.
+- **Failover & Preset Guardrails**: Zapret2 presets must compile with valid `--lua-init=` scripts, resolved positive `--hostlist=`/`--ipset=` files, and at least one `--lua-desync=` profile (`[presets.py:compile_zapret_preset]`). VPN node selection uses a circuit breaker with backoff `(60, 180, 600, 1800)` seconds (`[orchestrators.py:VpnLayerOrchestrator.record_node_result]`), and `[supervisor.py:ProcessSupervisor.start_stack]` atomically rolls back the stack if any process exits prematurely during startup.
+
+## Global Side Effects
+- **Local State & Generated Configs**: Mutates `netdoctor.db`, `configs/` (`winws2_preset.txt`, `winws2_live_at.txt`, `sing-box.json`, `xray.json`), `lists/` (`exclude_vpn_ips.txt`, `exclude_unlocker_domains.txt`, `ipset-telegram.txt`, strategy hostlists), `bin/` (`manifest.json`, downloaded executables/DLLs/WinDivert driver), and `logs/` (`*.log`, `*.prev.log`, `supervisor_state.json`).
+- **OS & Subprocess Control**: Spawns and terminates `winws2.exe` (WinDivert kernel packet driver), `sing-box.exe` (TUN adapter), `xray.exe`, `tg-ws-proxy`, and `ciadpi.exe` (`[supervisor.py:ProcessSupervisor]`); invokes `schtasks`, `ipconfig /flushdns`, `arp -a`, `route print 0.0.0.0`, PowerShell `WScript.Shell` COM shortcuts, and Win32 tray/mutex/UAC APIs (`[tray.py:NetdoctorTrayIcon]`, `[gui_backend.py:elevate_gui]`).
+- **External Network Traffic**: Sends DNS/DoH, TCP, TLS, HTTP(S), and QUIC probes (`[probes.py]`), fetches VPN subscriptions (`[vpn.py:fetch_subscription]`), queries GitHub Releases (`[supervisor.py:fetch_all_bins]`, `[updater.py:check_for_updates]`), and communicates with the local Clash controller at `127.0.0.1:19090` (`[clash_api.py:ClashApiClient]`).
+
+## System Verification
+- Run: `pytest`

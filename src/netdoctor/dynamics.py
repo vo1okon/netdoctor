@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -187,13 +188,18 @@ async def _default_canary_probe(
     timeout: float = 3.0,
     layer: str = "dpi",
     vpn_proxy_url: str | None = None,
+    protocol: Protocol = Protocol.TLS,
 ) -> bool:
     if layer == "vpn":
         proxy_url = vpn_proxy_url
         if proxy_url is None:
-            local_check = await probe_tcp("127.0.0.1", port=2080, timeout=min(timeout, 0.4))
+            local_check = await probe_tcp("127.0.0.1", port=2081, timeout=min(timeout, 0.4))
             if local_check.result == "ok":
-                proxy_url = "http://127.0.0.1:2080"
+                proxy_url = "http://127.0.0.1:2081"
+            else:
+                local_check = await probe_tcp("127.0.0.1", port=2080, timeout=min(timeout, 0.4))
+                if local_check.result == "ok":
+                    proxy_url = "http://127.0.0.1:2080"
         if proxy_url:
             try:
                 async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, follow_redirects=True) as client:
@@ -206,6 +212,11 @@ async def _default_canary_probe(
     ip = dns_res.doh_ips[0] if dns_res.doh_ips else (dns_res.system_ips[0] if dns_res.system_ips else None)
     if not ip:
         return False
+    if protocol == Protocol.QUIC:
+        from netdoctor.probes import probe_quic
+
+        q_res = await probe_quic(ip, sni=domain, port=443, timeout=timeout)
+        return q_res.result == "ok"
     tcp_res = await probe_tcp(ip, port=443, timeout=timeout)
     if tcp_res.result != "ok":
         return False
@@ -226,7 +237,7 @@ async def run_canary_cycle(
     1. Detect network fingerprint and upsert into storage.
     2. Identify expired decisions (TTL elapsed) and downshift opportunities.
     3. Inspect winws2.log for circular rotation events.
-    4. Probe active decisions; on failure, re-verify once before promoting fallback/VPN.
+    4. Probe active decisions concurrently; on failure, re-verify once before promoting fallback/VPN.
     """
     net = network or await detect_network_fingerprint()
     net_key = storage.upsert_network(net)
@@ -237,8 +248,11 @@ async def run_canary_cycle(
     rotations = parse_circular_rotations(Path(winws2_log_path))
 
     target_filter = {d.lower() for d in domains} if domains else None
+    to_check = [
+        d for d in active if target_filter is None or d.domain.lower() in target_filter
+    ]
 
-    checked: list[str] = []
+    checked: list[str] = [d.domain for d in to_check]
     promoted: list[str] = []
     downshifted: list[str] = []
     downshift_candidates: dict[str, list[str]] = {}
@@ -246,43 +260,52 @@ async def run_canary_cycle(
     async def _run_probe(dec: Decision) -> bool:
         if probe_fn is not None:
             return await probe_fn(dec.domain)
-        return await _default_canary_probe(dec.domain, layer=dec.layer, vpn_proxy_url=vpn_proxy_url)
+        return await _default_canary_probe(
+            dec.domain,
+            layer=dec.layer,
+            vpn_proxy_url=vpn_proxy_url,
+            protocol=dec.protocol,
+        )
 
-    for decision in active:
-        if target_filter is not None and decision.domain.lower() not in target_filter:
-            continue
-        checked.append(decision.domain)
-        is_expired = (decision.domain.lower(), decision.protocol) in expired_keys
-        cands: list[Strategy] = []
-        if is_expired:
-            cands = get_downshift_candidates(decision)
-            if cands:
-                downshift_candidates[decision.domain] = [c.id for c in cands[:2]]
-        ok = await _run_probe(decision)
-        if not ok:
-            # Immediate confirmation retry to filter transient single-packet drops
-            ok_retry = await _run_probe(decision)
-            if not ok_retry:
-                promote_fallback_on_failure(storage, decision, vpn_available=vpn_ok)
-                promoted.append(decision.domain)
-                continue
+    sem = asyncio.Semaphore(6)
 
-        if is_expired:
-            if downshift_probe_fn is not None and cands:
+    async def _check_one(decision: Decision) -> tuple[Decision, bool, bool, list[Strategy], Strategy | None]:
+        async with sem:
+            is_expired = (decision.domain.lower(), decision.protocol) in expired_keys
+            cands: list[Strategy] = get_downshift_candidates(decision) if is_expired else []
+            ok = await _run_probe(decision)
+            if not ok:
+                # Immediate confirmation retry to filter transient single-packet drops
+                ok = await _run_probe(decision)
+            chosen_downshift: Strategy | None = None
+            if ok and is_expired and downshift_probe_fn is not None and cands:
                 for cand in cands:
                     if await downshift_probe_fn(decision.domain, cand):
-                        old_strat = decision.strategy_id
-                        decision.layer = "dpi"
-                        decision.strategy_id = cand.id
-                        if (
-                            old_strat
-                            and old_strat != "vpn-select"
-                            and old_strat != cand.id
-                            and old_strat not in decision.fallback_strategies
-                        ):
-                            decision.fallback_strategies = [old_strat, *decision.fallback_strategies[:1]]
-                        downshifted.append(decision.domain)
+                        chosen_downshift = cand
                         break
+            return decision, is_expired, ok, cands, chosen_downshift
+
+    results = await asyncio.gather(*(_check_one(dec) for dec in to_check))
+    for decision, is_expired, ok, cands, chosen_downshift in results:
+        if is_expired and cands:
+            downshift_candidates[decision.domain] = [c.id for c in cands[:2]]
+        if not ok:
+            promote_fallback_on_failure(storage, decision, vpn_available=vpn_ok)
+            promoted.append(decision.domain)
+            continue
+        if is_expired:
+            if chosen_downshift is not None:
+                old_strat = decision.strategy_id
+                decision.layer = "dpi"
+                decision.strategy_id = chosen_downshift.id
+                if (
+                    old_strat
+                    and old_strat != "vpn-select"
+                    and old_strat != chosen_downshift.id
+                    and old_strat not in decision.fallback_strategies
+                ):
+                    decision.fallback_strategies = [old_strat, *decision.fallback_strategies[:1]]
+                downshifted.append(decision.domain)
             decision.updated_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
             decision.consecutive_fails = 0
             storage.save_decision(decision)

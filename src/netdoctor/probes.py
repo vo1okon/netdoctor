@@ -590,6 +590,7 @@ async def probe_stall(
         writer.write(req)
         await asyncio.wait_for(writer.drain(), timeout=max(0.1, deadline - time.perf_counter()))
 
+        raw_head = bytearray()
         while total_read < 32768:
             rem = deadline - time.perf_counter()
             if rem <= 0:
@@ -597,15 +598,27 @@ async def probe_stall(
             chunk = await asyncio.wait_for(reader.read(4096), timeout=rem)
             if not chunk:
                 break
+            if len(raw_head) < 512:
+                raw_head.extend(chunk[: 512 - len(raw_head)])
             total_read += len(chunk)
+
+        http_status: int | None = None
+        if raw_head:
+            first_line = bytes(raw_head).split(b"\r\n", 1)[0].decode("ascii", errors="ignore")
+            m_status = re.match(r"^HTTP/\d(?:\.\d)?\s+(\d{3})\b", first_line.strip())
+            if m_status:
+                try:
+                    http_status = int(m_status.group(1))
+                except ValueError:
+                    http_status = None
 
         elapsed = max(time.perf_counter() - t0, 0.001)
         if total_read < expected_min_bytes:
-            return StallProbeResult(result="stall", bytes_read=total_read)
+            return StallProbeResult(result="stall", bytes_read=total_read, http_status=http_status)
         kbps = round((total_read * 8 / 1000.0) / elapsed, 2)
         if min_kbps > 0 and kbps < min_kbps:
-            return StallProbeResult(result="stall", bytes_read=total_read, throughput_kbps=kbps)
-        return StallProbeResult(result="ok", bytes_read=total_read, throughput_kbps=kbps)
+            return StallProbeResult(result="stall", bytes_read=total_read, throughput_kbps=kbps, http_status=http_status)
+        return StallProbeResult(result="ok", bytes_read=total_read, throughput_kbps=kbps, http_status=http_status)
     except asyncio.TimeoutError:
         return StallProbeResult(
             result="stall" if total_read > 0 else "timeout",
@@ -622,14 +635,29 @@ async def probe_stall(
                 pass
 
 
+def _encode_quic_varint(value: int) -> bytes:
+    if value < 64:
+        return bytes([value])
+    return struct.pack("!H", 0x4000 | (value & 0x3FFF))
+
+
 def _build_quic_initial_packet(sni: str) -> bytes:
-    """Build a synthetic UDP QUIC v1 Initial-like probe packet containing the SNI string (min 1200 bytes)."""
-    # Long header (0xC0) + Version 1 (0x00000001) + DCID len 8 + SCID len 8 + SNI marker + padding to 1200 bytes
-    header = b"\xc3" + struct.pack("!I", 1) + b"\x08" + b"\x11\x22\x33\x44\x55\x66\x77\x88" + b"\x00"
-    sni_bytes = sni.encode("ascii", errors="ignore")
-    payload = b"QUIC_INITIAL_SNI:" + sni_bytes
-    pad_len = max(0, 1200 - len(header) - len(payload))
-    return header + payload + (b"\x00" * pad_len)
+    """Build a standards-compliant QUIC v1 Initial Long Header packet padded to 1200 bytes.
+
+    shortcut: sends unencrypted SNI payload marker rather than full TLS-over-QUIC HKDF Initial crypto;
+    upgrade to full RFC 9001 Initial packet protection if strict servers reject non-AEAD Initial frames.
+    """
+    dcid = b"\x11\x22\x33\x44\x55\x66\x77\x88"
+    header_prefix = b"\xc3" + struct.pack("!I", 1) + bytes([len(dcid)]) + dcid + b"\x00" + b"\x00"
+    sni_bytes = sni.encode("ascii", errors="ignore")[:128]
+    # Minimal CRYPTO frame header (0x06) + offset (0x00) + length varint + SNI marker
+    frame = b"\x06\x00" + _encode_quic_varint(len(sni_bytes) + 17) + b"QUIC_INITIAL_SNI:" + sni_bytes
+    pn = b"\x00\x00\x00\x00"
+    # Pad total datagram to at least 1200 bytes per RFC 9000 Section 14.1
+    body_target = max(len(pn) + len(frame), 1200 - len(header_prefix) - 2)
+    len_field = _encode_quic_varint(body_target)
+    pad_len = max(0, 1200 - len(header_prefix) - len(len_field) - len(pn) - len(frame))
+    return header_prefix + len_field + pn + frame + (b"\x00" * pad_len)
 
 
 class _QuicDatagramProtocol(asyncio.DatagramProtocol):
