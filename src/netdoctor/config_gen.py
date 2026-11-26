@@ -859,13 +859,21 @@ def generate_winws2_config(
     args.append("--lua-desync=fake:blob=discord_active:repeats=6")
     profile_count += 1
 
-    # Separate Game Cloud UDP profile when a game bundle uses direct_dpi or game_filter is enabled
+    # Separate Game Cloud UDP profile when a game bundle uses direct_dpi, ISP DPI is active, or game_filter is enabled
     if udp_dpi_active:
         args.append("--new")
         args.append("--filter-udp=1024-65535")
         cloud_ipsets = [
             lists_path / "zapret2" / fname
-            for fname in ("ipset-amazon.txt", "ipset-ovh.txt", "ipset-cloudflare.txt", "ipset-azure.txt")
+            for fname in (
+                "ipset-amazon.txt",
+                "ipset-ovh.txt",
+                "ipset-cloudflare.txt",
+                "ipset-cloudflare1.txt",
+                "ipset-hetzner.txt",
+                "ipset-digitalocean.txt",
+                "ipset-azure.txt",
+            )
             if (lists_path / "zapret2" / fname).is_file() and (lists_path / "zapret2" / fname).stat().st_size > 0
         ]
         for ipset_f in cloud_ipsets:
@@ -875,7 +883,9 @@ def generate_winws2_config(
         args.extend(
             [
                 "--out-range=-d8",
-                "--lua-desync=fake:blob=game_active:repeats=4",
+                "--payload=all",
+                "--lua-desync=fake:blob=game_active:repeats=4:payload=all",
+                "--lua-desync=fake:blob=fake_zero64:repeats=6:payload=all",
             ]
         )
         profile_count += 1

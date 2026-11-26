@@ -3328,7 +3328,24 @@ class NetdoctorEngine:
                 )
                 for p_name, cnt in self.orchestrator.monitor._last_stalled_direct_procs.items()
             )
+            has_alert_udp = any(
+                bool(a.get("stalled_udp"))
+                and (
+                    str(a.get("bundle_id") or "").lower() == bundle.id.lower()
+                    or str(a.get("process") or "").lower() in bundle_procs_low
+                )
+                for a in self.orchestrator.monitor.pending_bundle_alerts
+            )
+            has_stat_udp = any(
+                int(cnt.get("stalled_udp", 0)) > 0
+                and (
+                    p_name.lower() in bundle_procs_low
+                    or match_process_to_bundle(p_name, [bundle]) is not None
+                )
+                for p_name, cnt in self.orchestrator.monitor._last_stalled_direct_procs.items()
+            )
         has_16kb_tcp_stall = has_alert_16kb or has_stat_16kb
+        has_udp_stall = has_alert_udp or has_stat_udp
 
         ladder: list[str] = []
         if allow_downshift:
@@ -3350,6 +3367,16 @@ class NetdoctorEngine:
                 and stack_mode != "dpi_only"
             ):
                 tried.append({"mode": "direct_dpi", "ok": False, "latency_ms": None, "error": "skipped_16kb_tcp_stall"})
+                continue
+            if (
+                cand_mode == "direct_dpi"
+                and not allow_downshift
+                and has_udp_stall
+                and bool(getattr(self, "_last_game_udp_dpi", False))
+                and has_real_vpn
+                and stack_mode != "dpi_only"
+            ):
+                tried.append({"mode": "direct_dpi", "ok": False, "latency_ms": None, "error": "skipped_udp_dpi_already_active"})
                 continue
 
             if cand_mode == "vpn":
@@ -3551,9 +3578,23 @@ class NetdoctorEngine:
             profile_quic_blocked = bool((network_profile or {}).get("quic_blocked"))
             bundle_pass_domains = list(compiled_bundles["pass_domains"])
             bundle_dpi_domains = list(compiled_bundles.get("dpi_auth_domains") or ())
-            enable_game_udp_dpi = bool(compiled_bundles["enable_game_udp_dpi"])
+            profile_meta = (network_profile or {}).get("meta") if isinstance(network_profile, dict) else {}
+            if not isinstance(profile_meta, dict):
+                profile_meta = {}
+            isp_dpi_active = bool(
+                profile_quic_blocked
+                or profile_meta.get("sni_dpi_detected")
+                or profile_meta.get("throttle_detected")
+                or any(d.layer == "dpi" and d.status == "active" for d in decisions)
+            )
+            z2_lists = self.lists_dir / "zapret2"
+            has_cloud_ipsets = any(
+                (z2_lists / fname).is_file() and (z2_lists / fname).stat().st_size > 0
+                for fname in ("ipset-amazon.txt", "ipset-ovh.txt", "ipset-cloudflare.txt", "ipset-hetzner.txt", "ipset-digitalocean.txt")
+            )
+            enable_game_udp_dpi = bool(compiled_bundles["enable_game_udp_dpi"] or (isp_dpi_active and has_cloud_ipsets))
             self._last_pass_domains_sig = tuple(bundle_pass_domains)
-            self._last_game_udp_dpi = enable_game_udp_dpi
+            self._last_game_udp_dpi = bool(enable_game_udp_dpi or game_filter)
             effective_iface = (
                 iface
                 if iface is not None

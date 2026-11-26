@@ -3195,12 +3195,22 @@ class RealtimeConnectionMonitor:
                 chains = c.get("chains") or []
                 via_direct = (not chains) or any(str(ch).lower() == "direct" for ch in chains)
                 if via_direct:
-                    rec = stalled_direct_procs.setdefault(proc_name, {"stalled": 0, "healthy": 0, "stalled_16kb": 0})
+                    rec = stalled_direct_procs.setdefault(
+                        proc_name,
+                        {"stalled": 0, "healthy": 0, "stalled_16kb": 0, "stalled_udp": 0, "stalled_active_udp": 0},
+                    )
                     if is_16kb_stall:
                         rec["stalled"] += 1
                         rec["stalled_16kb"] += 1
-                    elif upload_b > 0 and download_b == 0 and (age_sec is None or age_sec >= 5.0):
+                    elif upload_b > 0 and download_b == 0 and (
+                        (age_sec is None or age_sec >= 5.0)
+                        or (t_proto == "udp" and upload_b >= 400 and (age_sec is None or age_sec >= 4.0))
+                    ):
                         rec["stalled"] += 1
+                        if t_proto == "udp":
+                            rec["stalled_udp"] += 1
+                            if upload_b >= 400:
+                                rec["stalled_active_udp"] += 1
                     elif upload_b > 0 and download_b > 0:
                         rec["healthy"] += 1
 
@@ -3584,7 +3594,7 @@ class RealtimeConnectionMonitor:
                 vpn_processes=vpn_procs,
                 vpn_server_hosts=vpn_server_hosts,
             )
-            bundle_alerts: list[tuple[str, str, bool]] = []
+            bundle_alerts: list[tuple[str, str, bool, bool]] = []
             prot_low = {p.lower() for p in guard["processes"]} if guard["enabled"] else set()
             vpn_low = {p.lower() for p in vpn_procs}
             with self._lock:
@@ -3602,21 +3612,28 @@ class RealtimeConnectionMonitor:
                         or low in optout
                     ):
                         continue
-                    if counts.get("healthy", 0) > 0:
+                    stalled_16kb = int(counts.get("stalled_16kb", 0))
+                    stalled_active_udp = int(counts.get("stalled_active_udp", 0))
+                    hard_stall = stalled_16kb > 0 or (
+                        stalled_active_udp > 0 and is_game_process(p_name, extra_processes=vpn_procs)
+                    )
+                    if counts.get("healthy", 0) > 0 and not hard_stall:
                         self._proc_stall_strikes.pop(low, None)
                     elif counts.get("stalled", 0) >= 1:
                         strikes = self._proc_stall_strikes.get(low, 0) + 1
-                        if counts.get("stalled", 0) >= 2 or strikes >= 2:
+                        if counts.get("stalled", 0) >= 2 or stalled_active_udp >= 2 or strikes >= 2:
                             self._proc_stall_strikes.pop(low, None)
                             if low not in self._emitted_bundle_alerts:
                                 self._emitted_bundle_alerts.add(low)
-                                bundle_alerts.append((p_name, low, int(counts.get("stalled_16kb", 0)) > 0))
+                                bundle_alerts.append(
+                                    (p_name, low, stalled_16kb > 0, int(counts.get("stalled_udp", 0)) > 0)
+                                )
                         else:
                             self._proc_stall_strikes[low] = strikes
         finally:
             storage.close()
 
-        for proc_name, low, is_16kb_proc in bundle_alerts:
+        for proc_name, low, is_16kb_proc, is_udp_proc in bundle_alerts:
             bundle_label = proc_name
             bundle_id = ""
             try:
@@ -3628,11 +3645,12 @@ class RealtimeConnectionMonitor:
                     bundle_id = matched_b.id
             except Exception:
                 pass
-            msg = (
-                f"У {bundle_label} обрыв TCP (~16 КБ / Cloudflare ТСПУ) — перевести на VPN?"
-                if is_16kb_proc
-                else f"У {bundle_label} проблемы со связью — подобрать другой маршрут?"
-            )
+            if is_16kb_proc:
+                msg = f"У {bundle_label} обрыв TCP (~16 КБ / Cloudflare ТСПУ) — перевести на VPN?"
+            elif is_udp_proc:
+                msg = f"У {bundle_label} блокируется игровой UDP (матч/сервер) — перевести на VPN?"
+            else:
+                msg = f"У {bundle_label} проблемы со связью — подобрать другой маршрут?"
             self.record_event(bundle_id or proc_name, proc_name, msg, "recommend", bundle_id or "bundle_issue")
             with self._lock:
                 self.pending_bundle_alerts.append(
@@ -3641,6 +3659,7 @@ class RealtimeConnectionMonitor:
                         "bundle_name": bundle_label,
                         "process": proc_name,
                         "stalled_16kb": is_16kb_proc,
+                        "stalled_udp": is_udp_proc,
                         "message": msg,
                     }
                 )

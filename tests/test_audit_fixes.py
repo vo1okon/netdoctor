@@ -20,6 +20,7 @@ from netdoctor.config_gen import (
     build_singbox_rulesets_payload,
     extract_blob_args,
     generate_singbox_config,
+    generate_winws2_config,
     needs_xray_bridge,
 )
 from netdoctor.core.engine import NetdoctorEngine
@@ -587,3 +588,124 @@ def test_multisize_ico_and_win32_loadimage(tmp_path: Path) -> None:
             h = u32.LoadImageW(None, str(ico_path.resolve()), 1, sz, sz, 0x0010)
             assert h
             u32.DestroyIcon(h)
+
+
+def test_cloud_game_udp_dpi_payload_all_and_match_udp_stall_escalation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import netdoctor.orchestrators as orch_mod
+    from datetime import datetime, timezone
+
+    # 1. generate_winws2_config includes --payload=all & :payload=all + fake_zero64 for Cloud Game UDP DPI
+    lists_dir = tmp_path / "standalone_lists"
+    (lists_dir / "zapret2").mkdir(parents=True, exist_ok=True)
+    (lists_dir / "zapret2" / "ipset-amazon.txt").write_text("54.115.0.0/16\n", encoding="utf-8")
+    (lists_dir / "zapret2" / "ipset-ovh.txt").write_text("51.89.0.0/16\n", encoding="utf-8")
+    args, _ = generate_winws2_config(
+        decisions=[],
+        strategies={s.id: s for s in DEFAULT_STRATEGIES},
+        lists_dir=lists_dir,
+        enable_game_udp_dpi=True,
+    )
+    joined = "\n".join(args)
+    assert "--filter-udp=1024-65535" in args
+    assert "ipset-amazon.txt" in joined
+    assert "ipset-ovh.txt" in joined
+    assert "--payload=all" in args
+    assert "--lua-desync=fake:blob=game_active:repeats=4:payload=all" in args
+    assert "--lua-desync=fake:blob=fake_zero64:repeats=6:payload=all" in args
+    assert any(tok.startswith("--blob=fake_zero64:") for tok in args)
+
+    # 2. trigger_apply_configs auto-enables Cloud Game UDP DPI on TSPU ISP even when game_filter=0 & bundles=direct_clean
+    eng = _make_engine(tmp_path)
+    (eng.lists_dir / "zapret2").mkdir(parents=True, exist_ok=True)
+    (eng.lists_dir / "zapret2" / "ipset-amazon.txt").write_text("54.115.0.0/16\n", encoding="utf-8")
+    (eng.lists_dir / "zapret2" / "ipset-ovh.txt").write_text("51.89.0.0/16\n", encoding="utf-8")
+    st = Storage(eng.db_path)
+    try:
+        nk = eng._resolve_network_info(st)[0]
+        st.set_setting("game_filter", "0")
+        st.set_bundle_mode(nk, "ubisoft", "direct_clean")
+        st.save_decision(
+            Decision(
+                network_key=nk,
+                domain="discord.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_alt1_199_fake_fakedsplit",
+            )
+        )
+    finally:
+        st.close()
+
+    applied = eng.trigger_apply_configs()
+    app_joined = "\n".join(applied["winws2_args"])
+    assert "--filter-udp=1024-65535" in applied["winws2_args"]
+    assert "ipset-amazon.txt" in app_joined
+    assert "--lua-desync=fake:blob=game_active:repeats=4:payload=all" in app_joined
+    assert eng._last_game_udp_dpi is True
+    pass_lines = (eng.lists_dir / "pass_domains.txt").read_text(encoding="utf-8").splitlines()
+    assert "ubisoft.com" in pass_lines
+
+    # 3. Healthy lobby/QoS UDP flow must NOT mask active blackholed match-server UDP flow in Clash
+    old_start = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+    mock_clash = MagicMock()
+    mock_clash.get_connections_sync.return_value = {
+        "connections": [
+            {
+                "id": "lobby-healthy-udp",
+                "metadata": {
+                    "destinationIP": "20.174.51.75",
+                    "destinationPort": 3075,
+                    "network": "udp",
+                    "process": "RainbowSix.exe",
+                },
+                "download": 500,
+                "upload": 500,
+                "start": old_start,
+                "chains": ["direct"],
+            },
+            {
+                "id": "match-blackhole-udp",
+                "metadata": {
+                    "destinationIP": "54.115.104.208",
+                    "destinationPort": 30000,
+                    "network": "udp",
+                    "process": "RainbowSix.exe",
+                },
+                "download": 0,
+                "upload": 1200,
+                "start": old_start,
+                "chains": ["direct"],
+            },
+        ]
+    }
+    monkeypatch.setattr(eng, "_collect_processes_state", lambda: {"winws2": {"running": True}, "sing-box": {"running": True}})
+    monkeypatch.setattr(eng.clash_api, "get_connections_sync", mock_clash.get_connections_sync)
+    monkeypatch.setattr("psutil.net_connections", lambda kind="inet": [])
+    monkeypatch.setattr(orch_mod, "detect_bypass_active", lambda: True)
+    monkeypatch.setattr(orch_mod, "_is_admin", lambda: False)
+
+    asyncio.run(eng.orchestrator.monitor.auto_heal_connections(eng, max_domains_per_tick=0))
+    asyncio.run(eng.orchestrator.monitor.auto_heal_connections(eng, max_domains_per_tick=0))
+    r6_alert = next(a for a in eng.orchestrator.monitor.pending_bundle_alerts if a.get("bundle_id") == "ubisoft")
+    assert r6_alert["stalled_udp"] is True
+
+    # 4. With Cloud UDP DPI already active + stalled_udp, bundle escalation skips direct_dpi -> vpn
+    seen_modes: list[str] = []
+
+    def _probe_all_ok(_dom: str, *, proxy_url: str | None = None, timeout: float = 3.0) -> dict[str, object]:
+        cur = next(b["mode"] for b in eng.get_bundles_status()["bundles"] if b["id"] == "ubisoft")
+        seen_modes.append(cur)
+        return {"ok": True, "latency_ms": 20.0}
+
+    esc = eng.find_best_bypass_for_bundle(
+        "ubisoft",
+        probe_fn=_probe_all_ok,
+        udp_check_fn=lambda: {"ok": True, "reason": ""},
+        allow_downshift=False,
+    )
+    assert esc["ok"] is True
+    assert esc["mode"] == "vpn"
+    assert "direct_dpi" not in seen_modes
+
