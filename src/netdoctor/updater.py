@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tomllib
 import zipfile
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ _ALLOWED_PORTABLE_CONFIG_FILES: frozenset[str] = frozenset(
     {
         "configs/strategies.yaml",
         "configs/targets.yaml",
+        "configs/bundles.yaml",
     }
 )
 
@@ -98,7 +100,7 @@ def _is_trusted_release_url(url: str) -> bool:
 
 def _is_allowed_portable_relpath(rel: PurePosixPath) -> bool:
     posix = rel.as_posix()
-    if posix.startswith(("src/", "presets/")):
+    if posix.startswith(("src/", "presets/", "lists/zapret2/")):
         return True
     if posix in _ALLOWED_PORTABLE_CONFIG_FILES:
         return True
@@ -259,41 +261,84 @@ def _is_locked_exe_pip_error(err_text: str) -> bool:
     return "winerror 32" in low and ("netdoctor-gui.exe" in low or "netdoctor.exe" in low)
 
 
+_EXTRAS_PACKAGES: dict[str, tuple[str, ...]] = {
+    "http2": ("h2",),
+    "socks": ("socksio",),
+}
+
+
+def _parse_pyproject_meta(root: Path) -> tuple[str, list[str]]:
+    pyproject_file = root / "pyproject.toml"
+    if not pyproject_file.is_file():
+        return "", []
+    data = tomllib.loads(pyproject_file.read_text(encoding="utf-8"))
+    project = data.get("project") if isinstance(data, dict) else {}
+    if not isinstance(project, dict):
+        return "", []
+    ver = str(project.get("version") or "").strip()
+    deps = [d for d in (project.get("dependencies") or []) if isinstance(d, str) and d.strip()]
+    return ver, deps
+
+
+def find_missing_python_deps(root: Path | None = None) -> list[str]:
+    """Return dependency specs from pyproject.toml whose distribution or extras are not installed."""
+    resolved = resolve_repo_root(root)
+    try:
+        _, deps = _parse_pyproject_meta(resolved)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+
+    missing: list[str] = []
+    for dep in deps:
+        pkg_name = re.split(r"[<>=!~;\[\s]", dep, 1)[0].strip()
+        if not pkg_name:
+            continue
+        pkgs_to_check = [pkg_name]
+        extras_m = re.search(r"\[([^\]]+)\]", dep)
+        if extras_m:
+            for extra in extras_m.group(1).split(","):
+                pkgs_to_check.extend(_EXTRAS_PACKAGES.get(extra.strip().lower(), ()))
+        for check_pkg in pkgs_to_check:
+            try:
+                importlib_version(check_pkg)
+            except PackageNotFoundError:
+                missing.append(dep)
+                break
+    return missing
+
+
+def ensure_python_deps(
+    root: Path | None = None,
+    *,
+    timeout: float = 120.0,
+) -> tuple[bool, list[str], str]:
+    """Install any missing Python runtime dependencies declared in pyproject.toml."""
+    resolved = resolve_repo_root(root)
+    missing = find_missing_python_deps(resolved)
+    if not missing:
+        return True, [], ""
+    proc = _run_cmd([sys.executable, "-m", "pip", "install", *missing], cwd=resolved, timeout=timeout)
+    if proc.returncode != 0:
+        return False, [], _cmd_err(proc)
+    return True, missing, ""
+
+
 def _sync_editable_metadata_fallback(
     root: Path,
     *,
     timeout: float = 120.0,
     dist_path_override: Path | None = None,
+    site_packages_override: Path | None = None,
 ) -> tuple[bool, str]:
-    """Install any missing dependencies directly and sync editable .dist-info version when GUI exe is locked."""
-    pyproject_file = root / "pyproject.toml"
+    """Install any missing dependencies directly and sync/recreate editable .dist-info when GUI exe is locked."""
     try:
-        data = tomllib.loads(pyproject_file.read_text(encoding="utf-8"))
+        new_version, _ = _parse_pyproject_meta(root)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return False, f"Failed to read pyproject.toml: {exc}"
 
-    project = data.get("project") if isinstance(data, dict) else {}
-    if not isinstance(project, dict):
-        project = {}
-    new_version = str(project.get("version") or "").strip()
-    deps = project.get("dependencies") or []
-
-    missing: list[str] = []
-    for dep in deps:
-        if not isinstance(dep, str):
-            continue
-        pkg_name = re.split(r"[<>=!~;\[\s]", dep, 1)[0].strip()
-        if not pkg_name:
-            continue
-        try:
-            importlib_version(pkg_name)
-        except PackageNotFoundError:
-            missing.append(dep)
-
-    if missing:
-        dep_proc = _run_cmd([sys.executable, "-m", "pip", "install", *missing], cwd=root, timeout=timeout)
-        if dep_proc.returncode != 0:
-            return False, _cmd_err(dep_proc)
+    deps_ok, _installed, deps_err = ensure_python_deps(root, timeout=timeout)
+    if not deps_ok:
+        return False, deps_err
 
     dist_dir = dist_path_override
     if dist_dir is None:
@@ -321,6 +366,26 @@ def _sync_editable_metadata_fallback(
             target_dir = dist_dir.with_name(f"netdoctor-{new_version}.dist-info")
             if target_dir != dist_dir and not target_dir.exists():
                 dist_dir.rename(target_dir)
+    elif new_version:
+        sp = site_packages_override or Path(sysconfig.get_path("purelib"))
+        if sp.is_dir():
+            for stale in list(sp.glob("netdoctor-*.dist-info")) + list(sp.glob("__editable__*netdoctor*")):
+                if stale.is_dir():
+                    shutil.rmtree(stale, ignore_errors=True)
+                else:
+                    stale.unlink(missing_ok=True)
+            src_dir = (root / "src").resolve()
+            (sp / f"__editable__.netdoctor-{new_version}.pth").write_text(f"{src_dir}\n", encoding="utf-8")
+            recreated_dist = sp / f"netdoctor-{new_version}.dist-info"
+            recreated_dist.mkdir(parents=True, exist_ok=True)
+            (recreated_dist / "METADATA").write_text(
+                f"Metadata-Version: 2.1\nName: netdoctor\nVersion: {new_version}\n",
+                encoding="utf-8",
+            )
+            (recreated_dist / "WHEEL").write_text(
+                "Wheel-Version: 1.0\nGenerator: netdoctor-updater\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                encoding="utf-8",
+            )
 
     return True, f"synced editable metadata to {new_version or 'current'}"
 
@@ -410,6 +475,9 @@ async def apply_app_update(
             pip_proc = _run_pip_install(pip_cmd, cwd=root, timeout=max(timeout, 120.0))
             if pip_proc.returncode != 0:
                 return {"ok": False, "mode": "git", "error": f"pip install failed: {_cmd_err(pip_proc)}"}
+            deps_ok, py_installed, deps_err = ensure_python_deps(root, timeout=max(timeout, 120.0))
+            if not deps_ok:
+                return {"ok": False, "mode": "git", "error": f"pip deps failed: {deps_err}"}
         except (OSError, subprocess.SubprocessError) as exc:
             return {"ok": False, "mode": "git", "error": str(exc)}
 
@@ -431,6 +499,7 @@ async def apply_app_update(
             "old_commit": old_commit,
             "new_commit": new_commit,
             "updated_bins": bool(bin_dir),
+            "installed_python_deps": py_installed,
             "restart_required": True,
             "detail": (
                 f"Обновлено через git ({old_commit} -> {new_commit})"
@@ -474,6 +543,9 @@ async def apply_app_update(
         pip_proc = _run_pip_install(_build_pip_install_cmd(), cwd=root, timeout=max(timeout, 120.0))
         if pip_proc.returncode != 0:
             return {"ok": False, "mode": "portable", "error": f"pip install failed: {_cmd_err(pip_proc)}"}
+        deps_ok, py_installed, deps_err = ensure_python_deps(root, timeout=max(timeout, 120.0))
+        if not deps_ok:
+            return {"ok": False, "mode": "portable", "error": f"pip deps failed: {deps_err}"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "mode": "portable", "error": str(exc)}
 
@@ -495,6 +567,7 @@ async def apply_app_update(
         "target_version": target_version or "",
         "updated_files": updated_files,
         "updated_bins": bool(bin_dir),
+        "installed_python_deps": py_installed,
         "restart_required": True,
         "detail": f"Обновлено {updated_files} файлов из архива релиза",
     }

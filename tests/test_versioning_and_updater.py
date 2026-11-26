@@ -693,3 +693,57 @@ def test_run_pip_install_recovers_from_locked_gui_exe_winerror32(
     )
     res_err = updater_mod._run_pip_install(["pip", "install", "-e", "."], cwd=tmp_path)
     assert res_err.returncode == 1
+
+
+def test_portable_relpath_and_auto_python_deps_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from importlib.metadata import PackageNotFoundError
+    from pathlib import PurePosixPath
+    import netdoctor.updater as updater_mod
+
+    assert updater_mod._is_allowed_portable_relpath(PurePosixPath("configs/bundles.yaml")) is True
+    assert updater_mod._is_allowed_portable_relpath(PurePosixPath("lists/zapret2/ubisoft.txt")) is True
+    assert updater_mod._is_allowed_portable_relpath(PurePosixPath("configs/sing-box.json")) is False
+    assert updater_mod._is_allowed_portable_relpath(PurePosixPath("lists/pass_domains.txt")) is False
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "netdoctor"\nversion = "0.3.3"\ndependencies = ["httpx[http2,socks]>=0.27.0", "cryptography>=42.0.0"]\n',
+        encoding="utf-8",
+    )
+
+    def _fake_ver(pkg: str) -> str:
+        if pkg in ("cryptography", "socksio"):
+            raise PackageNotFoundError(pkg)
+        return "1.0.0"
+
+    pip_calls: list[list[str]] = []
+    monkeypatch.setattr(updater_mod, "importlib_version", _fake_ver)
+    monkeypatch.setattr(
+        updater_mod,
+        "_run_cmd",
+        lambda cmd, *, cwd, timeout=120.0: (pip_calls.append(cmd), subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))[1],
+    )
+
+    missing = updater_mod.find_missing_python_deps(tmp_path)
+    assert missing == ["httpx[http2,socks]>=0.27.0", "cryptography>=42.0.0"]
+    ok, installed, err = updater_mod.ensure_python_deps(tmp_path)
+    assert ok is True and err == ""
+    assert installed == missing
+    assert pip_calls and pip_calls[0][1:4] == ["-m", "pip", "install"]
+    assert "cryptography>=42.0.0" in pip_calls[0]
+
+    # When pip uninstalled .dist-info/.pth before hitting WinError 32, fallback recreates them cleanly
+    site_dir = tmp_path / "site"
+    site_dir.mkdir()
+    (tmp_path / "src" / "netdoctor").mkdir(parents=True)
+    monkeypatch.setattr(
+        updater_mod,
+        "importlib_distribution",
+        lambda _name: (_ for _ in ()).throw(PackageNotFoundError("netdoctor")),
+    )
+    monkeypatch.setattr(updater_mod, "importlib_version", lambda _pkg: "1.0.0")
+    ok_fb, msg_fb = updater_mod._sync_editable_metadata_fallback(tmp_path, site_packages_override=site_dir)
+    assert ok_fb is True and "0.3.3" in msg_fb
+    assert (site_dir / "__editable__.netdoctor-0.3.3.pth").read_text(encoding="utf-8").strip() == str((tmp_path / "src").resolve())
+    assert "Version: 0.3.3" in (site_dir / "netdoctor-0.3.3.dist-info" / "METADATA").read_text(encoding="utf-8")

@@ -113,7 +113,13 @@ from netdoctor.supervisor import (
     validate_xray_config,
     verify_binaries,
 )
-from netdoctor.updater import apply_app_update, check_for_updates, detect_install_mode
+from netdoctor.updater import (
+    apply_app_update,
+    check_for_updates,
+    detect_install_mode,
+    ensure_python_deps,
+    find_missing_python_deps,
+)
 from netdoctor.tray import (
     _decode_process_output,
     get_autostart_status as tray_get_autostart_status,
@@ -5748,15 +5754,26 @@ class NetdoctorEngine:
         return True
 
     def ensure_deps(self, *, force: bool = False) -> dict[str, Any]:
-        """Verify external binaries/lists/presets and automatically download missing or broken components."""
+        """Verify external binaries/lists/presets + Python packages and download missing or broken components."""
         with self._deps_lock:
+            py_installed: list[str] = []
+            py_error: str | None = None
+            if force or find_missing_python_deps():
+                py_ok, py_installed, py_err = ensure_python_deps(timeout=120.0)
+                if not py_ok and py_err:
+                    py_error = py_err
+
             if not force:
                 pre = dict(verify_binaries(self.bin_dir, self.lists_dir))
                 if pre.get("ok"):
-                    pre["downloaded"] = False
+                    pre["downloaded"] = bool(py_installed)
+                    if py_installed:
+                        pre["python_deps_installed"] = py_installed
+                    if py_error is not None:
+                        pre["fetch_error"] = py_error
                     return pre
 
-            fetch_error: str | None = None
+            fetch_error: str | None = py_error
             try:
                 _run_coro_sync(fetch_all_bins(self.bin_dir, self.lists_dir, force=force))
             except Exception as exc:  # noqa: BLE001
@@ -5770,7 +5787,9 @@ class NetdoctorEngine:
                     fetch_error = str(exc)
                 post = dict(verify_binaries(self.bin_dir, self.lists_dir))
 
-            post["downloaded"] = fetch_error is None
+            post["downloaded"] = (fetch_error is None) or bool(py_installed)
+            if py_installed:
+                post["python_deps_installed"] = py_installed
             if fetch_error is not None:
                 post["fetch_error"] = fetch_error
             return post

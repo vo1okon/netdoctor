@@ -31,6 +31,7 @@ from netdoctor.tray import (
     terminate_pid_gracefully,
     write_app_icon,
 )
+from netdoctor.updater import find_missing_python_deps
 from netdoctor.ui.tab_dns import build_dns_tab
 from netdoctor.ui.tab_home import build_home_tab, dismiss_onboarding
 from netdoctor.ui.tab_logs import build_logs_tab
@@ -3743,7 +3744,8 @@ class NetdoctorGuiApp(tk.Tk):
     def _ensure_deps_on_startup(self) -> None:
         manifest = self.backend.bin_dir / "manifest.json"
         has_outdated = hasattr(self.backend, "has_outdated_pinned_bins") and self.backend.has_outdated_pinned_bins()
-        if self.backend.has_core_binaries() and manifest.is_file() and not has_outdated:
+        has_missing_py = bool(find_missing_python_deps())
+        if self.backend.has_core_binaries() and manifest.is_file() and not has_outdated and not has_missing_py:
             return
 
         def done(res: dict[str, Any]) -> None:
