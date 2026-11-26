@@ -29,6 +29,7 @@ from netdoctor.tray import (
     acquire_single_instance_mutex,
     release_single_instance_mutex,
     terminate_pid_gracefully,
+    write_app_icon,
 )
 from netdoctor.ui.tab_dns import build_dns_tab
 from netdoctor.ui.tab_home import build_home_tab, dismiss_onboarding
@@ -306,6 +307,7 @@ class NetdoctorGuiApp(tk.Tk):
         self._active_bg_labels: set[str] = set()
         self._tray: NetdoctorTrayIcon | None = None
         self._icon_image: tk.PhotoImage | None = None
+        self._win32_hicons: list[int] = []
         self._guide_visible = True
         self._extra_visible = False
         self._tooltips: list[HoverTooltip] = []
@@ -386,27 +388,89 @@ class NetdoctorGuiApp(tk.Tk):
 
     # ---------------------------------------------------------------- window chrome & lifecycle
 
+    def _apply_win32_taskbar_icon(self, ico_path: Path | None = None) -> bool:
+        """Apply multi-size .ico via Win32 WM_SETICON so Windows taskbar shows crisp icon instead of blank space."""
+        if sys.platform != "win32":
+            return False
+        target_ico = ico_path or Path(__file__).with_name("netdoctor.ico")
+        try:
+            if not target_ico.is_file():
+                write_app_icon(target_ico)
+            self.update_idletasks()
+            user32 = ctypes.windll.user32
+            user32.GetParent.argtypes = [ctypes.c_void_p]
+            user32.GetParent.restype = ctypes.c_void_p
+            user32.LoadImageW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_wchar_p,
+                ctypes.c_uint,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            user32.LoadImageW.restype = ctypes.c_void_p
+            user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+            user32.SendMessageW.restype = ctypes.c_void_p
+            user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+
+            tk_hwnd = self.winfo_id()
+            top_hwnd = user32.GetParent(tk_hwnd) or tk_hwnd
+            hwnds = list(dict.fromkeys(h for h in (top_hwnd, tk_hwnd) if h))
+            h_small = user32.LoadImageW(None, str(target_ico.resolve()), 1, 16, 16, 0x0010)
+            h_big = user32.LoadImageW(None, str(target_ico.resolve()), 1, 32, 32, 0x0010)
+            new_icons = [h for h in (h_small, h_big) if h]
+            if not new_icons or not hwnds:
+                for h in new_icons:
+                    user32.DestroyIcon(h)
+                return False
+            for hwnd in hwnds:
+                if h_big:
+                    user32.SendMessageW(hwnd, 0x0080, 1, h_big)
+                if h_small:
+                    user32.SendMessageW(hwnd, 0x0080, 0, h_small)
+            old_icons = list(self._win32_hicons)
+            self._win32_hicons = new_icons
+            for old_h in old_icons:
+                try:
+                    user32.DestroyIcon(old_h)
+                except Exception:  # noqa: BLE001
+                    pass
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def _apply_window_chrome(self, *, enable_dark: bool) -> None:
         ico_path = Path(__file__).with_name("netdoctor.ico")
-        if sys.platform == "win32" and ico_path.is_file():
+        ico_loaded = False
+        if sys.platform == "win32":
+            if not ico_path.is_file():
+                try:
+                    write_app_icon(ico_path)
+                except OSError:
+                    pass
+            if ico_path.is_file():
+                try:
+                    self.iconbitmap(str(ico_path))
+                    self.iconbitmap(default=str(ico_path))
+                    ico_loaded = self._apply_win32_taskbar_icon(ico_path)
+                except tk.TclError:
+                    ico_loaded = self._apply_win32_taskbar_icon(ico_path)
+
+        # Fallback 16x16 shield-dot icon on non-Windows or when .ico cannot be loaded (never overwrite Win32 ICON_BIG)
+        if not ico_loaded:
             try:
-                self.iconbitmap(default=str(ico_path))
+                img = tk.PhotoImage(width=16, height=16)
+                img.put(BG, to=(0, 0, 16, 16))
+                for y in range(2, 14):
+                    half = 5 if y < 8 else max(1, 13 - y)
+                    x0, x1 = 8 - half, 8 + half
+                    img.put(PRIMARY_BG, to=(x0, y, x1, y + 1))
+                img.put(ACCENT, to=(6, 5, 10, 9))
+                img.put(OK, to=(7, 6, 9, 8))
+                self._icon_image = img
+                self.iconphoto(True, img)
             except tk.TclError:
                 pass
-        # Custom crisp 16x16 shield-dot icon so Windows titlebar doesn't show legacy Tk feather
-        try:
-            img = tk.PhotoImage(width=16, height=16)
-            img.put(BG, to=(0, 0, 16, 16))
-            for y in range(2, 14):
-                half = 5 if y < 8 else max(1, 13 - y)
-                x0, x1 = 8 - half, 8 + half
-                img.put(PRIMARY_BG, to=(x0, y, x1, y + 1))
-            img.put(ACCENT, to=(6, 5, 10, 9))
-            img.put(OK, to=(7, 6, 9, 8))
-            self._icon_image = img
-            self.iconphoto(True, img)
-        except tk.TclError:
-            pass
 
         if enable_dark and sys.platform == "win32":
             try:
@@ -432,6 +496,7 @@ class NetdoctorGuiApp(tk.Tk):
             return
         try:
             self.deiconify()
+            self._apply_win32_taskbar_icon()
             self.lift()
             self.focus_force()
         except tk.TclError:
@@ -656,6 +721,15 @@ class NetdoctorGuiApp(tk.Tk):
         except tk.TclError:
             pass
         self._icon_image = None
+        if sys.platform == "win32" and getattr(self, "_win32_hicons", None):
+            try:
+                user32 = ctypes.windll.user32
+                user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+                for hicon in self._win32_hicons:
+                    user32.DestroyIcon(hicon)
+            except Exception:  # noqa: BLE001
+                pass
+            self._win32_hicons = []
         try:
             self.destroy()
         except tk.TclError:
@@ -4845,7 +4919,26 @@ class NetdoctorGuiApp(tk.Tk):
                 return
             cmap = getattr(self, "_home_fix_bundle_map", {})
             target = cmap.get(raw) or cmap.get(raw.lstrip("● ").lower()) or raw.lstrip("● ").strip()
-            self.on_find_best_bypass_bundle(target)
+            allow_downshift = True
+            try:
+                cur_bundles = (self.backend.get_bundles_status() or {}).get("bundles") or []
+                t_low = target.lower()
+                matched_b = next(
+                    (
+                        b
+                        for b in cur_bundles
+                        if str(b.get("id") or "").lower() == t_low
+                        or str(b.get("name") or "").lower() == t_low
+                        or any(str(p).lower() == t_low for p in (b.get("processes") or ()))
+                    ),
+                    None,
+                )
+                if matched_b and str(matched_b.get("mode") or "") in ("direct_clean", "direct_dpi"):
+                    # Escalate forward past the currently failing direct/dpi mode instead of re-picking it
+                    allow_downshift = False
+            except Exception:  # noqa: BLE001
+                allow_downshift = True
+            self.on_find_best_bypass_bundle(target, allow_downshift=allow_downshift)
             return
 
         raw_dom = self.home_fix_domain_var.get().strip() if hasattr(self, "home_fix_domain_var") else ""

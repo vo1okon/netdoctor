@@ -161,7 +161,7 @@ bundles:
   - id: minecraft
     name: "Minecraft"
     category: game
-    coupling: tight
+    coupling: storefront
     processes:
       - Minecraft.exe
       - MinecraftLauncher.exe

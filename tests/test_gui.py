@@ -897,9 +897,9 @@ def test_app_icon_and_elevated_shortcut_unicode(tmp_path: Path) -> None:
 
     ico_file = write_app_icon(tmp_path / "netdoctor.ico")
     raw_ico = ico_file.read_bytes()
-    assert raw_ico[:6] == b"\x00\x00\x01\x00\x01\x00"
-    assert len(raw_ico) == 4286
-    assert raw_ico[6] == 32 and raw_ico[7] == 32
+    assert raw_ico[:6] == b"\x00\x00\x01\x00\x03\x00"
+    assert [raw_ico[6 + i * 16] for i in range(3)] == [16, 32, 48]
+    assert [raw_ico[7 + i * 16] for i in range(3)] == [16, 32, 48]
 
     if sys.platform != "win32":
         pytest.skip("Windows .lnk creation only supported on Windows")

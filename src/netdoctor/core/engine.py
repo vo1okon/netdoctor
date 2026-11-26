@@ -556,6 +556,7 @@ class NetdoctorEngine:
         )
         self.ruleset_server = RuleSetServer(preferred_port=ruleset_port)
         self._shutting_down: bool = False
+        self._tun_interface_name: str = "netdoctor-tun"
         self._last_rulesets_payload_hash: str = ""
         self._last_pass_domains_sig: tuple[str, ...] = ()
         self._last_game_udp_dpi: bool = False
@@ -1265,7 +1266,7 @@ class NetdoctorEngine:
             calibration_result = self.run_calibration_sync(apply_configs=False)
             diagnosed_now = True
 
-        if self._shutting_down:
+        if self._stopping:
             return {
                 "ok": False,
                 "started_services": False,
@@ -3226,6 +3227,18 @@ class NetdoctorEngine:
             "rows": self.get_domain_rows(net_key=net_key),
         }
 
+    @staticmethod
+    def _probe_cloud_32kb_sync(proxy_url: str | None = None, timeout: float = 3.5) -> bool:
+        """Verify >32KB TCP stream completion (catches 16KB TSPU drops invisible to small TLS checks)."""
+        try:
+            import httpx
+
+            with httpx.Client(proxy=proxy_url, timeout=timeout, follow_redirects=True) as client:
+                resp = client.get("https://speed.cloudflare.com/__down?bytes=32768")
+                return resp.status_code == 200 and len(resp.content) >= 32768
+        except Exception:
+            return False
+
     def find_best_bypass_for_bundle(
         self,
         bundle_id_or_exe: str,
@@ -3291,6 +3304,26 @@ class NetdoctorEngine:
             avg_ms = round(sum(latencies) / len(latencies), 1) if latencies else None
             return True, avg_ms, ""
 
+        bundle_procs_low = {p.lower() for p in bundle.processes}
+        with self.orchestrator.monitor._lock:
+            has_alert_16kb = any(
+                bool(a.get("stalled_16kb"))
+                and (
+                    str(a.get("bundle_id") or "").lower() == bundle.id.lower()
+                    or str(a.get("process") or "").lower() in bundle_procs_low
+                )
+                for a in self.orchestrator.monitor.pending_bundle_alerts
+            )
+            has_stat_16kb = any(
+                int(cnt.get("stalled_16kb", 0)) > 0
+                and (
+                    p_name.lower() in bundle_procs_low
+                    or match_process_to_bundle(p_name, [bundle]) is not None
+                )
+                for p_name, cnt in self.orchestrator.monitor._last_stalled_direct_procs.items()
+            )
+        has_16kb_tcp_stall = has_alert_16kb or has_stat_16kb
+
         ladder: list[str] = []
         if allow_downshift:
             ladder = ["direct_clean", "direct_dpi", "vpn"]
@@ -3303,6 +3336,16 @@ class NetdoctorEngine:
         udp_check: dict[str, Any] = {"ok": True, "reason": ""}
 
         for cand_mode in ladder:
+            if (
+                cand_mode == "direct_dpi"
+                and not allow_downshift
+                and has_16kb_tcp_stall
+                and has_real_vpn
+                and stack_mode != "dpi_only"
+            ):
+                tried.append({"mode": "direct_dpi", "ok": False, "latency_ms": None, "error": "skipped_16kb_tcp_stall"})
+                continue
+
             if cand_mode == "vpn":
                 if not has_real_vpn or stack_mode == "dpi_only":
                     tried.append({"mode": "vpn", "ok": False, "latency_ms": None, "error": "no_usable_vpn"})
@@ -3312,7 +3355,7 @@ class NetdoctorEngine:
                     if udp_check_fn is not None
                     else self.check_vpn_udp_reachability()
                 )
-                if not udp_check.get("ok") and bundle.category == "game":
+                if not udp_check.get("ok") and bundle.category == "game" and bundle.coupling == "tight":
                     tried.append(
                         {
                             "mode": "vpn",
@@ -3330,6 +3373,9 @@ class NetdoctorEngine:
             else:
                 proxy_arg = None
             ok_step, step_ms, step_err = _probe_targets(proxy_arg)
+            if ok_step and cand_mode == "direct_dpi" and not allow_downshift and probe_fn is None and bundle.category == "game":
+                if not self._probe_cloud_32kb_sync(None, timeout=min(timeout, 3.5)):
+                    ok_step, step_err = False, "cloud_32kb_stall"
             tried.append({"mode": cand_mode, "ok": ok_step, "latency_ms": step_ms, "error": step_err})
             if ok_step:
                 winner_mode = cand_mode
@@ -3690,17 +3736,21 @@ class NetdoctorEngine:
                     if xray_valid:
                         xray_bridge_ports = candidate_ports
                         if xray_hash != self._last_xray_config_hash:
+                            st_xray_heal = Storage(self.db_path)
+                            try:
+                                with st_xray_heal.conn:
+                                    for tag_key in candidate_ports:
+                                        st_xray_heal.conn.execute(
+                                            """
+                                            UPDATE vpn_node_health
+                                            SET cb_state = 'half_open', consecutive_fails = 0, quarantined_until = ''
+                                            WHERE node_tag = ? AND cb_state = 'open' AND last_error = 'protocol_block'
+                                            """,
+                                            (tag_key,),
+                                        )
+                            finally:
+                                st_xray_heal.close()
                             self._last_xray_config_hash = xray_hash
-                            with storage.conn:
-                                for tag_key in candidate_ports:
-                                    storage.conn.execute(
-                                        """
-                                        UPDATE vpn_node_health
-                                        SET cb_state = 'half_open', consecutive_fails = 0, quarantined_until = ''
-                                        WHERE node_tag = ? AND cb_state = 'open' AND last_error = 'protocol_block'
-                                        """,
-                                        (tag_key,),
-                                    )
                     else:
                         xray_file.unlink(missing_ok=True)
                 else:
@@ -3769,6 +3819,7 @@ class NetdoctorEngine:
                 ruleset_base_url=ruleset_base_url,
                 quic_blocked_domains=quic_blocked_domains,
                 telegram_mode=telegram_mode,
+                tun_interface_name=self._tun_interface_name,
             )
             sb_hash = hashlib.sha256(singbox_file.read_bytes()).hexdigest()
             sb_exe = self.bin_dir.resolve() / "sing-box.exe"
@@ -4176,6 +4227,44 @@ class NetdoctorEngine:
             auto_start=False,
         )
 
+    _TUN_INTERFACE_CANDIDATES: tuple[str, ...] = ("netdoctor-tun", "netdoctor-tun2", "netdoctor-tun3")
+
+    @staticmethod
+    def _wait_wintun_gone(iface_name: str, timeout: float = 1.5) -> None:
+        target = (iface_name or "netdoctor-tun").strip().lower()
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            try:
+                ifaces = {k.lower() for k in psutil.net_if_addrs()}
+            except Exception:  # noqa: BLE001
+                break
+            if target not in ifaces:
+                break
+            time.sleep(0.15)
+        time.sleep(0.25)
+
+    def _rotate_tun_interface_name(self) -> str:
+        cands = self._TUN_INTERFACE_CANDIDATES
+        cur = self._tun_interface_name
+        idx = (cands.index(cur) + 1) % len(cands) if cur in cands else 0
+        self._tun_interface_name = cands[idx]
+        return self._tun_interface_name
+
+    def _is_wintun_exists_error(self) -> bool:
+        tail = _read_tail_lines(self.logs_dir / "sing-box.log", max_lines=12).lower()
+        return "cannot create a file when that file already exists" in tail
+
+    def _retry_singbox_after_wintun_collision(self, sup: ProcessSupervisor, iface: int | None) -> tuple[Any, dict[str, Any]]:
+        time.sleep(0.6)
+        self._rotate_tun_interface_name()
+        applied = self.trigger_apply_configs(iface=iface)
+        singbox_file = Path(applied["singbox_config"]).resolve()
+        bin_path = self.bin_dir.resolve()
+        cmd = [str(bin_path / "sing-box.exe"), "run", "-c", str(singbox_file)]
+        proc = sup.reload_process("sing-box", cmd, cwd=bin_path)
+        time.sleep(0.35)
+        return proc, applied
+
     def start_services(self, iface: int | None = None, force: bool = False) -> dict[str, Any]:
         """Verify elevation and conflicts, regenerate configs, and start the supervised process stack."""
         if not _is_admin():
@@ -4296,6 +4385,39 @@ class NetdoctorEngine:
                     "processes": self._collect_processes_state(),
                 }
 
+            if stack_mode != "dpi_only":
+                sb_proc = sup.processes.get("sing-box")
+                if sb_proc is not None and sb_proc.poll() is not None and self._is_wintun_exists_error():
+                    try:
+                        sb_proc, applied = self._retry_singbox_after_wintun_collision(sup, iface)
+                    except OSError as exc:
+                        sup.stop_process("sing-box")
+                        self._supervisor = sup
+                        return {
+                            "ok": False,
+                            "started": False,
+                            "requires_admin": getattr(exc, "winerror", None) == 740,
+                            "error": str(exc),
+                            "applied": applied,
+                            "processes": self._collect_processes_state(),
+                        }
+                if sb_proc is not None and sb_proc.poll() is not None:
+                    rc = sb_proc.poll()
+                    sup.stop_process("sing-box")
+                    log_tail = _read_tail_lines(self.logs_dir / "sing-box.log", max_lines=8).strip()
+                    reason = f"sing-box exited prematurely on start with code {rc}"
+                    if log_tail:
+                        reason = f"{reason}: {log_tail.splitlines()[-1].strip()[:180]}"
+                    self._supervisor = sup
+                    return {
+                        "ok": False,
+                        "started": False,
+                        "requires_admin": False,
+                        "error": reason,
+                        "applied": applied,
+                        "processes": self._collect_processes_state(),
+                    }
+
             self._supervisor = sup
             self._desired_running = True
             self._last_winws2_hash = self._winws2_args_hash(applied["winws2_args"])
@@ -4398,9 +4520,12 @@ class NetdoctorEngine:
                     if name not in stopped:
                         stopped.append(name)
                 self.ruleset_server.stop()
+                if "sing-box" in stopped:
+                    self._wait_wintun_gone(self._tun_interface_name)
                 return stopped
         finally:
             self._stopping = False
+            self._shutting_down = False
 
     def reload_winws2(
         self,
@@ -5077,6 +5202,10 @@ class NetdoctorEngine:
                 proc = self._supervisor.reload_process("sing-box", cmd, cwd=bin_path)
                 time.sleep(0.35)
                 rc = proc.poll()
+                if rc is not None and self._is_wintun_exists_error():
+                    proc, applied = self._retry_singbox_after_wintun_collision(self._supervisor, iface)
+                    singbox_file = Path(applied["singbox_config"]).resolve()
+                    rc = proc.poll()
                 if rc is not None:
                     self._supervisor.stop_process("sing-box")
                     log_tail = _read_tail_lines(self.logs_dir / "sing-box.log", max_lines=8).strip()

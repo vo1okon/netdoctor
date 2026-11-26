@@ -350,3 +350,240 @@ class _FakeBytesClient:
 
     async def get(self, _url: str) -> _FakeBytesResp:
         return _FakeBytesResp(self._data)
+
+
+def test_xray_heal_closed_db_and_start_after_stop_fixes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import netdoctor.core.engine as engine_mod
+
+    eng = _make_engine(tmp_path)
+    xhttp_node = parse_single_uri("vless://11111111-1111-1111-1111-111111111111@198.51.100.12:443?type=xhttp&path=/xp#xh")
+    assert xhttp_node is not None
+    st = Storage(eng.db_path)
+    try:
+        st.save_subscription("sub-xh", "https://example.com/xh", [xhttp_node.model_dump(mode="json")])
+    finally:
+        st.close()
+
+    (eng.bin_dir).mkdir(parents=True, exist_ok=True)
+    (eng.bin_dir / "xray.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(engine_mod, "validate_xray_config", lambda *_a, **_kw: (True, ""))
+    monkeypatch.setattr(engine_mod, "_is_admin", lambda: False)
+
+    # Previously raised sqlite3.ProgrammingError: Cannot operate on a closed database
+    applied = eng.trigger_apply_configs()
+    assert applied.get("xray_bridge_count", 0) >= 1
+
+    # Calling start_autopilot right after stop_services must never stick on "stopping"
+    eng.stop_services()
+    assert eng._shutting_down is False
+    res = eng.start_autopilot()
+    assert res.get("error") != "stopping"
+
+
+def test_smartdns_fallback_rules_and_tun_interface_rotation(tmp_path: Path) -> None:
+    from netdoctor.orchestrators import AI_GEOBLOCK_DOMAINS, DnsLayerOrchestrator
+
+    cat_map = {s["id"]: s for s in DnsLayerOrchestrator().get_all_dns_servers()}
+    srv = RuleSetServer(preferred_port=0)
+    base_url = srv.start()
+    try:
+        sb_path = tmp_path / "sing-box.json"
+        decs = [
+            Decision(network_key="AS1:home:d", domain="chatgpt.com", protocol=Protocol.TLS, layer="dns", strategy_id="smartdns"),
+            Decision(network_key="AS1:home:d", domain="discord.com", protocol=Protocol.TLS, layer="vpn", strategy_id="vpn-select"),
+        ]
+        sb_cfg = generate_singbox_config(
+            decisions=decs,
+            vpn_nodes=[
+                VpnNode(
+                    tag="FI-1",
+                    protocol="vless",
+                    server="198.51.100.11",
+                    server_port=443,
+                    raw_outbound={"type": "vless", "tag": "FI-1", "server": "198.51.100.11", "server_port": 443},
+                )
+            ],
+            output_path=sb_path,
+            doh_server="1.1.1.1",
+            dns_catalog=cat_map,
+            base_dns=cat_map["cf_security"],
+            primary_is_smartdns=False,
+            smartdns_domains=list(AI_GEOBLOCK_DOMAINS),
+            ruleset_base_url=base_url,
+            tun_interface_name="netdoctor-tun2",
+        )
+        assert any(s["tag"] == "dns-smartdns" for s in sb_cfg["dns"]["servers"])
+        assert {"rule_set": ["rs-smartdns"], "server": "dns-smartdns"} in sb_cfg["dns"]["rules"]
+        assert any(r.get("rule_set") == ["rs-vpn"] for r in sb_cfg["dns"]["rules"])
+        tun_ib = next(ib for ib in sb_cfg["inbounds"] if ib.get("tag") == "tun-in")
+        assert tun_ib["interface_name"] == "netdoctor-tun2"
+        sb_exe = Path("bin/sing-box.exe")
+        if sb_exe.is_file():
+            proc = subprocess.run([str(sb_exe), "check", "-c", str(sb_path)], capture_output=True, text=True, timeout=15)
+            assert proc.returncode == 0, f"sing-box check failed: {proc.stderr}\n{proc.stdout}"
+    finally:
+        srv.stop()
+
+
+def test_calibration_clean_ubisoft_mojang_pass_guard_and_cryptography_dep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import netdoctor.core.calibration as cal_mod
+    from netdoctor.config_gen import generate_winws2_config
+    from netdoctor.core.bundles import load_bundles
+    from netdoctor.models import DnsProbeResult, ProbesSummary, QuicProbeResult, StallProbeResult, TcpProbeResult, TlsProbeResult
+
+    st = Storage(tmp_path / "cal.db")
+    try:
+        async def _fake_net(timeout: float = 2.5) -> NetworkFingerprint:
+            return NetworkFingerprint(asn=1, kind=NetworkKind.HOME, isp="CleanGameISP")
+
+        async def _fake_beacon(dom: str, timeout: float = 2.5) -> ProbesSummary:
+            # Only discord.com has SNI DPI; cloudflare.com is clean -> ubisoft must stay direct_clean
+            tls_res = "reset" if dom == "discord.com" else "ok"
+            return ProbesSummary(
+                dns=DnsProbeResult(system="ok", doh="ok", doh_ips=["162.159.135.232"]),
+                tcp=TcpProbeResult(result="ok", rtt_ms=12.0, target_ip="162.159.135.232"),
+                tls=TlsProbeResult(real_sni=tls_res, neutral_sni="ok", ttfb_ms=15.0),
+                stall=StallProbeResult(result="ok", bytes_read=4096, throughput_kbps=5000.0),
+                quic=QuicProbeResult(result="ok", rtt_ms=10.0),
+            )
+
+        monkeypatch.setattr(cal_mod, "detect_network_fingerprint", _fake_net)
+        res = asyncio.run(
+            cal_mod.calibrate_network(
+                st,
+                probe_fn=_fake_beacon,
+                base_dns_probe_fn=lambda s: asyncio.sleep(0, result={"ok": True, "latency_ms": 10.0, "ip": s["ip"]}),
+            )
+        )
+        modes = st.get_bundle_modes(res["network_key"])
+        assert modes["ubisoft"]["mode"] == "direct_clean"
+        assert modes["discord"]["mode"] == "direct_dpi"
+    finally:
+        st.close()
+
+    # Subdomain DPI decision prevents parent domain from entering pass_domains.txt
+    lists_dir = tmp_path / "lists"
+    generate_winws2_config(
+        decisions=[
+            Decision(
+                network_key="AS1:home:d",
+                domain="sessionserver.mojang.com",
+                protocol=Protocol.TLS,
+                layer="dpi",
+                strategy_id="tls_hostfakesplit_ozon",
+            )
+        ],
+        strategies={s.id: s for s in DEFAULT_STRATEGIES},
+        lists_dir=lists_dir,
+        bundle_pass_domains=["mojang.com", "minecraft.net"],
+    )
+    pass_lines = (lists_dir / "pass_domains.txt").read_text(encoding="utf-8").splitlines()
+    assert "mojang.com" not in pass_lines
+    assert "minecraft.net" in pass_lines
+
+    mc_bundle = next(b for b in load_bundles(Path("configs/bundles.yaml")) if b.id == "minecraft")
+    assert mc_bundle.coupling == "storefront"
+    pyproject_text = Path("pyproject.toml").read_text(encoding="utf-8")
+    assert "cryptography" in pyproject_text
+
+
+def test_nonweb_tcp_16kb_stall_detection_and_vpn_escalation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import netdoctor.orchestrators as orch_mod
+    from datetime import datetime, timezone
+    from netdoctor.orchestrators import RealtimeConnectionMonitor
+
+    eng = _make_engine(tmp_path)
+    st = Storage(eng.db_path)
+    try:
+        nk = eng._resolve_network_info(st)[0]
+        st.set_bundle_mode(nk, "minecraft", "direct_clean")
+    finally:
+        st.close()
+
+    old_start = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+    mock_clash = MagicMock()
+    mock_clash.get_connections_sync.return_value = {
+        "connections": [
+            {
+                "id": "mc1",
+                "metadata": {
+                    "destinationIP": "172.65.197.160",
+                    "destinationPort": 25565,
+                    "network": "tcp",
+                    "process": "javaw.exe",
+                },
+                "download": 19804,
+                "upload": 1770,
+                "start": old_start,
+                "chains": ["direct"],
+            },
+            {
+                "id": "mc2",
+                "metadata": {
+                    "destinationIP": "172.65.200.155",
+                    "destinationPort": 25565,
+                    "network": "tcp",
+                    "process": "javaw.exe",
+                },
+                "download": 19804,
+                "upload": 1200,
+                "start": old_start,
+                "chains": ["direct"],
+            },
+        ]
+    }
+    monkeypatch.setattr(eng, "_collect_processes_state", lambda: {"winws2": {"running": True}, "sing-box": {"running": True}})
+    monkeypatch.setattr(eng.clash_api, "get_connections_sync", mock_clash.get_connections_sync)
+    monkeypatch.setattr("psutil.net_connections", lambda kind="inet": [])
+    monkeypatch.setattr(orch_mod, "detect_bypass_active", lambda: True)
+    monkeypatch.setattr(orch_mod, "_is_admin", lambda: False)
+
+    res_heal = asyncio.run(eng.orchestrator.monitor.auto_heal_connections(eng, max_domains_per_tick=0))
+    conns = res_heal["connections"]
+    assert conns and all(c["socket_status"] == "16KB_STALL" and c["health"] == "needs_fix" for c in conns)
+    mc_alert = next(a for a in eng.orchestrator.monitor.pending_bundle_alerts if a.get("bundle_id") == "minecraft")
+    assert mc_alert["stalled_16kb"] is True
+
+    seen_modes: list[str] = []
+
+    def _probe_all_ok(_dom: str, *, proxy_url: str | None = None, timeout: float = 3.0) -> dict[str, object]:
+        cur = next(b["mode"] for b in eng.get_bundles_status()["bundles"] if b["id"] == "minecraft")
+        seen_modes.append(cur)
+        return {"ok": True, "latency_ms": 20.0}
+
+    # With allow_downshift=False and a recorded 16KB TCP stall, minecraft skips direct_dpi and escalates to vpn
+    # even when udp_check_fn reports False (minecraft is storefront/TCP-viable).
+    esc = eng.find_best_bypass_for_bundle(
+        "minecraft",
+        probe_fn=_probe_all_ok,
+        udp_check_fn=lambda: {"ok": False, "reason": "tcp_only_node"},
+        allow_downshift=False,
+    )
+    assert esc["ok"] is True
+    assert esc["mode"] == "vpn"
+    assert "direct_dpi" not in seen_modes
+
+
+def test_multisize_ico_and_win32_loadimage(tmp_path: Path) -> None:
+    import struct
+    from netdoctor.tray import write_app_icon
+
+    ico_path = tmp_path / "app.ico"
+    write_app_icon(ico_path)
+    raw = ico_path.read_bytes()
+    reserved, img_type, count = struct.unpack_from("<HHH", raw, 0)
+    assert (reserved, img_type, count) == (0, 1, 3)
+    sizes = [raw[6 + i * 16] for i in range(count)]
+    assert sizes == [16, 32, 48]
+
+    if sys.platform == "win32":
+        import ctypes
+
+        u32 = ctypes.windll.user32
+        u32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u32.LoadImageW.restype = ctypes.c_void_p
+        u32.DestroyIcon.argtypes = [ctypes.c_void_p]
+        for sz in (16, 32, 48):
+            h = u32.LoadImageW(None, str(ico_path.resolve()), 1, sz, sz, 0x0010)
+            assert h
+            u32.DestroyIcon(h)

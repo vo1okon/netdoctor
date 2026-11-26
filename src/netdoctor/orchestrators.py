@@ -964,11 +964,16 @@ SERVICE_PRESETS: dict[str, dict[str, Any]] = {
 AI_GEOBLOCK_DOMAINS: tuple[str, ...] = (
     "chatgpt.com",
     "openai.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
     "claude.ai",
     "anthropic.com",
     "grok.com",
     "x.ai",
     "gemini.google.com",
+    "aistudio.google.com",
+    "generativelanguage.googleapis.com",
+    "perplexity.ai",
     "copilot.microsoft.com",
     "notion.so",
     "spotify.com",
@@ -3161,8 +3166,8 @@ class RealtimeConnectionMonitor:
             is_16kb_stall = (
                 upload_b > 0
                 and 10_000 <= download_b <= 26_000
-                and proto in ("tls", "http")
-                and (age_sec is not None and age_sec >= 3.5)
+                and proto in ("tls", "http", "tcp")
+                and (age_sec is not None and (age_sec >= 3.5 if proto in ("tls", "http") else age_sec >= 5.0))
             )
             is_healthy = upload_b > 0 and download_b > 0 and not is_16kb_stall
             is_stalled = (
@@ -3190,8 +3195,11 @@ class RealtimeConnectionMonitor:
                 chains = c.get("chains") or []
                 via_direct = (not chains) or any(str(ch).lower() == "direct" for ch in chains)
                 if via_direct:
-                    rec = stalled_direct_procs.setdefault(proc_name, {"stalled": 0, "healthy": 0})
-                    if upload_b > 0 and download_b == 0 and (age_sec is None or age_sec >= 5.0):
+                    rec = stalled_direct_procs.setdefault(proc_name, {"stalled": 0, "healthy": 0, "stalled_16kb": 0})
+                    if is_16kb_stall:
+                        rec["stalled"] += 1
+                        rec["stalled_16kb"] += 1
+                    elif upload_b > 0 and download_b == 0 and (age_sec is None or age_sec >= 5.0):
                         rec["stalled"] += 1
                     elif upload_b > 0 and download_b > 0:
                         rec["healthy"] += 1
@@ -3237,7 +3245,7 @@ class RealtimeConnectionMonitor:
                 )
             )
             t_proto = "udp" if proto in ("quic", "udp") else "tcp"
-            endpoint_stalled = (rip, rport, t_proto) in stalled_clash_endpoints or sock_status == "STALLED"
+            endpoint_stalled = (rip, rport, t_proto) in stalled_clash_endpoints or sock_status in ("STALLED", "16KB_STALL")
             is_healthy_conn = bool(
                 (
                     active_healthy
@@ -3261,11 +3269,14 @@ class RealtimeConnectionMonitor:
                 health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
             elif is_telemetry:
                 health = "protected" if (dec is not None and dec.layer in ("dpi", "vpn", "dns")) else "direct"
-            elif (rport in _WEB_PORTS) and (
-                sock_status in ("SYN_SENT", "STALLED", "16KB_STALL")
-                or endpoint_stalled
-                or (rip, rport) in failed_endpoints
-                or rip in failed_ip_only
+            elif sock_status == "16KB_STALL" or (
+                (rport in _WEB_PORTS)
+                and (
+                    sock_status in ("SYN_SENT", "STALLED")
+                    or endpoint_stalled
+                    or (rip, rport) in failed_endpoints
+                    or rip in failed_ip_only
+                )
             ):
                 health = "needs_fix"
             elif dec is not None and dec.status != "active":
@@ -3573,7 +3584,7 @@ class RealtimeConnectionMonitor:
                 vpn_processes=vpn_procs,
                 vpn_server_hosts=vpn_server_hosts,
             )
-            bundle_alerts: list[tuple[str, str]] = []
+            bundle_alerts: list[tuple[str, str, bool]] = []
             prot_low = {p.lower() for p in guard["processes"]} if guard["enabled"] else set()
             vpn_low = {p.lower() for p in vpn_procs}
             with self._lock:
@@ -3599,13 +3610,13 @@ class RealtimeConnectionMonitor:
                             self._proc_stall_strikes.pop(low, None)
                             if low not in self._emitted_bundle_alerts:
                                 self._emitted_bundle_alerts.add(low)
-                                bundle_alerts.append((p_name, low))
+                                bundle_alerts.append((p_name, low, int(counts.get("stalled_16kb", 0)) > 0))
                         else:
                             self._proc_stall_strikes[low] = strikes
         finally:
             storage.close()
 
-        for proc_name, low in bundle_alerts:
+        for proc_name, low, is_16kb_proc in bundle_alerts:
             bundle_label = proc_name
             bundle_id = ""
             try:
@@ -3617,7 +3628,11 @@ class RealtimeConnectionMonitor:
                     bundle_id = matched_b.id
             except Exception:
                 pass
-            msg = f"У {bundle_label} проблемы со связью — подобрать другой маршрут?"
+            msg = (
+                f"У {bundle_label} обрыв TCP (~16 КБ / Cloudflare ТСПУ) — перевести на VPN?"
+                if is_16kb_proc
+                else f"У {bundle_label} проблемы со связью — подобрать другой маршрут?"
+            )
             self.record_event(bundle_id or proc_name, proc_name, msg, "recommend", bundle_id or "bundle_issue")
             with self._lock:
                 self.pending_bundle_alerts.append(
@@ -3625,6 +3640,7 @@ class RealtimeConnectionMonitor:
                         "bundle_id": bundle_id,
                         "bundle_name": bundle_label,
                         "process": proc_name,
+                        "stalled_16kb": is_16kb_proc,
                         "message": msg,
                     }
                 )

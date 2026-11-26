@@ -1224,69 +1224,78 @@ def _inside_rounded_square(x: int, y: int, size: int = 32, margin: int = 1, radi
     return (dx * dx + dy * dy) <= (radius * radius)
 
 
-def _shield_pixel_rgba(x: int, y: int) -> tuple[int, int, int, int]:
-    """Render one 32x32 Midnight Slate shield-badge RGBA pixel."""
-    if not _inside_rounded_square(x, y):
+def _shield_pixel_rgba(x: int | float, y: int | float, size: int = 32) -> tuple[int, int, int, int]:
+    """Render one anti-aliased Midnight Slate shield-badge RGBA pixel scaled to `size`."""
+    sx = (x + 0.5) * 32.0 / max(1, size) - 0.5 if size != 32 else float(x)
+    sy = (y + 0.5) * 32.0 / max(1, size) - 0.5 if size != 32 else float(y)
+    if not _inside_rounded_square(round(sx), round(sy)):
         return (0, 0, 0, 0)
 
     # Subtle 1px slate border around the rounded badge
-    is_border = not _inside_rounded_square(x, y, margin=2, radius=5.0)
+    is_border = not _inside_rounded_square(round(sx), round(sy), margin=2, radius=5.0)
     r, g, b = (36, 49, 74) if is_border else (11, 15, 23)
 
     cx = 15.5
-    if 5 <= y <= 26:
-        half = 9.0 if y <= 15 else max(0.0, 9.0 * (26.5 - y) / 11.5)
-        if abs(x - cx) <= half:
+    if 5 <= sy <= 26:
+        half = 9.0 if sy <= 15 else max(0.0, 9.0 * (26.5 - sy) / 11.5)
+        if abs(sx - cx) <= half:
             r, g, b = (2, 132, 199)  # PRIMARY_BG (#0284C7)
 
-    if 8 <= y <= 23:
-        inner_half = 5.5 if y <= 15 else max(0.0, 5.5 * (23.5 - y) / 8.5)
-        if abs(x - cx) <= inner_half:
+    if 8 <= sy <= 23:
+        inner_half = 5.5 if sy <= 15 else max(0.0, 5.5 * (23.5 - sy) / 8.5)
+        if abs(sx - cx) <= inner_half:
             r, g, b = (56, 189, 248)  # ACCENT (#38BDF8)
 
-    dx = x - cx
-    dy = y - 14.5
+    dx = sx - cx
+    dy = sy - 14.5
     if (dx * dx + dy * dy) <= (2.6 * 2.6):
         r, g, b = (34, 197, 94)  # OK (#22C55E)
 
     return (r, g, b, 255)
 
 
-def write_app_icon(path: str | Path) -> Path:
-    """Write a 32x32 32-bit BGRA Windows .ico file using pure stdlib struct."""
-    size = 32
+def write_app_icon(path: str | Path, sizes: tuple[int, ...] = (16, 32, 48)) -> Path:
+    """Write a multi-size (16/32/48) 32-bit BGRA Windows .ico file using pure stdlib struct."""
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    frames: list[tuple[int, bytes]] = []
+    for s in sizes:
+        xor_bytes = bytearray()
+        and_bytes = bytearray()
+        and_row_bytes = ((s + 31) // 32) * 4
+        for y in range(s - 1, -1, -1):
+            row_bits = 0
+            for x in range(s):
+                r, g, b, a = _shield_pixel_rgba(x, y, size=s)
+                xor_bytes.extend((b, g, r, a))
+                if a == 0:
+                    row_bits |= 1 << (and_row_bytes * 8 - 1 - x)
+            and_bytes.extend(row_bits.to_bytes(and_row_bytes, "big"))
 
-    xor_bytes = bytearray()
-    and_bytes = bytearray()
-    for y in range(size - 1, -1, -1):
-        row_mask = 0
-        for x in range(size):
-            r, g, b, a = _shield_pixel_rgba(x, y)
-            xor_bytes.extend((b, g, r, a))
-            if a == 0:
-                row_mask |= 1 << (31 - x)
-        and_bytes.extend(struct.pack(">I", row_mask))
+        dib_header = struct.pack(
+            "<IIIHHIIIIII",
+            40,
+            s,
+            s * 2,
+            1,
+            32,
+            BI_RGB,
+            len(xor_bytes),
+            0,
+            0,
+            0,
+            0,
+        )
+        frames.append((s, dib_header + bytes(xor_bytes) + bytes(and_bytes)))
 
-    dib_header = struct.pack(
-        "<IIIHHIIIIII",
-        40,
-        size,
-        size * 2,
-        1,
-        32,
-        BI_RGB,
-        len(xor_bytes),
-        0,
-        0,
-        0,
-        0,
-    )
-    image_data = dib_header + bytes(xor_bytes) + bytes(and_bytes)
-    icondir = struct.pack("<HHH", 0, 1, 1)
-    icondir_entry = struct.pack("<BBBBHHII", size, size, 0, 0, 1, 32, len(image_data), 22)
-    out_path.write_bytes(icondir + icondir_entry + image_data)
+    icondir = struct.pack("<HHH", 0, 1, len(frames))
+    entries = bytearray()
+    offset = 6 + 16 * len(frames)
+    for s, img_bytes in frames:
+        w_byte = s if s < 256 else 0
+        entries.extend(struct.pack("<BBBBHHII", w_byte, w_byte, 0, 0, 1, 32, len(img_bytes), offset))
+        offset += len(img_bytes)
+    out_path.write_bytes(icondir + bytes(entries) + b"".join(img for _, img in frames))
     return out_path
 
 

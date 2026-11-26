@@ -654,8 +654,14 @@ def generate_winws2_config(
         for d in decisions
         if d.layer == "dns" and d.status == "active" and d.domain and d.domain.strip()
     } - dpi_domains
+    def _has_subdomain_match(parent: str, targets: set[str]) -> bool:
+        return any(t == parent or t.endswith("." + parent) for t in targets)
+
+    effective_bundle_pass = {
+        p for p in bundle_pass_set if not _has_subdomain_match(p, dpi_domains | bundle_dpi_set)
+    }
     catchall_excluded_domains = sorted(
-        (set(excluded_set) | vpn_hostnames | direct_domains | dns_domains | bundle_pass_set) - bundle_dpi_set
+        (set(excluded_set) | vpn_hostnames | direct_domains | dns_domains | effective_bundle_pass) - bundle_dpi_set
     )
     exclude_hostlist_path: Path | None = None
     if catchall_excluded_domains:
@@ -666,7 +672,7 @@ def generate_winws2_config(
     profile_count = 0
 
     # Explicit pass guard for direct_clean bundle auth domains, DNS infrastructure, and VPN servers
-    pass_domains = sorted((set(excluded_set) | (bundle_pass_set - dpi_domains - bundle_dpi_set)) | vpn_hostnames)
+    pass_domains = sorted((set(excluded_set) | effective_bundle_pass) | vpn_hostnames)
     if pass_domains:
         pass_list_path = lists_path / "pass_domains.txt"
         pass_list_path.write_text("\n".join(pass_domains) + "\n", encoding="utf-8")
@@ -1583,12 +1589,15 @@ def build_singbox_rulesets_payload(
             for d in decisions
             if d.layer in ("dns", "dpi", "vpn")
             and d.domain not in per_dns_override_hosts
+            and d.domain.strip().lower().lstrip(".") not in explicit_smartdns_hosts
             and not _is_bypassed(d.domain)
         }
         | {
             dom
             for dom in all_vpn_route_domains
-            if dom not in per_dns_override_hosts and not _is_bypassed(dom)
+            if dom not in per_dns_override_hosts
+            and dom.strip().lower().lstrip(".") not in explicit_smartdns_hosts
+            and not _is_bypassed(dom)
         }
     )
     smart_doms = sorted(
@@ -1694,6 +1703,7 @@ def generate_singbox_config(
     ruleset_base_url: str | None = None,
     quic_blocked_domains: list[str] | None = None,
     telegram_mode: str = "mtproto",
+    tun_interface_name: str = "netdoctor-tun",
 ) -> dict[str, Any]:
     """Generate sing-box 1.12+/1.14+ JSON configuration with safe mixed TUN, Split-DNS, AppBundles, and zero-downtime HTTP rule_sets."""
     vpn_nodes = vpn_nodes or []
@@ -1747,12 +1757,15 @@ def generate_singbox_config(
             for d in decisions
             if d.layer in ("dns", "dpi", "vpn")
             and d.domain not in per_dns_override_hosts
+            and d.domain.strip().lower().lstrip(".") not in explicit_smartdns_hosts
             and not _is_bypassed(d.domain)
         }
         | {
             dom
             for dom in all_vpn_route_domains
-            if dom not in per_dns_override_hosts and not _is_bypassed(dom)
+            if dom not in per_dns_override_hosts
+            and dom.strip().lower().lstrip(".") not in explicit_smartdns_hosts
+            and not _is_bypassed(dom)
         }
     )
     quic_reject_set = {
@@ -1987,13 +2000,43 @@ def generate_singbox_config(
                 }
             )
 
+    smartdns_server_tag: str | None = None
+    if not primary_is_smartdns and explicit_smartdns_hosts:
+        cat_map = catalog_map or {}
+        smart_cand: dict[str, Any] | None = None
+        for pref_id in ("comss_dns", "xbox_dns"):
+            cand = cat_map.get(pref_id)
+            if isinstance(cand, dict) and not cand.get("doh_broken"):
+                smart_cand = cand
+                break
+        if smart_cand is None:
+            smart_cand = next(
+                (
+                    s
+                    for s in cat_map.values()
+                    if isinstance(s, dict)
+                    and str(s.get("category") or "").strip().lower() == "ai_bypass"
+                    and not s.get("doh_broken")
+                ),
+                None,
+            )
+        if smart_cand is not None:
+            smart_entry = _build_catalog_dns_entry(smart_cand, "dns-smartdns", allow_broken_doh=False)
+            if smart_entry is not None:
+                dns_servers.append(smart_entry)
+                smartdns_server_tag = "dns-smartdns"
+        if smartdns_server_tag is None and vpn_dns_tag != "dns-local":
+            smartdns_server_tag = vpn_dns_tag
+
     if use_remote_rulesets:
+        if vpn_dns_tag != "dns-local":
+            dns_rules.append({"rule_set": ["rs-vpn"], "server": vpn_dns_tag})
         if primary_is_smartdns:
-            if vpn_dns_tag != "dns-local":
-                dns_rules.append({"rule_set": ["rs-vpn"], "server": vpn_dns_tag})
             dns_rules.append({"rule_set": ["rs-smartdns"], "server": "dns-doh"})
         else:
             dns_rules.append({"rule_set": ["rs-doh"], "server": "dns-doh"})
+            if explicit_smartdns_hosts and smartdns_server_tag:
+                dns_rules.append({"rule_set": ["rs-smartdns"], "server": smartdns_server_tag})
     elif primary_is_smartdns:
         smart_doms = sorted(
             {
@@ -2017,13 +2060,24 @@ def generate_singbox_config(
                     "server": "dns-doh",
                 }
             )
-    elif doh_domains:
-        dns_rules.append(
-            {
-                "domain_suffix": doh_domains,
-                "server": "dns-doh",
-            }
-        )
+    else:
+        if vpn_select_domains and vpn_dns_tag != "dns-local":
+            dns_rules.append({"domain_suffix": vpn_select_domains, "server": vpn_dns_tag})
+        if explicit_smartdns_hosts and smartdns_server_tag:
+            dns_rules.append(
+                {
+                    "domain_suffix": sorted(explicit_smartdns_hosts),
+                    "server": smartdns_server_tag,
+                }
+            )
+        non_vpn_doh = [d for d in doh_domains if not (vpn_dns_tag != "dns-local" and d in vpn_select_set)]
+        if non_vpn_doh:
+            dns_rules.append(
+                {
+                    "domain_suffix": non_vpn_doh,
+                    "server": "dns-doh",
+                }
+            )
 
     dns_config: dict[str, Any] = {
         "servers": dns_servers,
@@ -2039,7 +2093,7 @@ def generate_singbox_config(
             {
                 "type": "tun",
                 "tag": "tun-in",
-                "interface_name": "netdoctor-tun",
+                "interface_name": (tun_interface_name or "netdoctor-tun").strip() or "netdoctor-tun",
                 "address": ["172.19.0.1/30"],
                 "mtu": 1380,
                 "auto_route": True,

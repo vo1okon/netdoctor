@@ -228,7 +228,34 @@ async def calibrate_network(
                 )
 
     if geo_block_detected:
-        for ai_dom in ("chatgpt.com", "claude.ai", "gemini.google.com"):
+        ai_layer, ai_strategy = "dns", "smartdns"
+        if probe_fn is None and str(cur_active.get("category") or "").strip().lower() != "ai_bypass":
+            try:
+                rolled = await dns_orchestrator.roll_dns_for_domain(
+                    "chatgpt.com",
+                    net_key,
+                    storage=storage,
+                    timeout=min(timeout, 2.0),
+                )
+                if isinstance(rolled, Decision) and rolled.layer == "dns" and rolled.strategy_id and rolled.ttfb_ms is not None:
+                    ai_layer, ai_strategy = "dns", rolled.strategy_id
+                elif storage.has_usable_vpn():
+                    ai_layer, ai_strategy = "vpn", "vpn-select"
+            except Exception:
+                if storage.has_usable_vpn():
+                    ai_layer, ai_strategy = "vpn", "vpn-select"
+        ai_seed_domains = (
+            "chatgpt.com",
+            "openai.com",
+            "oaistatic.com",
+            "oaiusercontent.com",
+            "claude.ai",
+            "anthropic.com",
+            "gemini.google.com",
+            "grok.com",
+            "x.ai",
+        )
+        for ai_dom in ai_seed_domains:
             if (ai_dom, Protocol.TLS) not in existing_pinned and ai_dom in AI_GEOBLOCK_DOMAINS:
                 existing_ai = [d for d in storage.get_decisions(net_key, active_only=False) if d.domain == ai_dom and d.protocol == Protocol.TLS]
                 if not existing_ai:
@@ -237,8 +264,8 @@ async def calibrate_network(
                             network_key=net_key,
                             domain=ai_dom,
                             protocol=Protocol.TLS,
-                            layer="dns",
-                            strategy_id="smartdns",
+                            layer=ai_layer,
+                            strategy_id=ai_strategy,
                         )
                     )
 
@@ -261,7 +288,7 @@ async def calibrate_network(
                 for d in b.auth_domains
             )
             dpi_env = sni_dpi_detected or cf_dpi or throttle_detected
-            if auth_dpi or (dpi_env and (b.default_mode == "direct_dpi" or (b.category == "game" and b.coupling == "tight"))):
+            if auth_dpi or (cf_dpi and b.category == "game" and b.coupling == "tight") or (dpi_env and b.default_mode == "direct_dpi"):
                 auto_mode = "direct_dpi"
             else:
                 auto_mode = b.default_mode if b.default_mode in ("direct_clean", "direct_dpi", "vpn") else "direct_clean"
